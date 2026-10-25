@@ -238,7 +238,10 @@ def add_torrents(api, torrents):
         "hash": hashes["album"], "oldPath": "album/02.flac", "newPath": "album/02 - renamed.flac",
     })
     api.post("/api/v2/torrents/rename", {"hash": hashes["album"], "name": "Album (renamed)"})
-    api.post("/api/v2/torrents/filePrio", {"hash": hashes["pair"], "id": "0", "priority": "0"})
+    # By name: the order of files in the torrent is not the order made.
+    pair_files = json.loads(api.get(f"/api/v2/torrents/files?hash={hashes['pair']}"))
+    skipped = next(file["index"] for file in pair_files if file["name"].endswith("skipped.txt"))
+    api.post("/api/v2/torrents/filePrio", {"hash": hashes["pair"], "id": str(skipped), "priority": "0"})
     # qBittorrent keeps trackers in its resume data, not its .torrent copy.
     api.post("/api/v2/torrents/addTrackers", {
         "hash": hashes["mini.iso"], "urls": "http://tracker.example/announce",

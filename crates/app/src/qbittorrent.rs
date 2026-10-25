@@ -467,13 +467,14 @@ fn plan_torrent(
     }
 
     let states = qbittorrent.json(&format!("/api/v2/torrents/pieceStates?hash={id}"))?;
-    let pieces: Vec<bool> = states
+    let mut pieces: Vec<bool> = states
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
         .map(|state| state.as_i64() == Some(2))
         .collect();
+    distrust_skipped_files(&mut pieces, files);
     // Files on disk show whether paths are right here; skipped files may
     // never have been made, so one is enough.
     let found = names.iter().any(|name| folder.join(name).exists());
@@ -495,6 +496,35 @@ fn plan_torrent(
         planned.state = TransferState::Seeding;
     }
     Ok(planned)
+}
+
+/// Unmarks the pieces that touch a file skipped in qBittorrent. A piece
+/// that crosses into a skipped file can be complete in qBittorrent with
+/// its bytes for that file kept aside in libtorrent's part file, not in
+/// the file itself; EmpireBT, reading the file, would seed it wrong and
+/// never download it again. Unmarked, those pieces are downloaded.
+fn distrust_skipped_files(pieces: &mut [bool], files: &[Value]) {
+    for file in files
+        .iter()
+        .filter(|file| file.get("priority").and_then(Value::as_i64) == Some(0))
+    {
+        let range = file.get("piece_range").and_then(Value::as_array);
+        let bound = |at: usize| {
+            range
+                .and_then(|range| range.get(at))
+                .and_then(Value::as_u64)
+                .map(|piece| piece as usize)
+        };
+        match (bound(0), bound(1)) {
+            (Some(first), Some(last)) => {
+                for piece in pieces.iter_mut().take(last + 1).skip(first) {
+                    *piece = false;
+                }
+            }
+            // Without its range, nothing about the torrent is trusted.
+            _ => pieces.iter_mut().for_each(|piece| *piece = false),
+        }
+    }
 }
 
 /// Each file's path as qBittorrent names it in `torrents/files`, unless
@@ -704,6 +734,24 @@ pub fn import(plan: &Plan, store: &Store, config: &ClientConfig) -> Result<Impor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pieces_touching_a_skipped_file_are_downloaded_again() {
+        // Piece 2 crosses from the wanted file into the skipped one.
+        let files: Vec<Value> = serde_json::from_str(
+            r#"[{"name":"pair/wanted","priority":1,"piece_range":[0,2]},
+                {"name":"pair/skipped","priority":0,"piece_range":[2,4]}]"#,
+        )
+        .unwrap();
+        let mut pieces = vec![true; 5];
+        distrust_skipped_files(&mut pieces, &files);
+        assert_eq!(pieces, [true, true, false, false, false]);
+        let no_range: Vec<Value> =
+            serde_json::from_str(r#"[{"name":"x","priority":0}]"#).unwrap();
+        let mut pieces = vec![true; 2];
+        distrust_skipped_files(&mut pieces, &no_range);
+        assert_eq!(pieces, [false, false]);
+    }
 
     #[test]
     fn finds_the_folder_file_names_are_relative_to() {

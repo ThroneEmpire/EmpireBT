@@ -96,7 +96,8 @@ and imports once you confirm.
 
 **What doesn't, yet:**
 - **Torrents with skipped files come over paused,** because EmpireBT would
-  download every file.
+  download every file. Pieces that touch a skipped file are downloaded
+  again, since qBittorrent may keep part of them outside the files.
 - **Share limits are noted but not kept.**
 
 If qBittorrent sees the files under other paths than this computer does,

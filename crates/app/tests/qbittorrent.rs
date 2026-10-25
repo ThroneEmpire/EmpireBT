@@ -271,6 +271,8 @@ fn imports_from(live: &Live) {
         "{version}: {:?}",
         pair.warnings
     );
+    // The wanted file's pieces are trusted; the skipped file's are not.
+    assert_eq!(pair.progress(), Some(0.5), "{version}");
     // A hybrid, which qBittorrent's API calls by its v2 hash.
     let hybrid = torrent("hybrid.dat");
     assert_eq!(hybrid.state, TransferState::Seeding);
