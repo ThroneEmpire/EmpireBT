@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#0b0b0c" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f4f4f5" media="(prefers-color-scheme: light)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="EmpireBT">
+  <title>EmpireBT</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <!-- Icons, drawn with the current text color. -->
+  <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-add" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H4"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+    <symbol id="i-start" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+    <symbol id="i-recheck" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.9-3M4 4v4h4M4 13a8 8 0 0 0 14.9 3M20 20v-4h-4"/></symbol>
+    <symbol id="i-category" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-tags" viewBox="0 0 24 24"><path d="M3 12V4h8l9 9-8 8z"/><circle cx="7.5" cy="7.5" r="1.2"/></symbol>
+    <symbol id="i-remove" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+    <symbol id="i-sort" viewBox="0 0 24 24"><path d="M7 4v16M3 16l4 4 4-4M17 20V4M13 8l4-4 4 4"/></symbol>
+    <symbol id="i-empty" viewBox="0 0 24 24"><path d="M3 13h5l1 3h6l1-3h5M5.5 5h13L21 13v6H3v-6z"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  </svg>
+
+  <main id="login" class="login" hidden>
+    <form id="login-form" class="login-card">
+      <img src="/icon.svg" alt="" width="52" height="52" class="login-logo">
+      <h1>EmpireBT</h1>
+      <p class="muted login-sub">Sign in to continue</p>
+      <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password" required autofocus>
+      <p id="login-error" class="error" hidden></p>
+      <button type="submit" class="primary big">Sign in</button>
+      <p class="hint">Forgot it? Run <code>empirebt web password</code> on the computer running EmpireBT.</p>
+    </form>
+  </main>
+
+  <div id="app" class="app" hidden>
+    <header class="top">
+      <div class="brand"><img src="/icon.svg" alt="" width="26" height="26"> <span>EmpireBT</span></div>
+      <div class="rates">
+        <span class="rate down" title="Download speed"><svg class="icon"><use href="#i-down"/></svg><span id="rate-down">0 B/s</span></span>
+        <span class="rate up" title="Upload speed"><svg class="icon"><use href="#i-up"/></svg><span id="rate-up">0 B/s</span></span>
+      </div>
+      <div class="network" id="network"></div>
+      <div class="actions">
+        <button id="add-button" class="primary" aria-label="Add torrents" title="Add torrents"><svg class="icon"><use href="#i-add"/></svg><span class="label">Add</span></button>
+        <button id="settings-button" class="icon-button" aria-label="Settings" title="Settings"><svg class="icon"><use href="#i-settings"/></svg></button>
+        <button id="logout-button" class="icon-button" aria-label="Sign out" title="Sign out"><svg class="icon"><use href="#i-logout"/></svg></button>
+      </div>
+    </header>
+
+    <nav class="side" id="side" aria-label="Filters"></nav>
+
+    <section class="list">
+      <div class="toolbar">
+        <label class="search">
+          <svg class="icon"><use href="#i-search"/></svg>
+          <input id="search" type="search" placeholder="Search" aria-label="Search names" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+        </label>
+        <label class="sort">
+          <svg class="icon"><use href="#i-sort"/></svg>
+          <select id="sort" aria-label="Sort by">
+            <option value="">Added</option>
+            <option value="name">Name</option>
+            <option value="size">Size</option>
+            <option value="progress">Progress</option>
+            <option value="status">Status</option>
+            <option value="down">Download speed</option>
+            <option value="up">Upload speed</option>
+            <option value="peers">Peers</option>
+            <option value="eta">Time left</option>
+          </select>
+        </label>
+        <span id="shown" class="shown"></span>
+      </div>
+      <div class="table-wrap" id="table-wrap">
+        <div class="rows-head" role="row">
+          <button class="cell name" data-sort="name">Name</button>
+          <button class="cell num" data-sort="size">Size</button>
+          <button class="cell progress" data-sort="progress">Progress</button>
+          <button class="cell" data-sort="status">Status</button>
+          <button class="cell num" data-sort="down">Down</button>
+          <button class="cell num" data-sort="up">Up</button>
+          <button class="cell num" data-sort="peers">Peers</button>
+          <button class="cell num" data-sort="eta">ETA</button>
+        </div>
+        <div id="rows" class="rows" role="rowgroup"></div>
+        <div id="empty" class="empty" hidden>
+          <svg class="icon"><use href="#i-empty"/></svg>
+          <p id="empty-text"></p>
+        </div>
+      </div>
+    </section>
+
+    <section class="detail" id="detail" aria-label="Torrent details">
+      <div class="detail-head">
+        <button id="detail-back" class="back" aria-label="Back to the list"><svg class="icon"><use href="#i-back"/></svg><span>Torrents</span></button>
+        <h2 id="detail-title" class="detail-title"></h2>
+        <div class="selection-actions">
+          <button data-action="start" disabled title="Start"><svg class="icon"><use href="#i-start"/></svg><span>Start</span></button>
+          <button data-action="pause" disabled title="Pause"><svg class="icon"><use href="#i-pause"/></svg><span>Pause</span></button>
+          <button data-action="recheck" disabled title="Recheck the downloaded data"><svg class="icon"><use href="#i-recheck"/></svg><span>Recheck</span></button>
+          <button data-action="category" disabled title="Set the category"><svg class="icon"><use href="#i-category"/></svg><span>Category</span></button>
+          <button data-action="tags" disabled title="Edit the tags"><svg class="icon"><use href="#i-tags"/></svg><span>Tags</span></button>
+          <button data-action="remove" class="danger" disabled title="Remove"><svg class="icon"><use href="#i-remove"/></svg><span>Remove</span></button>
+        </div>
+      </div>
+      <div class="tabs" role="tablist">
+        <button role="tab" data-tab="overview" class="active">Overview</button>
+        <button role="tab" data-tab="files">Files</button>
+        <button role="tab" data-tab="peers">Peers</button>
+        <button role="tab" data-tab="trackers">Trackers</button>
+      </div>
+      <div id="detail-body" class="detail-body"></div>
+    </section>
+  </div>
+
+  <dialog id="dialog"></dialog>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>

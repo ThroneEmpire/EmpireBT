@@ -1,0 +1,12 @@
+[package]
+name = "empirebt-interop"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Interoperability tests against libtorrent, the reference BitTorrent implementation"
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+empirebt-backend = { path = "../crates/backend" }

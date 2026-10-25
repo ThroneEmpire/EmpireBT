@@ -1,0 +1,39 @@
+# EmpireBT with its web UI. See DOCKER.md.
+#
+#   mkdir -p data downloads
+#   docker compose up -d
+#   docker compose logs empirebt     # the sign-in link and first password
+#
+# Then open http://localhost:8080 (or https://, see below).
+
+services:
+  empirebt:
+    build: .
+    image: empirebt
+    container_name: empirebt
+    restart: unless-stopped
+    # Run as your own user, so files in ./data and ./downloads are yours.
+    # Find your ids with `id -u` and `id -g`.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "8080:8080"         # web UI
+      - "6881:6881"         # peers (TCP)
+      - "6881:6881/udp"     # peers (uTP, DHT)
+    volumes:
+      - ./data:/data            # settings, torrent list, web UI password
+      - ./downloads:/downloads  # downloaded files
+    environment:
+      # Any setting can be set as EMPIREBT_<SECTION>_<NAME>; see DOCKER.md.
+      # Host names you reach the web UI by, besides localhost and IP addresses:
+      EMPIREBT_WEB_ALLOWED_HOSTS: ""
+      # The web UI is HTTPS with a generated certificate (your browser asks
+      # you to accept it once). Behind a reverse proxy that adds HTTPS,
+      # set this to "off":
+      EMPIREBT_WEB_HTTPS: "auto"
+      # Speed limits in KiB/s (0 = unlimited):
+      # EMPIREBT_NETWORK_UPLOAD_LIMIT: "0"
+      # EMPIREBT_NETWORK_DOWNLOAD_LIMIT: "0"
+      # Set the web UI password instead of using the generated one:
+      # EMPIREBT_WEB_PASSWORD: "change me please"
+    # Time to tell trackers we are leaving and save the session.
+    stop_grace_period: 30s

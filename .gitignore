@@ -1,0 +1,16 @@
+/target/
+# libtorrent downloaded by interop/setup_libtorrent.py
+/interop/.libtorrent/
+
+# Docker Compose: settings, session, password hashes, and downloads
+/data/
+/downloads/
+/forwarded/
+# Compose variables (PUID, PGID, passwords) and Docker secrets
+.env
+/secrets/
+
+# Editors and operating systems
+.idea/
+*.swp
+.DS_Store

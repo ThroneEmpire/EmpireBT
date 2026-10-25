@@ -1,0 +1,8 @@
+# Only the sources are needed to build the image.
+target/
+interop/.libtorrent/
+.git/
+data/
+downloads/
+*.md
+!crates/**/*.md

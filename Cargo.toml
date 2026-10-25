@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/backend",
+    "crates/app",
+    "crates/console",
+    "crates/web",
+    "interop",
+]
+resolver = "3"
+
+# Shared by every crate. The version is EmpireBT's release: other clients
+# see it in our peer ID (-EM0100-), extension handshake ("EmpireBT 0.1.0"),
+# DHT messages, and tracker requests. Bump it here, once, for a release.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"

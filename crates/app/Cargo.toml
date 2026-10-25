@@ -1,0 +1,17 @@
+[package]
+name = "empirebt-app"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "empirebt_app"
+path = "src/lib.rs"
+
+[dependencies]
+empirebt-backend = { path = "../backend" }
+flate2 = "1"
+rlimit = "0.10"
+serde_json = "1"
+
+[dev-dependencies]
+sha1 = "0.10"

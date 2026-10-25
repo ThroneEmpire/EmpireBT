@@ -1,0 +1,16 @@
+[package]
+name = "empirebt-console"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "empirebt"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
+empirebt-app = { path = "../app" }
+empirebt-backend = { path = "../backend" }
+empirebt-web = { path = "../web" }
+ratatui = "0.30"

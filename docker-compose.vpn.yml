@@ -1,0 +1,68 @@
+# EmpireBT behind a VPN, with gluetun (https://github.com/qdm12/gluetun).
+# All of EmpireBT's traffic goes through the VPN, and EmpireBT is bound to
+# the VPN's interface, so nothing leaks if the VPN drops. With a provider
+# that forwards a port (ProtonVPN here), peers can connect in, and EmpireBT
+# follows the port whenever the VPN hands out a new one. See DOCKER.md.
+#
+#   mkdir -p data downloads forwarded
+#   docker compose -f docker-compose.vpn.yml up -d
+#
+# Fill in your details below. For other providers, see gluetun's wiki:
+# https://github.com/qdm12/gluetun-wiki
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      # EmpireBT shares gluetun's network, so its web UI is published here.
+      # Peers need no port here: they come in through the VPN.
+      - "8080:8080"
+    volumes:
+      # gluetun writes the forwarded port here for EmpireBT to read.
+      - ./forwarded:/forwarded
+    environment:
+      VPN_SERVICE_PROVIDER: "protonvpn"
+      VPN_TYPE: "wireguard"
+      # From a WireGuard configuration made in your Proton account, with
+      # "NAT-PMP (Port Forwarding)" turned on.
+      WIREGUARD_PRIVATE_KEY: ""
+      SERVER_COUNTRIES: "Netherlands"
+      # Ask Proton for a port, and use only servers that can forward one.
+      VPN_PORT_FORWARDING: "on"
+      PORT_FORWARD_ONLY: "on"
+      # Each time a port is forwarded (it changes when the VPN reconnects),
+      # write it where EmpireBT looks for it.
+      VPN_PORT_FORWARDING_UP_COMMAND: '/bin/sh -c "echo {{PORT}} > /forwarded/port"'
+      # Let the web UI be reached from your own network:
+      FIREWALL_OUTBOUND_SUBNETS: "192.168.0.0/16,10.0.0.0/8"
+
+  empirebt:
+    build: .
+    image: empirebt
+    container_name: empirebt
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+      - ./forwarded:/forwarded:ro
+    environment:
+      # Every connection uses the VPN's interface; while it is down,
+      # EmpireBT connects nothing. gluetun's VPN interface is tun0.
+      EMPIREBT_NETWORK_INTERFACE: "tun0"
+      # Take peers on the port the VPN forwards, following it when it
+      # changes. Until the file exists, EmpireBT uses 6881.
+      EMPIREBT_NETWORK_PORT_FILE: "/forwarded/port"
+      EMPIREBT_WEB_ALLOWED_HOSTS: ""
+      EMPIREBT_WEB_HTTPS: "auto"
+    stop_grace_period: 30s
