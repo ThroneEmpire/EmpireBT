@@ -13,6 +13,8 @@ const DHT_FILE: &str = "dht.dat";
 const CONFIG_FILE: &str = "config.toml";
 /// Held locked while a process uses the data directory.
 const LOCK_FILE: &str = "lock";
+/// The log, while the dashboard has the terminal.
+const LOG_FILE: &str = "empirebt.log";
 /// Categories and tags.
 const LABELS_FILE: &str = "labels";
 
@@ -35,6 +37,18 @@ pub const PEER_SETTINGS: &[Setting] = &[Setting {
     needs_restart: true,
 }];
 const PEER_DEFAULTS: &[(&str, &str)] = &[("peers.countries", "true")];
+
+/// Settings about logging, in the `[log]` section.
+pub const LOG_SETTINGS: &[Setting] = &[Setting {
+    key: "log.level",
+    kind: SettingKind::Text,
+    description: "How much to log: error, warn, info, debug, or trace. One area can say more, \
+                  as in info,dht=debug (areas: engine, torrent, tracker, peer, \
+                  seeding, network, port, web, geoip, import). The dashboard logs to empirebt.log in the \
+                  data directory; empirebt serve to its output.",
+    needs_restart: true,
+}];
+const LOG_DEFAULTS: &[(&str, &str)] = &[("log.level", "info")];
 
 /// Settings of the web UI, in the `[web]` section. None can be changed
 /// from the web UI itself.
@@ -181,6 +195,11 @@ impl Store {
     }
 
     /// Where categories and tags are saved.
+    /// The log file, for when the dashboard has the terminal.
+    pub fn log_path(&self) -> PathBuf {
+        self.data_dir.join(LOG_FILE)
+    }
+
     pub fn labels_path(&self) -> PathBuf {
         self.data_dir.join(LABELS_FILE)
     }
@@ -212,7 +231,10 @@ impl Store {
         let web = config
             .register(WEB_SETTINGS, WEB_DEFAULTS)
             .map_err(|error| error.to_string())?;
-        if console || peers || web {
+        let log = config
+            .register(LOG_SETTINGS, LOG_DEFAULTS)
+            .map_err(|error| error.to_string())?;
+        if console || peers || web || log {
             config.save().map_err(|error| error.to_string())?;
         }
         let _ = std::fs::remove_file(legacy);

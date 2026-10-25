@@ -166,8 +166,15 @@ impl GeoIp {
                 if age.is_some_and(|age| age < MAX_AGE) {
                     return;
                 }
-                if let Ok(countries) = refresh(&path, &binding) {
-                    set(countries);
+                match refresh(&path, &binding) {
+                    Ok(countries) => {
+                        tracing::info!(target: "geoip", "country database updated");
+                        set(countries);
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "geoip",
+                        "cannot download the country database: {error}"
+                    ),
                 }
             });
         geoip

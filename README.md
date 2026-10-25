@@ -176,6 +176,7 @@ with comments on first run. Change settings in any of three ways:
 | `dht.bootstrap` | public routers | Nodes used to join the DHT |
 | `peers.countries` | `true` | Show peers' countries, from the free DB-IP Lite database, downloaded monthly (applies after restart) |
 | `console.start_on_add` | `true` | Start downloading as soon as a torrent is added |
+| `log.level` | `info` | How much to log: `error`, `warn`, `info`, `debug`, `trace`, or per area such as `info,tracker=debug`. The dashboard logs to `empirebt.log` in the data directory (10 MiB, then it starts over, keeping one old file); `empirebt serve` to its output |
 | `web.*` | | Web UI address, port, HTTPS, certificate, and host names; see [WEB_UI.md](WEB_UI.md#settings) |
 
 Network and storage changes apply after a restart, unless marked live.

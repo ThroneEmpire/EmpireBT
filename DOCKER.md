@@ -238,6 +238,16 @@ or an ARM NAS, build there, or cross-build with buildx:
 docker buildx build --platform linux/arm64 -t empirebt:arm64 --load .
 ```
 
+## Logs
+
+`docker compose logs -f empirebt` shows what EmpireBT is doing: startup,
+torrents added, finished, or failing, trackers that go down, the VPN
+interface going down or up, port changes, and web sign-ins (failed ones
+with the address they came from). For more detail, set
+`EMPIREBT_LOG_LEVEL: "debug"`, or just one area, such as
+`"info,tracker=debug"`. Passwords and private trackers' passkeys are never
+logged, and peers' addresses only at `debug`.
+
 ## Health check
 
 The image checks itself every 30 seconds with `empirebt health`, which

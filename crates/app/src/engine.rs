@@ -246,6 +246,29 @@ impl Handle {
                 settings.binding.clone(),
             )
         };
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        tracing::info!(
+            target: "engine",
+            "EmpireBT {} starting: data in {}, downloads to {}, peers on port {}{}; DHT {}, uTP {}, \
+             local discovery {}; {} torrents",
+            env!("CARGO_PKG_VERSION"),
+            store.data_dir().display(),
+            config.download_directory().display(),
+            client.config().listen_port(),
+            settings
+                .binding
+                .name()
+                .map(|name| format!(" through {name}"))
+                .unwrap_or_default(),
+            match &dht_state {
+                DhtState::Running => "on".to_owned(),
+                DhtState::Disabled => "off".to_owned(),
+                DhtState::Failed(error) => format!("failed ({error})"),
+            },
+            on_off(client.utp().is_some()),
+            on_off(client.lsd().is_some()),
+            client.torrents().len(),
+        );
         let mut engine = Engine::new(client, store, settings, dht_state, config_file, overridden);
         engine.labels = labels;
         engine.geoip = geoip;
@@ -621,6 +644,10 @@ struct Engine {
     /// Downloads stopped to move to a new port, started again once the
     /// new runtime is live.
     restart_after_rebind: Vec<InfoHash>,
+    /// What the log last said about seeding and the network interface, so
+    /// it speaks only when they change.
+    logged_seeding: Option<String>,
+    logged_interface_up: Option<bool>,
 }
 
 /// A `.torrent` URL being downloaded: the URL, where the torrent goes, and
@@ -698,6 +725,8 @@ impl Engine {
             last_port_check: Instant::now(),
             port_file_problem: None,
             restart_after_rebind: Vec::new(),
+            logged_seeding: None,
+            logged_interface_up: None,
         };
         let saved: Vec<(InfoHash, TransferState)> = engine
             .client
@@ -1065,6 +1094,7 @@ impl Engine {
             self.start_next_verify();
         }
         self.seeding.tick(&mut self.client, &self.settings);
+        self.log_changes();
         self.restart_rebound_downloads();
         if self.last_port_check.elapsed() >= PORT_FILE_POLL {
             self.last_port_check = Instant::now();
@@ -1096,6 +1126,7 @@ impl Engine {
     /// Saves the session with interrupted downloads still marked as
     /// downloading so the next run resumes them, then stops every thread.
     fn shutdown(&mut self) {
+        tracing::info!(target: "engine", "stopping: saving the session and leaving trackers");
         let detached = std::mem::take(&mut self.detached);
         let jobs: Vec<TransferHandle> = self
             .activity
@@ -1127,6 +1158,7 @@ impl Engine {
         if let Some(dht) = self.client.dht() {
             dht.stop();
         }
+        tracing::info!(target: "engine", "stopped");
     }
 
     /// Validates, stores, and saves one setting, explaining when it applies.
@@ -1250,12 +1282,50 @@ impl Engine {
         }
         self.client.set_dht(None);
 
+        tracing::debug!(
+            target: "port",
+            "moving from port {} to {port}",
+            self.client.config().listen_port()
+        );
         self.client.set_listen_port(port);
         let config = self.client.config().clone();
         self.dht_state = start_networking(&mut self.client, &config, &self.settings, &self.store);
         self.seeding = SeedService::new(port, &self.settings, self.client.dht().cloned());
         self.session_dirty = true;
         self.notify(Level::Info, format!("Now taking peers on port {port}"));
+    }
+
+    /// Logs the seeding listener and the network interface when their
+    /// state changes.
+    fn log_changes(&mut self) {
+        let seeding = match self.seeding.status() {
+            SeedStatus::Listening { .. } => Some(format!(
+                "taking peers on port {}",
+                self.client.config().listen_port()
+            )),
+            SeedStatus::Failed(error) => Some(format!("cannot take peers: {error}")),
+            SeedStatus::Idle | SeedStatus::Starting => None,
+        };
+        if seeding.is_some() && seeding != self.logged_seeding {
+            let text = seeding.clone().unwrap_or_default();
+            if matches!(self.seeding.status(), SeedStatus::Failed(_)) {
+                tracing::error!(target: "seeding", "{text}");
+            } else {
+                tracing::info!(target: "seeding", "{text}");
+            }
+            self.logged_seeding = seeding;
+        }
+        if let Some(name) = self.settings.binding.name() {
+            let up = self.settings.binding.is_up();
+            if self.logged_interface_up != Some(up) {
+                if up {
+                    tracing::info!(target: "network", "{name} is up");
+                } else {
+                    tracing::warn!(target: "network", "{name} is down; nothing connects until it is back");
+                }
+                self.logged_interface_up = Some(up);
+            }
+        }
     }
 
     /// Starts the downloads [`Engine::change_port`] stopped, once the new
@@ -1736,11 +1806,17 @@ impl Engine {
     }
 
     fn notify(&mut self, level: Level, text: impl Into<String>) {
+        let text = text.into();
+        // What the interfaces tell the user goes in the log too.
+        match level {
+            Level::Error => tracing::error!(target: "torrent", "{text}"),
+            Level::Info | Level::Success => tracing::info!(target: "torrent", "{text}"),
+        }
         self.next_notice += 1;
         self.notices.push_back(Notice {
             id: self.next_notice,
             level,
-            text: text.into(),
+            text,
             at: Instant::now(),
         });
         while self.notices.len() > NOTICES_KEPT {

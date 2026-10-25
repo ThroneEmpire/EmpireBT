@@ -154,7 +154,9 @@ This checklist tracks backend, console, and web UI work.
 - [ ] Implement seed ratio and seeding time policies
 - [ ] Add backend unit and integration tests
 - [ ] Add local tracker/peer test fixtures
-- [ ] Add logging and diagnostics
+- [x] Logging (2026-10-25): `tracing` events under short areas (engine, torrent, tracker, peer, seeding, network, port, web, geoip, import); `log.level` (`EMPIREBT_LOG_LEVEL` in Docker) takes a level or `info,tracker=debug`, and a typo is reported instead of silently matching nothing. `empirebt serve` logs to standard error (`docker logs`), the dashboard to `empirebt.log` (10 MiB, then it starts over keeping `.1`), one-off commands only warnings. Logged: startup summary, every notice the UIs show (added, finished, paused, errors, port changes, settings), seeding listener up or failed, interface down or up, tracker hosts going down and coming back (once each, host only: passkeys stay out), web UI address, sign-ins and failed sign-ins (with address) and lockouts, country database updates, imports, shutdown; at debug, peers dropped with the reason, port moves. Never logged: passwords, tokens, login links, tracker paths and queries; peer addresses only at debug
+- [ ] Diagnostics: `empirebt doctor` (data folder writable, ports bindable, interface up, DHT reaching nodes, disk space, clock), and a Logs view in the web UI
+- [ ] More debug logging where problems hide: DHT bootstrap and lookups, tracker replies, uTP, local discovery
 - [x] Add cancellation and shutdown signals for the seeder
 - [x] Add concurrency/resource limits for seeding
 - [x] Configure maximum outbound peer connections

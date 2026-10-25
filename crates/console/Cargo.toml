@@ -14,3 +14,5 @@ empirebt-app = { path = "../app" }
 empirebt-backend = { path = "../backend" }
 empirebt-web = { path = "../web" }
 ratatui = "0.30"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }

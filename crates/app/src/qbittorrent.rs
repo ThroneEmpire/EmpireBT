@@ -627,6 +627,14 @@ pub fn import(plan: &Plan, store: &Store, config: &ClientConfig) -> Result<Impor
     }
     store.save(&client)?;
     labels.save(&store.labels_path())?;
+    tracing::info!(
+        target: "import",
+        "imported {} torrents, {} new categories, and {} new tags from {}",
+        imported.torrents,
+        imported.categories,
+        imported.tags,
+        plan.source
+    );
     Ok(imported)
 }
 

@@ -241,10 +241,13 @@ mod health {
         HOSTS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// `scheme://host:port`, so paths and passkeys share one entry.
+    /// `scheme://host:port`, so paths and passkeys share one entry. It is
+    /// also what logs name: never a URL's path or query, which carry
+    /// private trackers' passkeys, nor credentials before an `@`.
     fn host_of(url: &str) -> String {
         let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
         let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+        let authority = authority.rsplit('@').next().unwrap_or(authority);
         format!("{scheme}://{authority}")
     }
 
@@ -262,16 +265,28 @@ mod health {
         };
         let key = host_of(url);
         if reachable {
-            hosts.remove(&key);
+            if hosts.remove(&key).is_some() {
+                tracing::info!(target: "tracker", "{key} is reachable again");
+            }
             return;
         }
-        let health = hosts.entry(key).or_insert(Health {
+        let health = hosts.entry(key.clone()).or_insert(Health {
             failures: 0,
             retry_at: Instant::now(),
         });
         let backoff = FIRST_BACKOFF
             .saturating_mul(2_u32.saturating_pow(health.failures))
             .min(MAX_BACKOFF);
+        // Said once when it goes down; every torrent then skips it.
+        if health.failures == 0 {
+            tracing::warn!(
+                target: "tracker",
+                "{key} is unreachable; every torrent skips it for {}s, then longer while it stays down",
+                backoff.as_secs()
+            );
+        } else {
+            tracing::debug!(target: "tracker", "{key} is still unreachable; next try in {}s", backoff.as_secs());
+        }
         health.failures = health.failures.saturating_add(1);
         health.retry_at = Instant::now() + backoff;
     }

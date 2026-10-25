@@ -282,6 +282,7 @@ async fn login(
     axum::Json(login): axum::Json<Login>,
 ) -> Response {
     if let Some(wait) = state.guard.wait(client.0) {
+        tracing::warn!(target: "web", "sign-in from {} refused: locked out after failures", client.0);
         let mut response = error(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; try again in a few minutes",
@@ -307,9 +308,12 @@ async fn login(
         (None, None) => false,
     };
     if !valid {
+        // Who tried matters; what they typed is never logged.
+        tracing::warn!(target: "web", "failed sign-in from {}", client.0);
         state.guard.failed(client.0);
         return error(StatusCode::UNAUTHORIZED, "wrong password");
     }
+    tracing::info!(target: "web", "signed in from {}", client.0);
     state.guard.succeeded(client.0);
     let token = state.sessions.create();
     let mut response = StatusCode::NO_CONTENT.into_response();

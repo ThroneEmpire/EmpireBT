@@ -17,3 +17,4 @@ sha2 = "0.10"
 socket2 = { version = "0.6.5", features = ["all"] }
 toml_edit = "0.22"
 webpki-roots = "1"
+tracing = { version = "0.1", default-features = false, features = ["std"] }

@@ -1,6 +1,7 @@
 mod app;
 mod format;
 mod input;
+mod logging;
 mod ui;
 
 use app::App;
@@ -219,6 +220,25 @@ fn run(cli: Cli) -> Result<(), String> {
     let from_environment = apply_environment(&mut config_file, std::env::vars())?;
     if let Some(Command::Health) = &cli.command {
         return check_health(&config_file);
+    }
+    // The dashboard owns the terminal, so it logs to a file; everything
+    // else to standard error. One-off commands (add, list, import, …) say
+    // only what went wrong, unless EMPIREBT_LOG_LEVEL asks for more.
+    let dashboard = matches!(cli.command, None | Some(Command::Ui { .. }));
+    let one_off = !dashboard && !matches!(cli.command, Some(Command::Serve));
+    let level = if one_off && !config_file.is_overridden("log.level") {
+        "warn".to_owned()
+    } else {
+        config_file.get("log.level").unwrap_or_default()
+    };
+    let log_path = store.log_path();
+    let destination = if dashboard {
+        logging::Destination::File(&log_path)
+    } else {
+        logging::Destination::Stderr
+    };
+    if let Some(problem) = logging::start(&level, destination) {
+        eprintln!("warning: {problem}");
     }
     let (config, mut overridden) = apply_overrides(
         config_file.client_config().map_err(|e| e.to_string())?,

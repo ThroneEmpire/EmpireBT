@@ -931,12 +931,13 @@ impl Server<'_> {
 
     /// Closes a connection after an error, noting it on its torrent.
     fn fail(&mut self, id: usize, error: BackendError) {
-        if let Some(Connection {
-            phase: Phase::Active { torrent, .. },
-            ..
-        }) = self.connections.get(&id)
-        {
-            torrent.note_error(error);
+        if let Some(connection) = self.connections.get(&id) {
+            // Addresses only at debug: a default log keeps no record of who
+            // we traded with.
+            tracing::debug!(target: "peer", "{} dropped: {error}", connection.address);
+            if let Phase::Active { torrent, .. } = &connection.phase {
+                torrent.note_error(error);
+            }
         }
         self.close(id);
     }

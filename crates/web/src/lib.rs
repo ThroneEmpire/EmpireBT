@@ -153,7 +153,7 @@ impl Web {
                 runtime.block_on(async move {
                     match tokio::net::TcpListener::from_std(listener) {
                         Ok(listener) => server::run(listener, acceptor, router, stopped).await,
-                        Err(error) => eprintln!("web UI: {error}"),
+                        Err(error) => tracing::error!(target: "web", "cannot serve: {error}"),
                     }
                 });
             })
@@ -168,6 +168,10 @@ impl Web {
             IpAddr::V6(address) => format!("[{address}]"),
             IpAddr::V4(address) => address.to_string(),
         };
+        tracing::info!(
+            target: "web",
+            "web UI on {scheme}://{host}:{port} (listening on {address})"
+        );
         Ok(Self {
             url: format!("{scheme}://{host}:{port}"),
             state,
