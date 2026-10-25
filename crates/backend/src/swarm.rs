@@ -81,6 +81,11 @@ struct Peer {
     outgoing: bool,
     utp: bool,
     encrypted: bool,
+    /// The encryption handshake was used, whether or not the stream then
+    /// stayed encrypted.
+    obfuscated: bool,
+    /// It stopped sending blocks we asked for.
+    snubbed: bool,
     /// The client it named in its extension handshake.
     client: Option<String>,
     /// Pieces it has, of how many.
@@ -103,7 +108,18 @@ pub struct PeerInfo {
     /// We connected to it (rather than it to us).
     pub outgoing: bool,
     pub utp: bool,
+    /// The stream is RC4-encrypted.
     pub encrypted: bool,
+    /// The encryption handshake was used; without `encrypted`, the stream
+    /// went on in plain text.
+    pub handshake_encrypted: bool,
+    /// It has the optimistic upload slot.
+    pub optimistic: bool,
+    /// It stopped sending blocks we asked for.
+    pub snubbed: bool,
+    /// Where we heard of its address (`SOURCE_*` flags; none for peers
+    /// that connected to us).
+    pub sources: u8,
     /// Its share of the torrent, once it said which pieces it has.
     pub progress: Option<f64>,
     /// Bytes per second from and to it, measured over at least a second.
@@ -119,6 +135,67 @@ pub struct PeerInfo {
     pub interesting: bool,
     pub choking_us: bool,
 }
+
+impl PeerInfo {
+    /// The connection's flags as qBittorrent shows them (libtorrent's
+    /// letters, in qBittorrent's order), each with its meaning.
+    pub fn flags(&self) -> Vec<(char, &'static str)> {
+        let mut flags = Vec::new();
+        if self.interesting {
+            flags.push(if self.choking_us {
+                ('d', "Interested (local) and choked (peer)")
+            } else {
+                ('D', "Interested (local) and unchoked (peer)")
+            });
+        }
+        if self.interested {
+            flags.push(if self.unchoked {
+                ('U', "Interested (peer) and unchoked (local)")
+            } else {
+                ('u', "Interested (peer) and choked (local)")
+            });
+        }
+        if !self.choking_us && !self.interesting {
+            flags.push(('K', "Not interested (local) and unchoked (peer)"));
+        }
+        if self.unchoked && !self.interested {
+            flags.push(('?', "Not interested (peer) and unchoked (local)"));
+        }
+        if self.optimistic {
+            flags.push(('O', "Optimistic unchoke"));
+        }
+        if self.snubbed {
+            flags.push(('S', "Peer snubbed"));
+        }
+        if !self.outgoing {
+            flags.push(('I', "Incoming connection"));
+        }
+        if self.sources & SOURCE_DHT != 0 {
+            flags.push(('H', "Peer from DHT"));
+        }
+        if self.sources & SOURCE_PEX != 0 {
+            flags.push(('X', "Peer from PEX"));
+        }
+        if self.sources & SOURCE_LSD != 0 {
+            flags.push(('L', "Peer from LSD"));
+        }
+        if self.encrypted {
+            flags.push(('E', "Encrypted traffic"));
+        } else if self.handshake_encrypted {
+            flags.push(('e', "Encrypted handshake"));
+        }
+        if self.utp {
+            flags.push(('P', "μTP"));
+        }
+        flags
+    }
+}
+
+/// Where an address came from, as [`PeerInfo::sources`] has it.
+pub const SOURCE_TRACKER: u8 = 1;
+pub const SOURCE_DHT: u8 = 2;
+pub const SOURCE_PEX: u8 = 4;
+pub const SOURCE_LSD: u8 = 8;
 
 /// Rates are measured over windows at least this long.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -152,6 +229,8 @@ struct Inner {
     /// Addresses from peer exchange, for later rounds to retry.
     exchanged: Vec<SocketAddr>,
     from_source: HashMap<SocketAddr, usize>,
+    /// Where each known address came from (`SOURCE_*` flags).
+    sources: HashMap<SocketAddr, u8>,
     /// Who reported seeing us at each address (BEP 10 `yourip`).
     votes: HashMap<IpAddr, HashSet<IpAddr>>,
     listen_port: Option<u16>,
@@ -182,6 +261,7 @@ impl Swarm {
                 optimistic: None,
                 random: seed,
                 known: HashSet::new(),
+                sources: HashMap::new(),
                 discovered: VecDeque::new(),
                 exchanged: Vec::new(),
                 from_source: HashMap::new(),
@@ -224,6 +304,8 @@ impl Swarm {
                 outgoing: false,
                 utp: false,
                 encrypted: false,
+                obfuscated: false,
+                snubbed: false,
                 client: None,
                 pieces: None,
                 choking_us: true,
@@ -334,9 +416,24 @@ impl Swarm {
     }
 
     /// Records how a connection is carried.
-    pub fn describe(&self, key: PeerKey, outgoing: bool, utp: bool, encrypted: bool) {
+    pub fn describe(
+        &self,
+        key: PeerKey,
+        outgoing: bool,
+        utp: bool,
+        encrypted: bool,
+        obfuscated: bool,
+    ) {
         if let Some(peer) = self.lock().peers.get_mut(&key) {
-            (peer.outgoing, peer.utp, peer.encrypted) = (outgoing, utp, encrypted);
+            (peer.outgoing, peer.utp, peer.encrypted, peer.obfuscated) =
+                (outgoing, utp, encrypted, obfuscated);
+        }
+    }
+
+    /// Records whether a peer stopped sending the blocks we asked for.
+    pub fn set_snubbed(&self, key: PeerKey, snubbed: bool) {
+        if let Some(peer) = self.lock().peers.get_mut(&key) {
+            peer.snubbed = snubbed;
         }
     }
 
@@ -365,15 +462,14 @@ impl Swarm {
     pub fn peers(&self) -> Vec<PeerInfo> {
         let now = Instant::now();
         let mut inner = self.lock();
-        let mut peers: Vec<&mut Peer> = inner
-            .peers
-            .values_mut()
-            .filter(|peer| !peer.evicted)
-            .collect();
-        peers.sort_by_key(|peer| peer.joined);
+        let optimistic = inner.optimistic;
+        let Inner { peers, sources, .. } = &mut *inner;
+        let mut peers: Vec<(&PeerKey, &mut Peer)> =
+            peers.iter_mut().filter(|(_, peer)| !peer.evicted).collect();
+        peers.sort_by_key(|(_, peer)| peer.joined);
         peers
             .into_iter()
-            .map(|peer| {
+            .map(|(key, peer)| {
                 let (down, up, at) = peer.sampled;
                 let elapsed = now.saturating_duration_since(at);
                 if elapsed >= RATE_WINDOW {
@@ -394,6 +490,14 @@ impl Swarm {
                     outgoing: peer.outgoing,
                     utp: peer.utp,
                     encrypted: peer.encrypted,
+                    handshake_encrypted: peer.obfuscated,
+                    optimistic: optimistic == Some(*key),
+                    snubbed: peer.snubbed,
+                    sources: if peer.outgoing {
+                        sources.get(&peer.address).copied().unwrap_or(0)
+                    } else {
+                        0
+                    },
                     progress: peer.pieces.map(|(have, total)| {
                         if total == 0 {
                             0.0
@@ -568,13 +672,18 @@ impl Swarm {
                 break;
             }
             if !ips.insert(address.ip())
-                || inner.known.contains(address)
                 || inner.banned.contains(&identity(*address))
                 || us == Some((address.ip(), address.port()))
             {
                 continue;
             }
-            inner.known.insert(*address);
+            // Known from elsewhere, it is still a peer exchange contact.
+            if inner.sources.len() < MAX_DISCOVERED || inner.sources.contains_key(address) {
+                *inner.sources.entry(*address).or_default() |= SOURCE_PEX;
+            }
+            if !inner.known.insert(*address) {
+                continue;
+            }
             inner.discovered.push_back(*address);
             inner.exchanged.push(*address);
             *inner.from_source.entry(source).or_default() += 1;
@@ -583,15 +692,21 @@ impl Swarm {
         added
     }
 
-    /// Queues addresses from trackers or the DHT to try. These come from
-    /// sources we chose, so unlike peer exchange there is no per-source
-    /// limit. Returns how many were new.
-    pub fn offer(&self, addresses: &[SocketAddr]) -> usize {
+    /// Queues addresses from trackers, the DHT, or local discovery to try,
+    /// remembering where they came from (`SOURCE_*` flags) for peer lists.
+    /// These come from sources we chose, so unlike peer exchange there is
+    /// no per-source limit. Returns how many were new.
+    pub fn offer_from(&self, addresses: &[SocketAddr], source: u8) -> usize {
         let mut inner = self.lock();
         let mut added = 0;
         for address in addresses {
             if inner.discovered.len() >= MAX_OFFERED {
                 break;
+            }
+            if source != 0
+                && (inner.sources.len() < MAX_DISCOVERED || inner.sources.contains_key(address))
+            {
+                *inner.sources.entry(*address).or_default() |= source;
             }
             if inner.banned.contains(&identity(*address)) || !inner.known.insert(*address) {
                 continue;
@@ -703,6 +818,107 @@ mod tests {
 
     fn address(last: u8) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, last], 6881))
+    }
+
+    fn info() -> PeerInfo {
+        PeerInfo {
+            address: address(1),
+            client: None,
+            outgoing: true,
+            utp: false,
+            encrypted: false,
+            handshake_encrypted: false,
+            optimistic: false,
+            snubbed: false,
+            sources: 0,
+            progress: None,
+            down_rate: 0.0,
+            up_rate: 0.0,
+            downloaded: 0,
+            uploaded: 0,
+            interested: false,
+            unchoked: false,
+            interesting: false,
+            choking_us: true,
+        }
+    }
+
+    fn letters(info: &PeerInfo) -> String {
+        info.flags()
+            .iter()
+            .map(|(flag, _)| flag.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn shows_flags_with_qbittorrents_letters_in_its_order() {
+        // Downloading from a DHT peer we dialed over uTP, with only the
+        // handshake encrypted; it wants data but is choked.
+        let downloading = PeerInfo {
+            interesting: true,
+            choking_us: false,
+            interested: true,
+            utp: true,
+            handshake_encrypted: true,
+            sources: SOURCE_DHT | SOURCE_TRACKER,
+            ..info()
+        };
+        assert_eq!(letters(&downloading), "D u H e P");
+        // An incoming leecher we upload to on the optimistic slot, snubbed,
+        // fully encrypted.
+        let uploading = PeerInfo {
+            outgoing: false,
+            interested: true,
+            unchoked: true,
+            optimistic: true,
+            snubbed: true,
+            encrypted: true,
+            handshake_encrypted: true,
+            ..info()
+        };
+        assert_eq!(letters(&uploading), "U O S I E");
+        // Choking us while we want data; unchoked by us though it wants
+        // nothing; found by peer exchange and local discovery.
+        let idle = PeerInfo {
+            interesting: true,
+            unchoked: true,
+            sources: SOURCE_PEX | SOURCE_LSD,
+            ..info()
+        };
+        assert_eq!(letters(&idle), "d ? X L");
+        assert_eq!(
+            letters(&PeerInfo {
+                choking_us: false,
+                ..info()
+            }),
+            "K"
+        );
+        assert!(downloading.flags().contains(&('H', "Peer from DHT")));
+    }
+
+    #[test]
+    fn remembers_where_dialed_peers_came_from() {
+        let swarm = Swarm::new(4);
+        let now = Instant::now();
+        swarm.offer_from(&[address(1)], SOURCE_DHT);
+        swarm.discover(address(9), &[(address(1), 0), (address(2), 0)]);
+        let dialed = swarm.join(address(1), now).unwrap();
+        swarm.describe(dialed, true, false, false, false);
+        // A peer that connected to us has no source, as in libtorrent.
+        let incoming = swarm.join(address(2), now).unwrap();
+        swarm.describe(incoming, false, false, false, false);
+        let peer = |at: SocketAddr| {
+            swarm
+                .peers()
+                .into_iter()
+                .find(|peer| peer.address == at)
+                .unwrap()
+        };
+        assert_eq!(peer(address(1)).sources, SOURCE_DHT | SOURCE_PEX);
+        assert_eq!(peer(address(2)).sources, 0);
+        swarm.set_snubbed(dialed, true);
+        assert!(peer(address(1)).snubbed);
     }
 
     #[test]

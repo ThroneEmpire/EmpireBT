@@ -746,8 +746,7 @@ mod tests {
         let mut pieces = vec![true; 5];
         distrust_skipped_files(&mut pieces, &files);
         assert_eq!(pieces, [true, true, false, false, false]);
-        let no_range: Vec<Value> =
-            serde_json::from_str(r#"[{"name":"x","priority":0}]"#).unwrap();
+        let no_range: Vec<Value> = serde_json::from_str(r#"[{"name":"x","priority":0}]"#).unwrap();
         let mut pieces = vec![true; 2];
         distrust_skipped_files(&mut pieces, &no_range);
         assert_eq!(pieces, [false, false]);

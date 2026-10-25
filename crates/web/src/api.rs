@@ -756,6 +756,12 @@ fn peers_json(peers: &[empirebt_app::PeerView]) -> serde_json::Value {
         .iter()
         .map(|peer| {
             let info = &peer.info;
+            let flags = info.flags();
+            let letters: Vec<String> = flags.iter().map(|(flag, _)| flag.to_string()).collect();
+            let meanings: Vec<String> = flags
+                .iter()
+                .map(|(flag, meaning)| format!("{flag} = {meaning}"))
+                .collect();
             json!({
                 "address": info.address.to_string(),
                 "ip": info.address.ip().to_string(),
@@ -774,6 +780,8 @@ fn peers_json(peers: &[empirebt_app::PeerView]) -> serde_json::Value {
                 "unchoked": info.unchoked,
                 "interesting": info.interesting,
                 "chokingUs": info.choking_us,
+                "flags": letters.join(" "),
+                "flagsDescription": meanings.join("\n"),
             })
         })
         .collect();

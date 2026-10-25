@@ -119,6 +119,8 @@ struct Connection {
     paused: bool,
     /// Present when the stream is RC4-encrypted (MSE).
     ciphers: Option<Ciphers>,
+    /// The encryption handshake was used.
+    obfuscated: bool,
     /// Counts this connection against the shared connection limit.
     _slot: crate::limits::Slot,
 }
@@ -514,7 +516,7 @@ impl Server<'_> {
             torrent,
             mut wire,
         } = adopted;
-        let (transport, ciphers, buffered) = connection.into_parts();
+        let (transport, ciphers, obfuscated, buffered) = connection.into_parts();
         let id = self.next_id();
         let stream = match transport {
             crate::peer_manager::Transport::Tcp(stream) => {
@@ -552,6 +554,7 @@ impl Server<'_> {
         };
         connection.input = buffered;
         connection.ciphers = ciphers;
+        connection.obfuscated = obfuscated;
         connection.phase = Phase::Active { torrent, wire };
         if dispatch(id, connection, &self.jobs, out).is_err() {
             return self.close(id);
@@ -589,6 +592,7 @@ impl Server<'_> {
                 registered: Some(Interest::READABLE),
                 paused: false,
                 ciphers: None,
+                obfuscated: false,
                 _slot: self.limits.open_slot(),
             },
         );
@@ -681,6 +685,7 @@ impl Server<'_> {
                 return Ok(false);
             };
             connection.ciphers = established.ciphers;
+            connection.obfuscated = true;
             connection.phase = Phase::Handshake {
                 deadline: *deadline,
                 negotiated: Some(established.info_hash),
@@ -721,6 +726,7 @@ impl Server<'_> {
                 extensions: handshake.supports_extensions(),
                 utp: matches!(connection.stream, Stream::Utp(_)),
                 encrypted: connection.ciphers.is_some(),
+                obfuscated: connection.obfuscated,
             };
             // Dropping the wire releases its pieces and leaves the swarm.
             let mut wire = Box::new(PeerWire::new(Arc::clone(&torrent), link, Instant::now()));

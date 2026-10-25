@@ -781,15 +781,13 @@ fn draw_peers(frame: &mut Frame, app: &App, area: Rect) {
         .take(shown)
         .map(|peer| {
             let info = &peer.info;
-            let flags = [
-                if info.outgoing { "out" } else { "in" },
-                if info.utp { "uTP" } else { "TCP" },
-                if info.encrypted { "enc" } else { "" },
-            ]
-            .into_iter()
-            .filter(|flag| !flag.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+            // qBittorrent's flags, such as "D U I E P" (see `?`).
+            let flags = info
+                .flags()
+                .iter()
+                .map(|(flag, _)| flag.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
             let progress = info.progress.map_or(String::new(), |progress| {
                 format!("{:.0}%", progress * 100.0)
             });
@@ -838,7 +836,7 @@ fn draw_peers(frame: &mut Frame, app: &App, area: Rect) {
                 Constraint::Length(2),
                 Constraint::Length(22),
                 Constraint::Fill(1),
-                Constraint::Length(11),
+                Constraint::Length(14),
                 Constraint::Length(4),
                 Constraint::Length(10),
                 Constraint::Length(10),
@@ -1639,7 +1637,7 @@ fn draw_web_info(frame: &mut Frame, app: &App) {
 }
 
 fn draw_help(frame: &mut Frame, app: &App) {
-    let sections: [(&str, &[(&str, &str)]); 4] = [
+    let sections: [(&str, &[(&str, &str)]); 5] = [
         (
             "Torrents",
             &[
@@ -1664,6 +1662,18 @@ fn draw_help(frame: &mut Frame, app: &App) {
                 ("f", "filter by category or tag"),
                 ("S", "sort: by upload speed, size, progress…"),
                 ("esc", "show all torrents again"),
+            ],
+        ),
+        (
+            "Peer flags (as in qBittorrent)",
+            &[
+                ("D  d", "downloading from it / it is choking us"),
+                ("U  u", "uploading to it / we are choking it"),
+                ("K  ?", "unchoked by it / by us, nothing wanted"),
+                ("O  S", "optimistic unchoke / snubbed"),
+                ("I", "it connected to us"),
+                ("H X L", "from the DHT / peer exchange / LAN"),
+                ("E e P", "encrypted / encrypted handshake / uTP"),
             ],
         ),
         (

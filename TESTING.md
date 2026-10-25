@@ -5,7 +5,7 @@ EmpireBT has four kinds of tests. Only the first three run in
 
 | Kind | Where | Count | Needs |
 | --- | --- | --- | --- |
-| Backend unit tests | `crates/backend/src/*.rs` (`mod tests`) | ~205 | nothing |
+| Backend unit tests | `crates/backend/src/*.rs` (`mod tests`) | ~210 | nothing |
 | Application tests | `crates/app/src/*.rs` (`mod tests`), `crates/app/tests/qbittorrent.rs` | 33 + 1 (+1 opt in) | nothing |
 | Console unit tests | `crates/console/src/*.rs` (`mod tests`) | 21 | nothing |
 | Web UI tests | `crates/web/src/*.rs` and `crates/web/tests/web.rs` | 9 + 10 | nothing |

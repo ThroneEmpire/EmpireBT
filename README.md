@@ -252,8 +252,10 @@ connections it already has.
   needs close after 15 seconds, and silent peers are dropped after 3
   minutes.
 - **A peer list in both interfaces.** It shows each peer's address,
-  country, client name (from its handshake or peer ID), direction,
-  transport, encryption, progress and speeds.
+  country, client name (from its handshake or peer ID), progress and
+  speeds, and the connection's flags as qBittorrent shows them (`D U I E
+  P` and so on; hover in the web UI, or `?` in the dashboard, for what
+  each means).
 
 ### Finding peers
 

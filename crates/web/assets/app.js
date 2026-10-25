@@ -934,23 +934,6 @@ function trackersView() {
   return [summary, element("ul", { class: "trackers" }, lines)].filter(Boolean);
 }
 
-// What a peer connection is doing, in words, for its tooltip.
-function peerFlags(peer) {
-  const flags = [];
-  const said = [];
-  flags.push(peer.outgoing ? "out" : "in");
-  said.push(peer.outgoing ? "we connected to it" : "it connected to us");
-  flags.push(peer.utp ? "uTP" : "TCP");
-  if (peer.encrypted) {
-    flags.push("enc");
-    said.push("encrypted");
-  }
-  if (peer.interesting && !peer.chokingUs) said.push("downloading from it");
-  else if (peer.interesting) said.push("it is choking us");
-  if (peer.interested && peer.unchoked) said.push("uploading to it");
-  else if (peer.interested) said.push("it wants data; choked");
-  return { text: flags.join(" "), title: said.join(", ") };
-}
 
 // How the peer list can be ordered: label, value, and whether largest
 // first is the natural direction.
@@ -1007,7 +990,6 @@ function peersView() {
     element("label", { class: "sort" }, [icon("sort"), menu]),
   ]);
   const rows = list.map((peer) => {
-    const flags = peerFlags(peer);
     const country = peer.country && peer.country !== "ZZ" ? peer.country : "";
     return element("tr", { class: peer.up >= 1 ? "sending" : "" }, [
       element("td", { class: "country", title: country }, [
@@ -1016,7 +998,8 @@ function peersView() {
       ]),
       element("td", { class: "address", text: peer.address }),
       element("td", { class: "client", text: peer.client || "—" }),
-      element("td", { class: "flags muted", text: flags.text, title: flags.title }),
+      // qBittorrent's flags, such as "D U I E P"; the tooltip says what each means.
+      element("td", { class: "flags muted", text: peer.flags, title: peer.flagsDescription }),
       element("td", { class: "num", text: peer.progress === null ? "" : `${(peer.progress * 100).toFixed(0)}%` }),
       element("td", { class: "num down", text: rate(peer.down) }),
       element("td", { class: "num up", text: rate(peer.up) }),

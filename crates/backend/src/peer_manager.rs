@@ -123,6 +123,9 @@ pub struct PeerConnection {
     remote_reserved: [u8; 8],
     /// Present when the stream is RC4-encrypted (MSE).
     ciphers: Option<crate::mse::Ciphers>,
+    /// The encryption handshake was used, even if the stream then went on
+    /// in plain text.
+    obfuscated: bool,
     /// Plain-text bytes read ahead of the current message.
     buffered: Vec<u8>,
 }
@@ -201,7 +204,7 @@ impl PeerConnection {
         };
         let plain = |mut stream: Transport| {
             stream.write_all(&handshake.encode()).map_err(io)?;
-            Self::finish(stream, handshake, None)
+            Self::finish(stream, handshake, None, false)
         };
         let attempt = |over_utp: bool| match options.encryption {
             Encryption::Disabled => plain(open(over_utp)?),
@@ -216,7 +219,7 @@ impl PeerConnection {
                     &handshake.encode(),
                     allow_plaintext,
                 ) {
-                    Ok(ciphers) => Self::finish(stream, handshake, ciphers),
+                    Ok(ciphers) => Self::finish(stream, handshake, ciphers, true),
                     // A peer that refused encryption may accept plain text;
                     // one that never answered will not.
                     Err(_) if allow_plaintext && started.elapsed() < dial_timeout => {
@@ -254,8 +257,8 @@ impl PeerConnection {
 
     /// The stream, its encryption, and anything read ahead of the next
     /// message, for an event loop to take over.
-    pub(crate) fn into_parts(self) -> (Transport, Option<crate::mse::Ciphers>, Vec<u8>) {
-        (self.stream, self.ciphers, self.buffered)
+    pub(crate) fn into_parts(self) -> (Transport, Option<crate::mse::Ciphers>, bool, Vec<u8>) {
+        (self.stream, self.ciphers, self.obfuscated, self.buffered)
     }
 
     /// Whether the connection runs over uTP rather than TCP.
@@ -268,6 +271,7 @@ impl PeerConnection {
         stream: Transport,
         handshake: &Handshake,
         ciphers: Option<crate::mse::Ciphers>,
+        obfuscated: bool,
     ) -> Result<Self, crate::BackendError> {
         let mut connection = Self {
             stream,
@@ -275,6 +279,7 @@ impl PeerConnection {
             supports_v2: false,
             remote_reserved: [0; 8],
             ciphers,
+            obfuscated,
             buffered: Vec::new(),
         };
         let received = connection.read_exact(HANDSHAKE_LENGTH)?;
@@ -301,6 +306,12 @@ impl PeerConnection {
         self.ciphers.is_some()
     }
 
+    /// Whether the encryption handshake was used, even if the stream then
+    /// went on in plain text.
+    pub fn is_obfuscated(&self) -> bool {
+        self.obfuscated
+    }
+
     /// Wraps an already-handshaken stream, useful for accepted inbound peers.
     pub fn from_stream(
         mut stream: TcpStream,
@@ -319,7 +330,8 @@ impl PeerConnection {
             read_more(&mut stream, &mut input)?;
         }
         let mut ciphers = None;
-        if crate::mse::classify(&input) == Opening::Encrypted {
+        let obfuscated = crate::mse::classify(&input) == Opening::Encrypted;
+        if obfuscated {
             let info_hash = *handshake.info_hash();
             let mut responder = Responder::new(true);
             loop {
@@ -341,6 +353,7 @@ impl PeerConnection {
             supports_v2: false,
             remote_reserved: [0; 8],
             ciphers,
+            obfuscated,
             buffered: input,
         };
         let received = connection.read_exact(HANDSHAKE_LENGTH)?;

@@ -425,7 +425,7 @@ impl DownloadSession {
             lsd.join(
                 &hashes,
                 Arc::new(move |peers: &[SocketAddr]| {
-                    swarm.offer(&swarm.rank(peers));
+                    swarm.offer_from(&swarm.rank(peers), crate::swarm::SOURCE_LSD);
                     if let Ok(mut found) = found.lock() {
                         remember_peers(&mut found, peers);
                     }
@@ -439,7 +439,8 @@ impl DownloadSession {
                     for search in &mut dht_searches {
                         let peers = search.poll();
                         if !peers.is_empty() {
-                            self.swarm.offer(&self.swarm.rank(&peers));
+                            self.swarm
+                                .offer_from(&self.swarm.rank(&peers), crate::swarm::SOURCE_DHT);
                             if let Ok(mut found) = found.lock() {
                                 remember_peers(&mut found, &peers);
                             }
@@ -479,7 +480,7 @@ impl DownloadSession {
                 trackers,
                 self.timeout,
                 Arc::new(move |peers: &[SocketAddr]| {
-                    swarm.offer(&swarm.rank(peers));
+                    swarm.offer_from(&swarm.rank(peers), crate::swarm::SOURCE_TRACKER);
                 }),
             )
         };

@@ -327,7 +327,9 @@ as needed; folders left empty are removed.
       "interested": false,
       "unchoked": false,
       "interesting": true,
-      "chokingUs": false
+      "chokingUs": false,
+      "flags": "D E",
+      "flagsDescription": "D = Interested (local) and unchoked (peer)\nE = Encrypted traffic"
     }
   ],
   "attribution": "IP geolocation by DB-IP (db-ip.com)"
@@ -347,6 +349,13 @@ as needed; folders left empty are removed.
   are sending it.
 - **`interesting` and `chokingUs`** mean we want data from the peer, and
   whether it refuses.
+- **`flags`** are the connection's flags as qBittorrent shows them, in its
+  order: `D`/`d` downloading or interested but choked, `U`/`u` uploading
+  or interested but choked by us, `K` and `?` unchoked without interest,
+  `O` optimistic unchoke, `S` snubbed, `I` incoming, `H`/`X`/`L` found
+  through the DHT, peer exchange or local discovery, `E` encrypted, `e`
+  encrypted handshake only, `P` uTP. **`flagsDescription`** explains each,
+  one per line, in qBittorrent's words.
 
 If you show countries, credit DB-IP with `attribution`; its free database
 requires it.

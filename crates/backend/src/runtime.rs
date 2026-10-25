@@ -440,6 +440,7 @@ impl Runtime {
             extensions: connection.supports_extensions(),
             utp: connection.is_utp(),
             encrypted: connection.is_encrypted(),
+            obfuscated: connection.is_obfuscated(),
         };
         // Created here, so the connection counts as open before the event
         // loop takes it. Dropping it leaves the swarm.
@@ -772,6 +773,58 @@ mod tests {
 
     /// A runtime seeding `size` bytes in 16 KiB pieces, served on a local
     /// port until the returned flag is set.
+    #[test]
+    fn shows_an_encrypted_peer_as_qbittorrent_would() {
+        let limits = Arc::new(crate::Limits::unlimited());
+        let (info, _, shutdown, server, root) = serving("peer-flags", 64 * 1024, limits);
+        let storage = crate::Storage::new(&root).unwrap();
+        let seeder = Seeder::new(info.clone(), storage, [3; 20], Duration::from_secs(5)).unwrap();
+        let runtime = Arc::new(
+            Runtime::new(vec![seeder], 8)
+                .unwrap()
+                .with_encryption(crate::Encryption::Enabled),
+        );
+        let listener = runtime.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let serving = {
+            let (runtime, stop) = (Arc::clone(&runtime), Arc::clone(&stop));
+            thread::spawn(move || runtime.serve_until(&listener, &stop))
+        };
+        let options = crate::ConnectOptions::new().with_encryption(crate::Encryption::Enabled);
+        let connection = PeerConnection::connect_with(
+            address,
+            &Handshake::new(*info.info_hash(), *b"-qB4650-000000000001"),
+            Duration::from_secs(5),
+            &options,
+        )
+        .unwrap();
+        assert!(connection.is_obfuscated() && connection.is_encrypted());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let flags = loop {
+            if let Some(peer) = runtime.peers(info.info_hash()).unwrap().first() {
+                break peer
+                    .flags()
+                    .iter()
+                    .map(|(flag, _)| *flag)
+                    .collect::<String>();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the peer never showed"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(flags.contains('I') && flags.contains('E'), "{flags}");
+        assert!(!flags.contains('e'), "{flags}");
+        drop(connection);
+        stop.store(true, Ordering::Release);
+        serving.join().unwrap().unwrap();
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn serving(
         name: &str,
         size: usize,
@@ -968,6 +1021,11 @@ mod tests {
         assert!(!peer.outgoing && !peer.utp);
         assert_eq!(peer.progress, Some(0.25));
         assert!(peer.interested && peer.unchoked);
+        // As qBittorrent shows it: uploading to it, it connected to us,
+        // plain TCP. (One peer may also hold the optimistic slot.)
+        let flags: String = peer.flags().iter().map(|(flag, _)| *flag).collect();
+        assert!(flags.starts_with("U") && flags.contains('I'), "{flags}");
+        assert!(!flags.contains(['E', 'e', 'P', 'H', 'X', 'L']), "{flags}");
         assert!(runtime.peers(&[9; 20]).is_none());
 
         stop.store(true, Ordering::Release);

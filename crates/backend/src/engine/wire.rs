@@ -81,6 +81,8 @@ pub(crate) struct Link {
     pub(crate) extensions: bool,
     pub(crate) utp: bool,
     pub(crate) encrypted: bool,
+    /// The encryption handshake was used (the stream may be plain).
+    pub(crate) obfuscated: bool,
 }
 
 pub(crate) struct PeerWire {
@@ -127,9 +129,13 @@ impl PeerWire {
             Vec::new()
         };
         torrent.connection_opened();
-        torrent
-            .swarm
-            .describe(link.key, link.outgoing, link.utp, link.encrypted);
+        torrent.swarm.describe(
+            link.key,
+            link.outgoing,
+            link.utp,
+            link.encrypted,
+            link.obfuscated,
+        );
         let mut pex_flags = 0;
         if link.utp {
             pex_flags |= crate::pex::SUPPORTS_UTP;
@@ -264,6 +270,7 @@ impl PeerWire {
         if waiting && now - self.state.last_block > torrent.timeout {
             self.downloads.clear();
             self.state.snubbed_until = Some(now + SNUB_COOLDOWN);
+            torrent.swarm.set_snubbed(self.link.key, true);
             if !self.state.peer_interested {
                 return Err(invalid_peer("peer stopped sending requested blocks"));
             }
@@ -666,7 +673,9 @@ impl PeerWire {
                 };
                 self.downloads[index].outstanding.swap_remove(position);
                 self.state.last_block = now;
-                self.state.snubbed_until = None;
+                if self.state.snubbed_until.take().is_some() {
+                    self.torrent.swarm.set_snubbed(self.link.key, false);
+                }
                 self.state.window_bytes += block.len() as u64;
                 torrent.progress.add_received(block.len() as u64);
                 torrent.swarm.record_download(key, block.len() as u64);
