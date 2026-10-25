@@ -159,11 +159,20 @@ def seed(torrent, save, port):
     ses = session(int(port))
     handle = add(ses, torrent, save)
     last, ready = "", False
+    # Each peer's progress as libtorrent sees it (from its bitfield and
+    # `have` messages), printed as `peer progress: <percent>` when it moves:
+    # what qBittorrent's peer list and PeerBanHelper go by.
+    seen = {}
     while True:
         status, last = report(ses, handle, last)
         if not ready and status.is_seeding:
             print("READY", flush=True)
             ready = True
+        for peer in handle.get_peer_info():
+            shown = f"{peer.progress * 100:.0f}"
+            if seen.get(peer.ip) != shown:
+                seen[peer.ip] = shown
+                print(f"peer progress: {shown}", flush=True)
         # Poll often enough to see short-lived local connections.
         time.sleep(0.02)
 

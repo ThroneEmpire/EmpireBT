@@ -632,6 +632,30 @@ fn downloads_from_libtorrent(format: Format) {
     assert_same_files(&scratch.join("source/album"), &scratch.join("get/album"));
 }
 
+/// A libtorrent seed (qBittorrent's engine) watches our progress grow as
+/// it uploads to us: we announce every verified piece, even to peers that
+/// have it. A seed that saw only our starting bitfield would think we claim
+/// less than we downloaded, which PeerBanHelper bans as a fake.
+#[test]
+fn a_libtorrent_seed_sees_our_progress_grow() {
+    let Some(lt) = libtorrent() else { return };
+    let scratch = Scratch::new("progress-seen");
+    let (torrent, info) = album_torrent(&lt, &scratch, Format::V1);
+    // Slow enough for the seed to see the progress move.
+    let seeder = lt
+        .with_upload_limit(400_000)
+        .seed(&torrent, &scratch.join("source"));
+    empire_download(&info, &scratch.join("get"), seeder.address);
+    let log = seeder.log();
+    let seen: Vec<u32> = tagged(&log, "peer progress: ")
+        .iter()
+        .filter_map(|percent| percent.parse().ok())
+        .collect();
+    let highest = seen.iter().copied().max().unwrap_or(0);
+    assert!(highest >= 90, "libtorrent saw our progress as {seen:?}");
+    assert!(seen.len() > 3, "it moved in steps: {seen:?}");
+}
+
 /// Over TCP; the uTP tests below cover uTP, which libtorrent prefers.
 fn seeds_to_libtorrent(format: Format) {
     let Some(lt) = libtorrent() else { return };

@@ -224,13 +224,16 @@ impl PeerWire {
             return Ok(Flow::Finished);
         }
 
-        // Announce pieces verified through other connections.
+        // Announce every verified piece, even to peers that have it, as
+        // libtorrent does (`send_redundant_have`): seeds learn our
+        // progress only this way. Without it a seed sees the progress we
+        // had when we connected while it keeps uploading to us, and
+        // anti-leech tools (PeerBanHelper's progress check) ban us for
+        // claiming less than we downloaded.
         for index in torrent.swarm.haves_since(&mut self.have_cursor) {
-            if !self.peer_has(index as usize) {
-                self.send(out, PeerMessage::Have { piece_index: index }, now);
-                if self.granted.contains(&index) {
-                    self.send(out, PeerMessage::AllowedFast { piece_index: index }, now);
-                }
+            self.send(out, PeerMessage::Have { piece_index: index }, now);
+            if !self.peer_has(index as usize) && self.granted.contains(&index) {
+                self.send(out, PeerMessage::AllowedFast { piece_index: index }, now);
             }
             self.state.interest_changed = true;
         }

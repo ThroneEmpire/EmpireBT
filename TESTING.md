@@ -9,7 +9,7 @@ EmpireBT has four kinds of tests. Only the first three run in
 | Application tests | `crates/app/src/*.rs` (`mod tests`), `crates/app/tests/qbittorrent.rs` | 33 + 1 (+1 opt in) | nothing |
 | Console unit tests | `crates/console/src/*.rs` (`mod tests`) | 21 | nothing |
 | Web UI tests | `crates/web/src/*.rs` and `crates/web/tests/web.rs` | 9 + 10 | nothing |
-| libtorrent interop tests | `interop/tests/libtorrent.rs` | 37 | libtorrent (skipped without it) |
+| libtorrent interop tests | `interop/tests/libtorrent.rs` | 38 | libtorrent (skipped without it) |
 | Scale benchmark | `crates/backend/examples/scale.rs` | — | run by hand, release build |
 
 There are also 5 unit tests marked `#[ignore = "requires network access"]`.
@@ -172,6 +172,8 @@ The cases:
 - Client identification: libtorrent decodes our BEP 20 peer ID as
   `EM <version>`, never as another client. Once our extension handshake
   arrives, it shows us as `EmpireBT <version>`.
+- Progress others see: a libtorrent seed (qBittorrent's engine, and what
+  PeerBanHelper reads) watches our progress climb while it uploads to us.
 - Anonymous mode: libtorrent connects to an anonymous EmpireBT seed and
   never shows it as EmpireBT or `EM` (it shows "Unknown").
 
