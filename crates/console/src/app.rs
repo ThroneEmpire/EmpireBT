@@ -58,7 +58,11 @@ pub enum Mode {
         field: AddField,
         error: Option<String>,
     },
-    ConfirmRemove(InfoHash),
+    /// Removing a torrent, with its files when `delete_files` is set.
+    ConfirmRemove {
+        torrent: InfoHash,
+        delete_files: bool,
+    },
     Help,
     /// How to reach the web UI, shown when the dashboard opens with it.
     WebInfo,
@@ -633,12 +637,22 @@ impl App {
             Mode::PickFile { .. } => self.handle_pick_file_key(key),
             Mode::Rename { .. } => self.handle_rename_key(key),
             Mode::Settings { .. } => self.handle_settings_key(key),
-            Mode::ConfirmRemove(hash) => {
-                let hash = *hash;
+            Mode::ConfirmRemove {
+                torrent,
+                delete_files,
+            } => {
+                let (hash, delete) = (*torrent, *delete_files);
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                         self.mode = Mode::Normal;
-                        let _ = self.call(Command::Remove(hash));
+                        let _ = self.call(if delete {
+                            Command::RemoveWithFiles(hash)
+                        } else {
+                            Command::Remove(hash)
+                        });
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Char(' ') | KeyCode::Tab => {
+                        *delete_files = !delete;
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         self.mode = Mode::Normal;
@@ -837,7 +851,10 @@ impl App {
                     KeyCode::Char(' ') => Command::Toggle(hash),
                     KeyCode::Char('v') => Command::Recheck(hash),
                     KeyCode::Char('x') | KeyCode::Delete => {
-                        self.mode = Mode::ConfirmRemove(hash);
+                        self.mode = Mode::ConfirmRemove {
+                            torrent: hash,
+                            delete_files: false,
+                        };
                         return;
                     }
                     KeyCode::Char('t') => {
@@ -1608,6 +1625,53 @@ mod tests {
         let torrent = app.engine.snapshot().torrents[0].clone();
         let paths: Vec<_> = torrent.files().into_iter().map(|file| file.path).collect();
         assert_eq!(paths, [PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+        app.engine.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removes_a_torrent_with_its_files_when_asked() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-console-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("downloads")).unwrap();
+        let mut torrent =
+            b"d4:infod6:lengthi5e4:name9:hello.txt12:piece lengthi16384e6:pieces20:".to_vec();
+        torrent.extend([7; 20]);
+        torrent.extend(b"ee");
+        let file = root.join("hello.torrent");
+        std::fs::write(&file, torrent).unwrap();
+        let data = root.join("downloads").join("hello.txt");
+        std::fs::write(&data, b"hello").unwrap();
+
+        let mut app = dashboard(&root);
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        app.handle_paste(&file.to_string_lossy());
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        app.table.select(Some(0));
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmRemove {
+                delete_files: false,
+                ..
+            }
+        ));
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmRemove {
+                delete_files: true,
+                ..
+            }
+        ));
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(app.engine.snapshot().torrents.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while data.exists() {
+            assert!(Instant::now() < deadline, "the file was not deleted");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         app.engine.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

@@ -1095,8 +1095,7 @@ for (const button of document.querySelectorAll(".selection-actions button")) {
     if (["start", "pause", "recheck"].includes(action)) {
       busy(button, act(api(`/api/torrents/${torrent.hash}/${action}`, { method: "POST" })));
     } else if (action === "remove") {
-      confirmDialog(`Remove “${torrent.name}”?`, "Downloaded files stay on disk.", "Remove", () =>
-        act(api(`/api/torrents/${torrent.hash}`, { method: "DELETE" })));
+      removeDialog(torrent);
     } else if (action === "category") {
       categoryDialog(torrent);
     } else if (action === "tags") {
@@ -1199,6 +1198,32 @@ function confirmDialog(title, text, label, confirm) {
     event.preventDefault();
     closeDialog();
     confirm();
+  });
+}
+
+// Removing, optionally with the files, as qBittorrent asks.
+function removeDialog(torrent) {
+  const deleteFiles = element("input", { class: "switch", attrs: { type: "checkbox" } });
+  const where = torrent.savePath ? ` in ${torrent.savePath}` : "";
+  const about = element("p", { class: "muted" });
+  const yes = element("button", { class: "danger", attrs: { type: "submit" } });
+  const update = () => {
+    about.textContent = deleteFiles.checked
+      ? `Its files${where} are deleted for good. Other files there, and files another torrent uses, stay.`
+      : `Its downloaded files stay on disk${where}.`;
+    yes.textContent = deleteFiles.checked ? "Remove and delete files" : "Remove";
+  };
+  deleteFiles.addEventListener("change", update);
+  update();
+  const form = openDialog(`Remove “${torrent.name}”?`, [
+    element("label", { class: "switch-row" }, [element("span", { text: "Also delete the downloaded files" }), deleteFiles]),
+    about,
+  ], [cancelButton(), yes]);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    closeDialog();
+    const query = deleteFiles.checked ? "?deleteFiles=true" : "";
+    act(api(`/api/torrents/${torrent.hash}${query}`, { method: "DELETE" }));
   });
 }
 

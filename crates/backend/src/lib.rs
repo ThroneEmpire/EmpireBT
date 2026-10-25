@@ -65,7 +65,7 @@ pub use resume::ResumeData;
 pub use runtime::Runtime;
 pub use seeder::Seeder;
 pub use session::DownloadSession;
-pub use storage::{Renames, Storage};
+pub use storage::{Deleted, Renames, Storage, delete_files};
 pub use swarm::PeerInfo;
 pub use torrent::{ContentLayout, Torrent, TorrentFileName};
 pub use tracker::{AnnounceEvent, AnnounceRequest, Tracker, TrackerClient, TrackerResponse};

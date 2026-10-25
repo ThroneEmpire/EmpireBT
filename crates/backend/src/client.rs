@@ -510,6 +510,34 @@ impl Client {
         Ok(moved.len())
     }
 
+    /// Where a torrent's files are on disk (padding left out): its folder,
+    /// and each file's full path under it, renames followed.
+    pub fn file_paths(&self, index: usize) -> (PathBuf, Vec<PathBuf>) {
+        let Some(torrent) = self.torrents.get(index) else {
+            return (PathBuf::new(), Vec::new());
+        };
+        let storage = self.storage_for(torrent);
+        let paths = torrent
+            .info()
+            .map(|info| {
+                info.files()
+                    .iter()
+                    .filter(|file| !file.is_padding())
+                    .filter_map(|file| storage.path_for(file.path()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (storage.root().to_owned(), paths)
+    }
+
+    /// Closes open handles to `paths`, such as before deleting them, so
+    /// their space is freed at once.
+    pub fn release_files(&self, paths: &[PathBuf]) {
+        for path in paths {
+            self.storage.forget(path);
+        }
+    }
+
     fn storage_at(&self, index: usize) -> crate::Storage {
         match self.torrents.get(index) {
             Some(torrent) => self.storage_for(torrent),

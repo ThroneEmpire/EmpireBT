@@ -59,6 +59,10 @@ pub enum Command {
     Recheck(InfoHash),
     /// Removes the torrent from the list. Downloaded files stay on disk.
     Remove(InfoHash),
+    /// Removes the torrent and deletes its downloaded files, once its
+    /// transfer has stopped. Files another torrent in the list also uses
+    /// stay, as do other files in its folders.
+    RemoveWithFiles(InfoHash),
     /// Validates, stores, and saves a setting, applying it at once where it
     /// can be.
     ChangeSetting {
@@ -461,6 +465,31 @@ struct Settings {
     binding: empirebt_backend::Binding,
 }
 
+/// A removed torrent's files, deleted once `job` (its transfer, if it had
+/// one) has stopped.
+struct Deletion {
+    name: String,
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+    job: Option<TransferHandle>,
+}
+
+/// A size for notices: `1.5 GiB`.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[derive(Default)]
 struct Activity {
     job: Option<TransferHandle>,
@@ -650,6 +679,8 @@ struct Engine {
     fetches: Vec<Fetch>,
     /// Transfers of removed torrents, kept until their threads exit.
     detached: Vec<TransferHandle>,
+    /// Files of removed torrents to delete once their transfers stop.
+    deletions: Vec<Deletion>,
     seeding: SeedService,
     last_file_sweep: Instant,
     dht_state: DhtState,
@@ -738,6 +769,7 @@ impl Engine {
             verify_queue: VecDeque::new(),
             fetches: Vec::new(),
             detached: Vec::new(),
+            deletions: Vec::new(),
             seeding,
             last_file_sweep: Instant::now(),
             dht_state,
@@ -853,7 +885,11 @@ impl Engine {
                 Ok(Reply::Done)
             }
             Command::Remove(hash) => {
-                self.remove(hash);
+                self.remove(hash, false);
+                Ok(Reply::Done)
+            }
+            Command::RemoveWithFiles(hash) => {
+                self.remove(hash, true);
                 Ok(Reply::Done)
             }
             Command::ChangeSetting { key, value } => {
@@ -1172,6 +1208,7 @@ impl Engine {
             self.start_next_verify();
         }
         self.seeding.tick(&mut self.client, &self.settings);
+        self.delete_removed_files(false);
         self.log_changes();
         if std::mem::take(&mut self.interface_returned) {
             // Most likely a VPN reconnected, perhaps at another address:
@@ -1241,6 +1278,8 @@ impl Engine {
         for job in &jobs {
             self.client.checkpoint(job);
         }
+        // Removed torrents' files go even if a transfer is slow to stop.
+        self.delete_removed_files(true);
         self.save();
         // Saves known nodes so the next run joins the DHT quickly.
         if let Some(dht) = self.client.dht() {
@@ -1718,17 +1757,20 @@ impl Engine {
         true
     }
 
-    fn remove(&mut self, hash: InfoHash) {
+    /// Removes a torrent; with `delete_files`, its files are deleted once
+    /// its transfer has stopped writing (see
+    /// [`Engine::delete_removed_files`]).
+    fn remove(&mut self, hash: InfoHash, delete_files: bool) {
         let Some(index) = self.client.torrent_index(&hash) else {
             return;
         };
-        if let Some(job) = self
+        let (root, paths) = self.client.file_paths(index);
+        let job = self
             .activity
             .remove(&hash)
-            .and_then(|activity| activity.job)
-        {
+            .and_then(|activity| activity.job);
+        if let Some(job) = &job {
             job.cancel();
-            self.detached.push(job);
         }
         self.verify_queue.retain(|queued| *queued != hash);
         let Ok(torrent) = self.client.remove_torrent(index) else {
@@ -1739,14 +1781,107 @@ impl Engine {
         }
         self.seeding.resync = true;
         self.session_dirty = true;
-        self.notify(
-            Level::Info,
-            format!(
-                "Removed {} — downloaded files are still in {}",
-                torrent.display_name(),
-                self.client.config().download_directory().display()
-            ),
-        );
+        let name = torrent.display_name().to_owned();
+        if delete_files && !paths.is_empty() {
+            self.notify(Level::Info, format!("Removed {name}; deleting its files"));
+            self.deletions.push(Deletion {
+                name,
+                root,
+                paths,
+                job,
+            });
+        } else {
+            self.detached.extend(job);
+            let kept = if paths.is_empty() {
+                String::new()
+            } else {
+                format!(" — its files are still in {}", root.display())
+            };
+            self.notify(Level::Info, format!("Removed {name}{kept}"));
+        }
+    }
+
+    /// Deletes the files of removed torrents whose transfers have stopped
+    /// (all of them, with `now`), after the seeding runtime let go of them.
+    /// A file another torrent in the list uses is kept.
+    fn delete_removed_files(&mut self, now: bool) {
+        if self.deletions.is_empty() {
+            return;
+        }
+        let (ready, waiting): (Vec<Deletion>, Vec<Deletion>) = std::mem::take(&mut self.deletions)
+            .into_iter()
+            .partition(|deletion| {
+                now || deletion
+                    .job
+                    .as_ref()
+                    .is_none_or(TransferHandle::is_finished)
+            });
+        self.deletions = waiting;
+        if ready.is_empty() {
+            return;
+        }
+        let in_use: std::collections::HashSet<PathBuf> = (0..self.client.torrents().len())
+            .flat_map(|index| self.client.file_paths(index).1)
+            .collect();
+        for deletion in ready {
+            let listed = deletion.paths.len();
+            let paths: Vec<PathBuf> = deletion
+                .paths
+                .into_iter()
+                .filter(|path| !in_use.contains(path))
+                .collect();
+            let kept = listed - paths.len();
+            self.client.release_files(&paths);
+            let deleted = empirebt_backend::delete_files(&deletion.root, &paths);
+            // A read that raced the deletion may have opened one again.
+            self.client.release_files(&paths);
+            tracing::info!(
+                target: "torrent",
+                "deleted {} files ({} bytes) of {}",
+                deleted.files,
+                deleted.bytes,
+                deletion.name
+            );
+            let shared = match kept {
+                0 => String::new(),
+                1 => "; kept 1 file another torrent in the list uses".to_owned(),
+                count => format!("; kept {count} files another torrent in the list uses"),
+            };
+            match deleted.failures.first() {
+                None if deleted.files == 0 && kept > 0 => self.notify(
+                    Level::Info,
+                    format!(
+                        "Kept the files of {}: another torrent in the list uses them",
+                        deletion.name
+                    ),
+                ),
+                None if deleted.files == 0 => self.notify(
+                    Level::Info,
+                    format!("{} had no files on disk to delete", deletion.name),
+                ),
+                None => self.notify(
+                    Level::Success,
+                    format!(
+                        "Deleted the files of {} ({}){shared}",
+                        deletion.name,
+                        human_bytes(deleted.bytes)
+                    ),
+                ),
+                Some(first) => {
+                    let more = match deleted.failures.len() {
+                        1 => String::new(),
+                        count => format!(" (and {} more)", count - 1),
+                    };
+                    self.notify(
+                        Level::Error,
+                        format!(
+                            "Could not delete every file of {}: {first}{more}",
+                            deletion.name
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     // ----- background bookkeeping ------------------------------------------
@@ -2427,6 +2562,87 @@ mod tests {
                 })
                 .is_err()
         );
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removes_a_torrent_with_its_files_but_nothing_else() {
+        let (handle, root) = engine("delete");
+        let save = root.join("saved");
+        std::fs::create_dir_all(save.join("album/disc")).unwrap();
+        std::fs::write(save.join("album/a.txt"), b"abc").unwrap();
+        std::fs::write(save.join("album/disc/b.txt"), b"defg").unwrap();
+        std::fs::write(save.join("album/cover.jpg"), b"mine").unwrap();
+        let mut torrent = b"d4:infod5:filesld6:lengthi3e4:pathl5:a.txteed6:lengthi4e4:pathl4:disc5:b.txteee4:name5:album12:piece lengthi16384e6:pieces20:".to_vec();
+        torrent.extend([7; 20]);
+        torrent.extend(b"ee");
+        let mut request = AddRequest::new(AddSource::Torrent(torrent));
+        request.save_dir = Some(save.clone());
+        request.start = Some(false);
+        let Ok(Reply::Added(hash)) = handle.call(Command::AddWith(request)) else {
+            panic!("not added");
+        };
+        handle.call(Command::RemoveWithFiles(hash)).unwrap();
+        assert!(handle.snapshot().torrent(&hash).is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while save.join("album/a.txt").exists() {
+            assert!(Instant::now() < deadline, "the files were not deleted");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!save.join("album/disc").exists(), "an emptied folder goes");
+        assert_eq!(
+            std::fs::read(save.join("album/cover.jpg")).unwrap(),
+            b"mine",
+            "files that are not the torrent's stay, and so does their folder"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle
+            .snapshot()
+            .notices
+            .iter()
+            .any(|notice| notice.text.starts_with("Deleted the files of album"))
+        {
+            assert!(Instant::now() < deadline, "no notice");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keeps_files_another_torrent_uses() {
+        let (handle, root) = engine("delete-shared");
+        let save = root.join("saved");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::write(save.join("shared.bin"), b"abc").unwrap();
+        // Two torrents (different hashes) of one file in one folder.
+        let add = |fill: u8| {
+            let mut torrent =
+                b"d4:infod6:lengthi3e4:name10:shared.bin12:piece lengthi16384e6:pieces20:".to_vec();
+            torrent.extend([fill; 20]);
+            torrent.extend(b"ee");
+            let mut request = AddRequest::new(AddSource::Torrent(torrent));
+            request.save_dir = Some(save.clone());
+            request.start = Some(false);
+            match handle.call(Command::AddWith(request)) {
+                Ok(Reply::Added(hash)) => hash,
+                other => panic!("not added: {other:?}"),
+            }
+        };
+        let (first, _second) = (add(1), add(2));
+        handle.call(Command::RemoveWithFiles(first)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle
+            .snapshot()
+            .notices
+            .iter()
+            .any(|notice| notice.text.starts_with("Kept the files of shared.bin"))
+        {
+            assert!(Instant::now() < deadline, "no notice");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(save.join("shared.bin").exists());
         handle.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

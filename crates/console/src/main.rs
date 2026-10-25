@@ -122,10 +122,15 @@ enum Command {
     },
     /// Print the torrent list.
     List,
-    /// Remove a torrent from the list by its number. Files stay on disk.
+    /// Remove a torrent from the list by its number. Files stay on disk
+    /// unless --delete-files is given.
     Remove {
         #[arg(value_name = "NUMBER")]
         index: usize,
+        /// Also delete the torrent's downloaded files. Other files in its
+        /// folder, and files another torrent uses, stay.
+        #[arg(long)]
+        delete_files: bool,
     },
     /// Show settings, or change one with `config set <key> <value>`.
     Config {
@@ -412,13 +417,53 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Config { .. } => unreachable!("handled before loading the session"),
-        Command::Remove { index } => {
+        Command::Remove {
+            index,
+            delete_files,
+        } => {
+            let (root, paths) = client.file_paths(index);
             let torrent = client
                 .remove_torrent(index)
                 .map_err(|_| format!("there is no torrent #{index}; see `empirebt list`"))?;
             store.save(&client)?;
-            println!("removed {} (files kept on disk)", torrent.name());
-            Ok(())
+            if !delete_files {
+                println!(
+                    "removed {} (files kept in {})",
+                    torrent.display_name(),
+                    root.display()
+                );
+                return Ok(());
+            }
+            let in_use: std::collections::HashSet<PathBuf> = (0..client.torrents().len())
+                .flat_map(|other| client.file_paths(other).1)
+                .collect();
+            let (shared, paths): (Vec<PathBuf>, Vec<PathBuf>) =
+                paths.into_iter().partition(|path| in_use.contains(path));
+            let deleted = empirebt_backend::delete_files(&root, &paths);
+            let files = |count: usize| {
+                if count == 1 {
+                    "1 file".to_owned()
+                } else {
+                    format!("{count} files")
+                }
+            };
+            println!(
+                "removed {} and deleted {} ({} bytes)",
+                torrent.display_name(),
+                files(deleted.files),
+                deleted.bytes
+            );
+            if !shared.is_empty() {
+                println!("kept {} another torrent uses", files(shared.len()));
+            }
+            for failure in &deleted.failures {
+                eprintln!("could not delete {failure}");
+            }
+            if deleted.failures.is_empty() {
+                Ok(())
+            } else {
+                Err("some files could not be deleted".to_owned())
+            }
         }
     }
 }

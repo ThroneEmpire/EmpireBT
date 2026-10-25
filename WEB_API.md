@@ -79,7 +79,7 @@ for the right password.
 | `POST /api/torrents/{hash}/pause` | | `204` |
 | `POST /api/torrents/{hash}/toggle` | | `204` (start if paused, else pause) |
 | `POST /api/torrents/{hash}/recheck` | | `204` |
-| `DELETE /api/torrents/{hash}` | | `204`; downloaded files stay on disk |
+| `DELETE /api/torrents/{hash}` | | `204`; downloaded files stay on disk. With `?deleteFiles=true` they are deleted once its transfer stops (not other files in its folders, nor files another torrent uses) |
 | `PUT /api/torrents/{hash}/category` | `{"category": "ISOs"}` (`null` for none) | `204`; a new name creates the category |
 | `PUT /api/torrents/{hash}/tags` | `{"tags": ["linux", "web"]}` | `204`; replaces all tags |
 | `PUT /api/torrents/{hash}/name` | `{"name": "My album"}` (`null` or empty for its own name) | `204`; only the name shown changes |

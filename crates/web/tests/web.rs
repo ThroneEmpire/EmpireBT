@@ -493,12 +493,29 @@ fn a_signed_in_browser_drives_the_engine() {
     assert_eq!(details["originalName"], "clip.mkv");
     assert_eq!(details["files"][0]["path"], "clip/clip.mkv");
     assert_eq!(details["files"][0]["original"], "clip.mkv");
-    browser(
+    // Removing it can delete its files too.
+    let file = running.root.join("downloads").join("clip").join("clip.mkv");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"partial").unwrap();
+    let removed = browser(
         &running,
         &cookie,
         "DELETE",
-        &format!("/api/torrents/{clip}"),
+        &format!("/api/torrents/{clip}?deleteFiles=true"),
         "",
+    );
+    assert_eq!(removed.status, 204, "{}", removed.body);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while file.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the file was not deleted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !file.parent().unwrap().exists(),
+        "its emptied folder goes too"
     );
     browser(
         &running,

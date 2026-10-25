@@ -947,8 +947,20 @@ async fn upload(
     .await
 }
 
-async fn remove(State(state): State<Shared>, Path(hash): Path<String>) -> Response {
+#[derive(Deserialize)]
+struct RemoveOptions {
+    /// Also delete the torrent's downloaded files.
+    #[serde(rename = "deleteFiles", default)]
+    delete_files: bool,
+}
+
+async fn remove(
+    State(state): State<Shared>,
+    Path(hash): Path<String>,
+    Query(options): Query<RemoveOptions>,
+) -> Response {
     match known_hash(&state, &hash) {
+        Ok(hash) if options.delete_files => run(&state, Command::RemoveWithFiles(hash)).await,
         Ok(hash) => run(&state, Command::Remove(hash)).await,
         Err(response) => response,
     }

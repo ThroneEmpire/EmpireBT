@@ -54,7 +54,7 @@ cargo run --release -p empirebt-console -- [COMMAND]
 | `empirebt ui --web` | Opens the dashboard and serves the web UI too |
 | `empirebt serve` | Serves the web UI without the dashboard, until Ctrl-C |
 | `empirebt add <files, URLs, or magnets…>` | Adds torrents without opening anything (`-d <folder>` saves them there; `--layout nosubfolder` leaves out the top folder, `--layout subfolder` puts a single file in a folder) |
-| `empirebt list` / `empirebt remove <number>` | Lists or removes torrents (files stay on disk) |
+| `empirebt list` / `empirebt remove <number>` | Lists or removes torrents (files stay on disk; `--delete-files` deletes them) |
 | `empirebt config` / `empirebt config set <key> <value>` | Shows or changes settings |
 | `empirebt web password` / `token <name>` / `revoke-tokens` | Manages access to the web UI (works while EmpireBT runs) |
 | `empirebt health` | Succeeds if a running EmpireBT's web UI answers (for health checks) |
@@ -114,7 +114,7 @@ files, peers (address, country, client, connection, speeds) and trackers.
 | `a` | Add a `.torrent` file, URL, or magnet link, and choose its folder and content layout (↑↓ switch fields, Tab completes paths, ←→ change the layout; pasting works) |
 | `s` / `p` | Start / pause |
 | `v` | Recheck the downloaded data |
-| `x` | Remove |
+| `x` | Remove; `d` in the dialog deletes the downloaded files too |
 | `C` / `t` | Set the category / edit the tags (Tab completes known names) |
 | `R` | Rename the torrent (only the name shown; empty shows its own again) |
 | `r` | Rename a file or folder on disk: pick it, then type its new name (`/` moves it into a folder) |

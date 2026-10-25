@@ -42,7 +42,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Normal => {}
         Mode::Help => draw_help(frame, app),
         Mode::WebInfo => draw_web_info(frame, app),
-        Mode::ConfirmRemove(_) => draw_confirm_remove(frame, app),
+        Mode::ConfirmRemove { .. } => draw_confirm_remove(frame, app),
         Mode::Add { .. } => draw_add(frame, app),
         Mode::Settings { .. } => draw_settings(frame, app),
         Mode::Label { .. } => draw_label(frame, app),
@@ -1413,15 +1413,41 @@ fn key_hints(hints: &[(&str, &str)]) -> Line<'static> {
 }
 
 fn draw_confirm_remove(frame: &mut Frame, app: &App) {
-    let Mode::ConfirmRemove(hash) = &app.mode else {
+    let Mode::ConfirmRemove {
+        torrent,
+        delete_files,
+    } = &app.mode
+    else {
         return;
     };
-    let name = app
-        .rows()
-        .find(|row| row.hash == *hash)
-        .map(|row| row.name.to_owned())
+    let row = app.rows().find(|row| row.hash == *torrent);
+    let name = row.map(|row| row.name.to_owned()).unwrap_or_default();
+    let folder = row
+        .map(|row| row.save_dir.display().to_string())
         .unwrap_or_default();
-    let inner = dialog(frame, "Remove torrent", 64, 8);
+    let (mark, about, action) = if *delete_files {
+        (
+            Span::styled("[x]", Style::new().fg(Color::LightRed).bold()),
+            Span::styled(
+                format!(
+                    "Its files in {folder} are deleted for good. Other files there, and files \
+                     another torrent uses, stay."
+                ),
+                Style::new().fg(Color::LightRed),
+            ),
+            "remove and delete files",
+        )
+    } else {
+        (
+            Span::styled("[ ]", Style::new().fg(MUTED)),
+            Span::styled(
+                format!("Its downloaded files stay in {folder}."),
+                Style::new().fg(Color::Gray),
+            ),
+            "remove",
+        )
+    };
+    let inner = dialog(frame, "Remove torrent", 72, 11);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
@@ -1429,12 +1455,11 @@ fn draw_confirm_remove(frame: &mut Frame, app: &App) {
                 Span::raw(name).bold(),
                 Span::raw(" from EmpireBT?"),
             ]),
-            Line::from(Span::styled(
-                "Downloaded files stay on disk.",
-                Style::new().fg(Color::Gray),
-            )),
             Line::raw(""),
-            key_hints(&[("y", "remove"), ("n", "keep")]),
+            Line::from(vec![mark, Span::raw(" Also delete the downloaded files")]),
+            Line::from(about),
+            Line::raw(""),
+            key_hints(&[("d", "delete files too"), ("y", action), ("n", "keep")]),
         ])
         .wrap(Wrap { trim: true }),
         inner,

@@ -822,6 +822,47 @@ fn write_all_at(
     Ok(())
 }
 
+/// What [`delete_files`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Deleted {
+    pub files: usize,
+    pub bytes: u64,
+    /// Files that could not be deleted, with why.
+    pub failures: Vec<String>,
+}
+
+/// Deletes `paths` (files inside `root`) and then the folders under `root`
+/// they leave empty; `root` itself stays. Files already gone are fine.
+pub fn delete_files(root: &Path, paths: &[PathBuf]) -> Deleted {
+    let mut deleted = Deleted::default();
+    for path in paths.iter().filter(|path| path.starts_with(root)) {
+        let size = std::fs::symlink_metadata(path).map(|meta| meta.len());
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                deleted.files += 1;
+                deleted.bytes += size.unwrap_or(0);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => deleted
+                .failures
+                .push(format!("{}: {error}", path.display())),
+        }
+    }
+    // Deepest folders first, so a parent empties once its children go.
+    let mut folders: Vec<&Path> = paths
+        .iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|folder| folder.starts_with(root) && *folder != root)
+        .collect();
+    folders.sort_by_key(|folder| std::cmp::Reverse(folder.components().count()));
+    folders.dedup();
+    for folder in folders {
+        // Only empty ones go; anything else in them stays.
+        let _ = std::fs::remove_dir(folder);
+    }
+    deleted
+}
+
 #[cfg(test)]
 mod tests {
     /// A file read first and written later: its read-only handle leaves the
