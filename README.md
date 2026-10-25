@@ -110,6 +110,7 @@ files, peers (address, country, client, connection, speeds) and trackers.
 | `x` | Remove |
 | `C` / `t` | Set the category / edit the tags (Tab completes known names) |
 | `f` / `Esc` | Show one category or tag / show everything again |
+| `S` | Sort the list: by upload or download speed, size, progress, peers, time left, name |
 | `c` | Settings |
 | `?` | Every shortcut |
 

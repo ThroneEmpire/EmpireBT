@@ -31,6 +31,10 @@ pub enum Mode {
     Filter {
         selected: usize,
     },
+    /// Choosing the order of the list.
+    Sort {
+        selected: usize,
+    },
     Add {
         input: PathInput,
         /// The folder to save it in, the download directory at first.
@@ -113,6 +117,75 @@ impl Filter {
     }
 }
 
+/// The order of the list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Sort {
+    /// The order torrents were added in.
+    #[default]
+    Added,
+    Name,
+    Size,
+    Progress,
+    Down,
+    Up,
+    Peers,
+    TimeLeft,
+}
+
+impl Sort {
+    pub const ALL: [Self; 8] = [
+        Self::Added,
+        Self::Name,
+        Self::Size,
+        Self::Progress,
+        Self::Down,
+        Self::Up,
+        Self::Peers,
+        Self::TimeLeft,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Added => "Added",
+            Self::Name => "Name",
+            Self::Size => "Size",
+            Self::Progress => "Progress",
+            Self::Down => "Download speed",
+            Self::Up => "Upload speed",
+            Self::Peers => "Peers",
+            Self::TimeLeft => "Time left",
+        }
+    }
+
+    /// Whether `a` comes before `b`: names A to Z, time left soonest
+    /// first, and amounts (size, progress, speeds, peers) largest first.
+    fn compare(self, a: &TorrentView, b: &TorrentView) -> std::cmp::Ordering {
+        let amount = |view: &TorrentView| -> f64 {
+            match self {
+                Self::Size => view.size().unwrap_or(0) as f64,
+                Self::Progress => view.fraction.unwrap_or(-1.0),
+                Self::Down => view.down_rate,
+                Self::Up => view.up_rate,
+                Self::Peers => view.peers.unwrap_or(0) as f64,
+                _ => 0.0,
+            }
+        };
+        let time_left = |view: &TorrentView| {
+            if view.down_rate >= 1.0 && view.remaining() > 0 {
+                view.remaining() as f64 / view.down_rate
+            } else {
+                f64::INFINITY
+            }
+        };
+        match self {
+            Self::Added => std::cmp::Ordering::Equal,
+            Self::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            Self::TimeLeft => time_left(a).total_cmp(&time_left(b)),
+            _ => amount(b).total_cmp(&amount(a)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
     Overview,
@@ -150,6 +223,7 @@ pub struct App {
     /// A torrent to select once a snapshot shows it.
     select: Option<InfoHash>,
     pub filter: Filter,
+    pub sort: Sort,
     /// Indexes into the snapshot's torrents of those the filter shows.
     visible: Vec<usize>,
     pub table: TableState,
@@ -176,6 +250,7 @@ impl App {
             view,
             select: None,
             filter: Filter::All,
+            sort: Sort::Added,
             table,
             tab: DetailTab::Overview,
             mode: Mode::Normal,
@@ -215,7 +290,16 @@ impl App {
         if fresh {
             return;
         }
-        if let Ok(Reply::Peers(peers)) = self.engine.call(Command::Peers(hash)) {
+        if let Ok(Reply::Peers(mut peers)) = self.engine.call(Command::Peers(hash)) {
+            // Who gets the most from us first, then who gives the most.
+            peers.sort_by(|a, b| {
+                let (a, b) = (&a.info, &b.info);
+                b.up_rate
+                    .total_cmp(&a.up_rate)
+                    .then(b.down_rate.total_cmp(&a.down_rate))
+                    .then(b.uploaded.cmp(&a.uploaded))
+                    .then(b.downloaded.cmp(&a.downloaded))
+            });
             self.peers = Some((hash, peers, Instant::now()));
         }
     }
@@ -385,6 +469,10 @@ impl App {
         self.visible = (0..self.view.torrents.len())
             .filter(|index| self.filter.matches(&self.view.torrents[*index]))
             .collect();
+        // Ties keep the order torrents were added in.
+        let (sort, torrents) = (self.sort, &self.view.torrents);
+        self.visible
+            .sort_by(|a, b| sort.compare(&torrents[*a], &torrents[*b]).then(a.cmp(b)));
         if let Some(index) = selected.and_then(|hash| self.visible_position(&hash)) {
             self.table.select(Some(index));
         }
@@ -424,6 +512,7 @@ impl App {
             Mode::Help | Mode::WebInfo => self.mode = Mode::Normal,
             Mode::Label { .. } => self.handle_label_key(key),
             Mode::Filter { .. } => self.handle_filter_key(key),
+            Mode::Sort { .. } => self.handle_sort_key(key),
             Mode::Settings { .. } => self.handle_settings_key(key),
             Mode::ConfirmRemove(hash) => {
                 let hash = *hash;
@@ -573,6 +662,13 @@ impl App {
                 self.mode = self.add_mode(PathInput::default());
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('S') => {
+                let selected = Sort::ALL
+                    .iter()
+                    .position(|sort| *sort == self.sort)
+                    .unwrap_or(0);
+                self.mode = Mode::Sort { selected };
+            }
             KeyCode::Char('f') => {
                 let selected = self
                     .filter_choices()
@@ -831,6 +927,26 @@ impl App {
         self.refresh();
     }
 
+    fn handle_sort_key(&mut self, key: KeyEvent) {
+        let Mode::Sort { selected } = &mut self.mode else {
+            return;
+        };
+        let last = Sort::ALL.len() - 1;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(last),
+            KeyCode::Home | KeyCode::Char('g') => *selected = 0,
+            KeyCode::End | KeyCode::Char('G') => *selected = last,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.sort = Sort::ALL[*selected];
+                self.mode = Mode::Normal;
+                self.refresh();
+            }
+            _ => {}
+        }
+    }
+
     // ----- helpers ------------------------------------------------------------
 
     fn visible_position(&self, hash: &InfoHash) -> Option<usize> {
@@ -1061,6 +1177,34 @@ mod tests {
             complete_label("fav", &known, LabelKind::Category).as_deref(),
             Some("Favorite")
         );
+    }
+
+    /// `S` picks the order; the selection stays on its torrent.
+    #[test]
+    fn sorts_the_list_and_keeps_the_selection() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-console-sort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = dashboard(&root);
+        for (byte, name) in [(1u8, "zebra"), (2, "apple"), (3, "mango")] {
+            let hex: String = [byte; 20].iter().map(|b| format!("{b:02x}")).collect();
+            app.call(Command::Add(format!("magnet:?xt=urn:btih:{hex}&dn={name}")))
+                .unwrap();
+        }
+        app.tick();
+        let names = |app: &App| app.rows().map(|row| row.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&app), ["zebra", "apple", "mango"]);
+        app.table.select(Some(0)); // zebra
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('S')));
+        assert!(matches!(app.mode, Mode::Sort { selected: 0 }));
+        app.handle_key(KeyEvent::from(KeyCode::Down)); // Name
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.sort, Sort::Name);
+        assert_eq!(names(&app), ["apple", "mango", "zebra"]);
+        assert_eq!(app.row(app.selected().unwrap()).unwrap().name, "zebra");
+        app.engine.shutdown();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The add dialog's second field picks the folder; ↑↓ move between

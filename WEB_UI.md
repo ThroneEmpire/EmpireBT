@@ -23,7 +23,9 @@ that browser only.
 The **Peers** tab lists each connected peer with its country flag, address,
 client, how it is connected (`in`/`out`, `uTP`/`TCP`, `enc` when
 encrypted; hover for what it is doing), its progress, speeds, and the
-bytes exchanged. Countries come from the free
+bytes downloaded from and uploaded to it. It opens sorted by upload speed,
+so the peers you are sending to come first, shown in green; click a column
+(or, on a phone, use the menu above the list) to sort by anything else. Countries come from the free
 [DB-IP Lite](https://db-ip.com) country database (CC BY 4.0), which
 EmpireBT downloads in the background (a few MB, through the chosen
 network interface) and refreshes monthly, as qBittorrent does. Turn it off

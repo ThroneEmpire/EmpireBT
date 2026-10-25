@@ -20,6 +20,7 @@ const ui = {
   tab: "overview",
   details: null,
   peers: null, // { hash, list, attribution }
+  peerSort: { key: "up", desc: true },
   seenNotice: 0,
   events: null,
   rows: new Map(), // hash → row (see makeRow)
@@ -860,14 +861,64 @@ function peerFlags(peer) {
   return { text: flags.join(" "), title: said.join(", ") };
 }
 
+// How the peer list can be ordered: label, value, and whether largest
+// first is the natural direction.
+const PEER_SORTS = {
+  up: ["Upload speed", (peer) => peer.up, true],
+  down: ["Download speed", (peer) => peer.down, true],
+  uploaded: ["Uploaded", (peer) => peer.uploaded, true],
+  downloaded: ["Downloaded", (peer) => peer.downloaded, true],
+  progress: ["Progress", (peer) => peer.progress ?? -1, true],
+  client: ["Client", (peer) => (peer.client || "").toLowerCase(), false],
+  country: ["Country", (peer) => peer.country || "~", false],
+  address: ["Address", (peer) => peer.address, false],
+};
+
+function setPeerSort(key) {
+  const natural = PEER_SORTS[key][2];
+  ui.peerSort = ui.peerSort.key === key
+    ? { key, desc: !ui.peerSort.desc }
+    : { key, desc: natural };
+  renderDetail(true);
+}
+
+function sortedPeers(list) {
+  const [, value] = PEER_SORTS[ui.peerSort.key];
+  const direction = ui.peerSort.desc ? -1 : 1;
+  // Ties: who gets most from us, then who gives most.
+  const tie = (a, b) => b.up - a.up || b.down - a.down || b.uploaded - a.uploaded;
+  return [...list].sort((a, b) => {
+    const x = value(a);
+    const y = value(b);
+    if (x < y) return -direction;
+    if (x > y) return direction;
+    return tie(a, b);
+  });
+}
+
 function peersView() {
   const peers = ui.peers;
   if (!peers || peers.hash !== ui.selected) return [element("p", { class: "muted", text: "Loading…" })];
   if (peers.list.length === 0) return [element("p", { class: "muted", text: "No peers connected." })];
-  const rows = peers.list.map((peer) => {
+  const list = sortedPeers(peers.list);
+  const sending = list.filter((peer) => peer.up >= 1).length;
+  const receiving = list.filter((peer) => peer.down >= 1).length;
+  // On a phone the headers are hidden; this menu sorts there.
+  const menu = element("select", {
+    attrs: { "aria-label": "Sort peers by" },
+    on: { change: (event) => setPeerSort(event.target.value) },
+  }, Object.entries(PEER_SORTS).map(([key, [label]]) =>
+    element("option", { text: label, attrs: { value: key } })));
+  menu.value = ui.peerSort.key;
+  const summary = element("div", { class: "peers-bar" }, [
+    element("span", { class: "muted", text:
+      `${list.length} peer${list.length === 1 ? "" : "s"} · sending to ${sending} · getting from ${receiving}` }),
+    element("label", { class: "sort" }, [icon("sort"), menu]),
+  ]);
+  const rows = list.map((peer) => {
     const flags = peerFlags(peer);
     const country = peer.country && peer.country !== "ZZ" ? peer.country : "";
-    return element("tr", {}, [
+    return element("tr", { class: peer.up >= 1 ? "sending" : "" }, [
       element("td", { class: "country", title: country }, [
         element("span", { class: "flag", text: flag(country), attrs: { "aria-hidden": "true" } }),
         element("span", { class: "code", text: country }),
@@ -878,15 +929,31 @@ function peersView() {
       element("td", { class: "num", text: peer.progress === null ? "" : `${(peer.progress * 100).toFixed(0)}%` }),
       element("td", { class: "num down", text: rate(peer.down) }),
       element("td", { class: "num up", text: rate(peer.up) }),
-      element("td", { class: "num total", text: `${bytes(peer.downloaded)} / ${bytes(peer.uploaded)}` }),
+      element("td", { class: "num total got", text: peer.downloaded ? bytes(peer.downloaded) : "", title: "Downloaded from it" }),
+      element("td", { class: "num total sent", text: peer.uploaded ? bytes(peer.uploaded) : "", title: "Uploaded to it" }),
     ]);
   });
-  const head = element("thead", {}, [element("tr", {}, ["", "Address", "Client", "Flags", "Done", "Down", "Up", "Got / gave"]
-    .map((text, index) => element("th", { class: index >= 4 ? "num" : "", text })))]);
+  const columns = [
+    ["", "country"], ["Address", "address"], ["Client", "client"], ["Flags", null],
+    ["Done", "progress"], ["Down", "down"], ["Up", "up"], ["Downloaded", "downloaded"], ["Uploaded", "uploaded"],
+  ];
+  const head = element("thead", {}, [element("tr", {}, columns.map(([text, key], index) => {
+    const numeric = index >= 4;
+    if (!key) return element("th", { text });
+    const active = ui.peerSort.key === key;
+    return element("th", {
+      class: numeric ? "num" : "",
+      attrs: { "aria-sort": active ? (ui.peerSort.desc ? "descending" : "ascending") : "none" },
+    }, [element("button", {
+      class: `peer-sort${active ? " sorted" : ""}${active && ui.peerSort.desc ? " desc" : ""}`,
+      text: text || "Country",
+      on: { click: () => setPeerSort(key) },
+    })]);
+  }))]);
   const credit = peers.list.some((peer) => peer.country)
     ? element("p", { class: "credit muted", text: peers.attribution })
     : null;
-  return [element("table", { class: "peers" }, [head, element("tbody", {}, rows)]), credit].filter(Boolean);
+  return [summary, element("table", { class: "peers" }, [head, element("tbody", {}, rows)]), credit].filter(Boolean);
 }
 
 function renderNotices(notices) {

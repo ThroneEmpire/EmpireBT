@@ -1,7 +1,7 @@
 //! Renders the dashboard: header, torrent table, detail pane, footer, and
 //! modal dialogs.
 
-use crate::app::{App, DetailTab, Filter, LabelKind, Mode};
+use crate::app::{App, DetailTab, Filter, LabelKind, Mode, Sort};
 use crate::format;
 use crate::input::PathInput;
 use empirebt_app::{DhtState, Level, SeedStatus, Status, TorrentView as RowView};
@@ -47,6 +47,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Settings { .. } => draw_settings(frame, app),
         Mode::Label { .. } => draw_label(frame, app),
         Mode::Filter { .. } => draw_filter(frame, app),
+        Mode::Sort { .. } => draw_sort(frame, app),
     }
 }
 
@@ -340,7 +341,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     widths.push(Constraint::Length(11));
 
-    let title = match &app.filter {
+    let mut title = match &app.filter {
         Filter::All => Line::from(vec![
             Span::styled(" Torrents ", Style::new().fg(ACCENT).bold()),
             Span::styled(format!("{} ", app.len()), Style::new().fg(MUTED)),
@@ -357,6 +358,12 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
         ]),
     };
+    if app.sort != Sort::Added {
+        title.push_span(Span::styled(
+            format!("· by {} ", app.sort.label().to_lowercase()),
+            Style::new().fg(ACCENT),
+        ));
+    }
     let empty = rows.is_empty();
     let table = Table::new(rows, widths)
         .header(header)
@@ -620,8 +627,11 @@ fn draw_peers(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         peers.len()
     };
-    let header = Row::new(["", "Address", "Client", "Flags", "Done", "Down", "Up"])
-        .style(Style::new().fg(MUTED));
+    // Sorted by what we upload to each, then what each sends us.
+    let header = Row::new([
+        "", "Address", "Client", "Flags", "Done", "Down", "Up ▼", "Sent",
+    ])
+    .style(Style::new().fg(MUTED));
     let mut rows: Vec<Row> = peers
         .iter()
         .take(shown)
@@ -643,7 +653,12 @@ fn draw_peers(frame: &mut Frame, app: &App, area: Rect) {
                 let text = format::rate(value);
                 Cell::from(Line::styled(text, Style::new().fg(color)).right_aligned())
             };
-            Row::new([
+            let sent = if info.uploaded > 0 {
+                format::bytes(info.uploaded)
+            } else {
+                String::new()
+            };
+            let row = Row::new([
                 Cell::from(peer.country_code().unwrap_or("").to_owned()),
                 Cell::from(info.address.to_string()),
                 Cell::from(info.client.clone().unwrap_or_default()),
@@ -651,7 +666,14 @@ fn draw_peers(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(Line::from(progress).right_aligned()),
                 rate(info.down_rate, DOWN),
                 rate(info.up_rate, UP),
-            ])
+                Cell::from(Line::from(sent).right_aligned()),
+            ]);
+            // Peers we are sending to right now stand out.
+            if info.up_rate >= 1.0 {
+                row.style(Style::new().fg(UP))
+            } else {
+                row
+            }
         })
         .collect();
     if shown < peers.len() {
@@ -674,6 +696,7 @@ fn draw_peers(frame: &mut Frame, app: &App, area: Rect) {
                 Constraint::Fill(1),
                 Constraint::Length(11),
                 Constraint::Length(4),
+                Constraint::Length(10),
                 Constraint::Length(10),
                 Constraint::Length(10),
             ],
@@ -792,6 +815,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("v", "Recheck"),
             ("x", "Remove"),
             ("f", "Filter"),
+            ("S", "Sort"),
             ("c", "Settings"),
             ("⇥", "Details"),
             ("?", "Help"),
@@ -810,7 +834,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(spans)
     };
     // Drop the least essential hints first; help and quit always stay.
-    for optional in ["⇥", "v", "f", "c", "x"] {
+    for optional in ["⇥", "S", "v", "f", "c", "x"] {
         if render_hints(&hints).width() <= area.width as usize {
             break;
         }
@@ -1152,6 +1176,47 @@ fn draw_filter(frame: &mut Frame, app: &App) {
     );
 }
 
+fn draw_sort(frame: &mut Frame, app: &App) {
+    let Mode::Sort { selected } = &app.mode else {
+        return;
+    };
+    let height = Sort::ALL.len() as u16 + 5;
+    let inner = dialog(frame, "Sort by", 40, height);
+    let [list, hint] = Layout::vertical([
+        Constraint::Length(Sort::ALL.len() as u16),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+    let lines: Vec<Line> = Sort::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, sort)| {
+            let chosen = index == *selected;
+            let mut spans = vec![
+                Span::styled(if chosen { "▌ " } else { "  " }, Style::new().fg(ACCENT)),
+                Span::styled(sort.label(), Style::new().fg(Color::Gray)),
+            ];
+            if *sort == app.sort {
+                spans.push(Span::styled("  (now)", Style::new().fg(MUTED)));
+            }
+            let line = Line::from(spans);
+            if chosen {
+                line.style(Style::new().bg(Color::Indexed(236)).bold())
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), list);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw(""),
+            key_hints(&[("↑↓", "select"), ("Enter", "sort"), ("Esc", "close")]),
+        ]),
+        hint,
+    );
+}
+
 fn key_hints(hints: &[(&str, &str)]) -> Line<'static> {
     let mut spans = Vec::new();
     for (index, (key, label)) in hints.iter().enumerate() {
@@ -1393,6 +1458,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
                 ("t", "edit tags (comma-separated)"),
                 ("C", "set category"),
                 ("f", "filter by category or tag"),
+                ("S", "sort: by upload speed, size, progress…"),
                 ("esc", "show all torrents again"),
             ],
         ),

@@ -474,6 +474,27 @@ button.chip { padding: 6px 12px; font-size: 13px; }
 .peers .client { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 .peers .flags { font-size: 12px; }
 .peers .total { color: var(--muted); font-size: 12px; }
+.peers-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; font-size: 12px; flex-wrap: wrap; }
+.peers-bar .sort { display: flex; }
+.peers-bar .sort select { appearance: none; -webkit-appearance: none; width: auto; padding: 5px 10px 5px 30px; font-size: 13px; background: var(--surface-2); }
+.peers .peer-sort {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font: inherit;
+  color: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+}
+.peers .peer-sort:active:not(:disabled) { transform: none; }
+.peers .peer-sort.sorted { color: var(--accent); }
+.peers .peer-sort.sorted::after { content: " ▲"; font-size: 8px; }
+.peers .peer-sort.sorted.desc::after { content: " ▼"; }
+@media (hover: hover) { .peers .peer-sort:hover:not(:disabled) { background: none; color: var(--text); } }
+/* Peers we are sending to right now stand out. */
+.peers tr.sending td { color: var(--up); }
+.peers tr.sending td:first-child { box-shadow: inset 3px 0 0 var(--up); }
+.peers tr.sending .code, .peers tr.sending .client, .peers tr.sending .flags, .peers tr.sending .total { color: color-mix(in srgb, var(--up) 75%, var(--muted)); }
 .credit { font-size: 11px; margin: 10px 0 0; text-align: right; color: var(--faint); }
 
 /* ----- dialogs and toasts ----- */
@@ -799,7 +820,10 @@ input[type="file"]::file-selector-button {
   .peers tr {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr) auto auto;
-    grid-template-areas: "country address down up" "client client flags done";
+    grid-template-areas:
+      "country address down up"
+      "client client done done"
+      "flags flags got sent";
     gap: 3px 10px;
     padding: 10px 0;
     border-bottom: 1px solid var(--line);
@@ -814,7 +838,20 @@ input[type="file"]::file-selector-button {
   .peers td:nth-child(5) { grid-area: done; font-size: 12px; }
   .peers td:nth-child(6) { grid-area: down; font-weight: 600; }
   .peers td:nth-child(7) { grid-area: up; font-weight: 600; }
-  .peers td:nth-child(8) { display: none; }
+  .peers td:nth-child(8) { grid-area: got; font-size: 12px; }
+  .peers td:nth-child(9) { grid-area: sent; font-size: 12px; }
+  .peers td:nth-child(8):not(:empty)::before { content: "↓ "; }
+  .peers td:nth-child(9):not(:empty)::before { content: "↑ "; }
+  .peers tr.sending {
+    background: color-mix(in srgb, var(--up) 9%, transparent);
+    border-radius: 10px;
+    margin: 0 -8px;
+    padding: 10px 8px;
+    border-bottom-color: transparent;
+  }
+  .peers tr.sending td:first-child { box-shadow: none; }
+  .peers-bar { font-size: 13px; }
+  .peers-bar .sort select { font-size: 16px; padding: 7px 12px 7px 32px; }
   .credit { text-align: center; }
 
   /* Dialogs rise from the bottom and can be dragged back down. */
