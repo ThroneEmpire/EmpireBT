@@ -256,9 +256,18 @@ connections it already has.
 
 ### Finding peers
 
-- **Trackers.** EmpireBT announces to every HTTP, HTTPS and UDP tracker at
-  once, each on its own interval. A dead tracker never delays the others,
-  and an unreachable tracker host is skipped for every torrent for a while.
+- **Trackers.** EmpireBT announces to every tier of HTTP, HTTPS and UDP
+  trackers at once, each on its own interval, and within a tier to one
+  tracker, moving to the next if it fails (BEP 12, as qBittorrent does by
+  default). A dead tracker never delays the others, and an unreachable
+  tracker host is skipped for every torrent for a while.
+- **Honest counts for private trackers.** Trackers hear what this session
+  uploaded and downloaded: data already on disk is never counted as
+  downloaded, a finished download's uploads are not reported again once it
+  seeds, and backup URLs in one tier never each get the same upload.
+  Pausing or quitting sends `stopped` with the final counts. Announces
+  carry the same parameters as libtorrent's (`corrupt`, `key`, `numwant`,
+  `no_peer_id`).
 - **The mainline DHT** (BEP 5, and BEP 32 for IPv6). Lookups are fast at
   first, then slow gradually to every 15 minutes for a torrent that finds
   no new peers, without ever stopping. Known nodes are saved between runs,

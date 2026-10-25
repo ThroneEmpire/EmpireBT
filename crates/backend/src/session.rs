@@ -369,7 +369,7 @@ impl DownloadSession {
                 "maximum peer connections must be greater than zero".to_owned(),
             ));
         }
-        let trackers = TrackerClient::from_urls(self.info.tracker_urls().to_vec())?
+        let trackers = TrackerClient::from_tiers(self.info.tracker_tiers().to_vec())?
             .with_binding(self.connect.binding());
         let torrent = self.active(self.check_local_pieces()?);
         if torrent.is_complete() {
@@ -483,107 +483,138 @@ impl DownloadSession {
                 }),
             )
         };
-        let request = |hash, event| self.announce_request(hash, port, event);
-        let mut downloaded = 0;
-        let mut last_error = None;
-        let collect = |announcer: &mut crate::discovery::Announcer,
-                       last_error: &mut Option<crate::BackendError>| {
-            announcer.start_due(&hashes, request);
-            let collected = announcer.collect();
-            if let Some(best) = &collected.best {
-                self.progress.set_swarm(best);
-            }
-            if let Some(error) = collected.error {
-                self.progress.record_error(&error);
-                *last_error = Some(error);
-            }
-        };
-        if !announcer.is_empty() {
-            // The first round waits for one tracker to answer, or all to
-            // fail, so it has peers to try; the rest keep coming meanwhile.
-            self.progress.set_phase(TransferPhase::Announcing);
-            let deadline = Instant::now() + self.timeout + Duration::from_secs(1);
-            loop {
-                collect(&mut announcer, &mut last_error);
-                if announcer.succeeded()
-                    || announcer.all_answered()
-                    || self.swarm.has_pending()
-                    || Instant::now() >= deadline
-                {
-                    break;
+        // Trackers count what this session downloads, not what was on disk
+        // already (checked before this).
+        let on_disk = self.progress.verified_bytes();
+        let request = |hash, event| self.announce_request(hash, port, event, on_disk);
+        let result = (|| {
+            let mut downloaded = 0;
+            let mut last_error = None;
+            let collect = |announcer: &mut crate::discovery::Announcer,
+                           last_error: &mut Option<crate::BackendError>| {
+                announcer.start_due(&hashes, request);
+                let collected = announcer.collect();
+                if let Some(best) = &collected.best {
+                    self.progress.set_swarm(best);
                 }
-                self.progress.sleep(TRACKER_POLL)?;
-            }
-        }
-        for round in 0..max_rounds {
-            collect(&mut announcer, &mut last_error);
-            if let Ok(found) = found.lock() {
-                remember_peers(&mut peers, &found);
-            }
-            self.progress.check_cancelled()?;
-            // Peers learned from trackers and through exchange are retried
-            // like announced ones.
-            remember_peers(&mut peers, &self.swarm.exchanged());
-            remember_peers(&mut peers, &self.swarm.take_discovered());
-            if !peers.is_empty() {
-                self.progress.set_phase(TransferPhase::Downloading);
-                let (count, error) = self.run_peers(torrent, runtime, &peers, max_connections)?;
-                downloaded += count;
-                if let Some(error) = error {
+                if let Some(error) = collected.error {
                     self.progress.record_error(&error);
-                    last_error = Some(error);
+                    *last_error = Some(error);
                 }
-                if torrent.is_complete() {
-                    self.require_hybrid_roots()?;
-                    if downloaded > 0 {
-                        announcer.announce_completed(
-                            hashes
-                                .iter()
-                                .map(|hash| {
-                                    self.announce_request(*hash, port, AnnounceEvent::Completed)
-                                })
-                                .collect(),
-                        );
-                    }
-                    return Ok(downloaded);
-                }
-            }
-            if round + 1 < max_rounds {
-                self.progress.set_phase(TransferPhase::Waiting);
-                let wait = if peers.is_empty() {
-                    announcer
-                        .next_due()
-                        .map_or(PEER_RETRY_DELAY, |due| {
-                            due.saturating_duration_since(Instant::now())
-                        })
-                        .max(TRACKER_POLL)
-                } else {
-                    PEER_RETRY_DELAY
-                };
-                // New peers from trackers or the DHT end the wait early.
-                let deadline = Instant::now() + wait;
-                while Instant::now() < deadline && !self.swarm.has_pending() {
-                    self.progress.sleep(DISCOVERY_POLL)?;
+            };
+            if !announcer.is_empty() {
+                // The first round waits for one tracker to answer, or all to
+                // fail, so it has peers to try; the rest keep coming meanwhile.
+                self.progress.set_phase(TransferPhase::Announcing);
+                let deadline = Instant::now() + self.timeout + Duration::from_secs(1);
+                loop {
                     collect(&mut announcer, &mut last_error);
+                    if announcer.succeeded()
+                        || announcer.all_answered()
+                        || self.swarm.has_pending()
+                        || Instant::now() >= deadline
+                    {
+                        break;
+                    }
+                    self.progress.sleep(TRACKER_POLL)?;
                 }
             }
+            for round in 0..max_rounds {
+                collect(&mut announcer, &mut last_error);
+                if let Ok(found) = found.lock() {
+                    remember_peers(&mut peers, &found);
+                }
+                self.progress.check_cancelled()?;
+                // Peers learned from trackers and through exchange are retried
+                // like announced ones.
+                remember_peers(&mut peers, &self.swarm.exchanged());
+                remember_peers(&mut peers, &self.swarm.take_discovered());
+                if !peers.is_empty() {
+                    self.progress.set_phase(TransferPhase::Downloading);
+                    let (count, error) =
+                        self.run_peers(torrent, runtime, &peers, max_connections)?;
+                    downloaded += count;
+                    if let Some(error) = error {
+                        self.progress.record_error(&error);
+                        last_error = Some(error);
+                    }
+                    if torrent.is_complete() {
+                        self.require_hybrid_roots()?;
+                        if downloaded > 0 {
+                            announcer.announce_completed(
+                                hashes
+                                    .iter()
+                                    .map(|hash| {
+                                        self.announce_request(
+                                            *hash,
+                                            port,
+                                            AnnounceEvent::Completed,
+                                            on_disk,
+                                        )
+                                    })
+                                    .collect(),
+                            );
+                        }
+                        return Ok(downloaded);
+                    }
+                }
+                if round + 1 < max_rounds {
+                    self.progress.set_phase(TransferPhase::Waiting);
+                    let wait = if peers.is_empty() {
+                        announcer
+                            .next_due()
+                            .map_or(PEER_RETRY_DELAY, |due| {
+                                due.saturating_duration_since(Instant::now())
+                            })
+                            .max(TRACKER_POLL)
+                    } else {
+                        PEER_RETRY_DELAY
+                    };
+                    // New peers from trackers or the DHT end the wait early.
+                    let deadline = Instant::now() + wait;
+                    while Instant::now() < deadline && !self.swarm.has_pending() {
+                        self.progress.sleep(DISCOVERY_POLL)?;
+                        collect(&mut announcer, &mut last_error);
+                    }
+                }
+            }
+            Err(last_error.unwrap_or_else(|| {
+                crate::BackendError::Tracker(
+                    "no peers have provided the remaining pieces yet".to_owned(),
+                )
+            }))
+        })();
+        // Paused or quitting: trackers that know us hear we left, with the
+        // final counts, so nothing uploaded is lost from the ratio.
+        if matches!(result, Err(crate::BackendError::Cancelled)) {
+            announcer.announce_stopped(
+                hashes
+                    .iter()
+                    .map(|hash| request(*hash, AnnounceEvent::Stopped))
+                    .collect(),
+            );
         }
-        Err(last_error.unwrap_or_else(|| {
-            crate::BackendError::Tracker(
-                "no peers have provided the remaining pieces yet".to_owned(),
-            )
-        }))
+        result
     }
 
-    fn announce_request(&self, hash: [u8; 20], port: u16, event: AnnounceEvent) -> AnnounceRequest {
-        let downloaded = self.progress.verified_bytes();
+    /// An announce for `hash`; `on_disk` is what was verified before this
+    /// session, which trackers have no business counting as downloaded.
+    fn announce_request(
+        &self,
+        hash: [u8; 20],
+        port: u16,
+        event: AnnounceEvent,
+        on_disk: u64,
+    ) -> AnnounceRequest {
+        let verified = self.progress.verified_bytes();
         AnnounceRequest {
             info_hash: hash,
             peer_id: self.peer_id,
             port,
             uploaded: self.progress.uploaded_bytes(),
-            downloaded,
-            left: self.info.total_length().saturating_sub(downloaded),
+            downloaded: verified.saturating_sub(on_disk),
+            left: self.info.total_length().saturating_sub(verified),
+            corrupt: self.progress.corrupt_bytes(),
             compact: true,
             event,
         }
@@ -1121,6 +1152,128 @@ mod tests {
         assert!(error.to_string().contains("empirebt-vpn0"), "{error}");
         // Neither the peer nor the tracker heard from us.
         assert!(listener.accept().is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An HTTP tracker that answers with `peer`, if any, and forwards each
+    /// request line.
+    fn recording_tracker_for(
+        peer: Option<SocketAddr>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/announce", listener.local_addr().unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0; 2048];
+                let size = stream.read(&mut request).unwrap_or(0);
+                let line = String::from_utf8_lossy(&request[..size])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let mut body = b"d8:intervali60e5:peers".to_vec();
+                match peer {
+                    Some(SocketAddr::V4(peer)) => {
+                        body.extend(b"6:");
+                        body.extend(peer.ip().octets());
+                        body.extend(peer.port().to_be_bytes());
+                    }
+                    _ => body.extend(b"0:"),
+                }
+                body.push(b'e');
+                let _ = stream.write_all(&[b"HTTP/1.0 200 OK\r\n\r\n".as_slice(), &body].concat());
+                if sender.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        (url, receiver)
+    }
+
+    #[test]
+    fn trackers_hear_only_what_this_session_downloaded() {
+        const PIECE: usize = 16 * 1024;
+        let data: Vec<u8> = (0..2 * PIECE).map(|byte| (byte * 7 % 251) as u8).collect();
+        let hashes = data
+            .chunks(PIECE)
+            .map(|piece| sha1::Sha1::digest(piece).into())
+            .collect();
+        let info = TorrentInfo::new(
+            "halfway",
+            PIECE as u32,
+            hashes,
+            vec![crate::TorrentFile::new("halfway", data.len() as u64)],
+        )
+        .unwrap();
+        let served = data.clone();
+        let (address, _peer) = fake_peer_with(&info, Some(vec![0xc0]), true, move |peer| {
+            while let Ok(message) = peer.receive() {
+                if let PeerMessage::Request {
+                    piece_index,
+                    begin,
+                    length,
+                } = message
+                {
+                    let start = piece_index as usize * PIECE + begin as usize;
+                    let block = served[start..start + length as usize].to_vec();
+                    let reply = PeerMessage::Piece {
+                        piece_index,
+                        begin,
+                        block,
+                    };
+                    if peer.send(&reply).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let (url, heard) = recording_tracker_for(Some(address));
+        let info = info.with_tracker_urls(vec![url]);
+        let (session, root) = session(&info, "halfway");
+        // The first piece is on disk from an earlier run.
+        Storage::new(&root)
+            .unwrap()
+            .write_piece(&info, 0, &data[..PIECE])
+            .unwrap();
+        session
+            .download_from_trackers_with_retries(0, 4, 1)
+            .unwrap();
+        let started = heard.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(started.contains("event=started"), "{started}");
+        assert!(
+            started.contains(&format!("&downloaded=0&left={PIECE}&")),
+            "data already on disk is not downloaded again: {started}"
+        );
+        let completed = std::iter::from_fn(|| heard.recv_timeout(Duration::from_secs(2)).ok())
+            .find(|line| line.contains("event=completed"))
+            .expect("a completed announce");
+        assert!(
+            completed.contains(&format!("&downloaded={PIECE}&left=0&corrupt=0&")),
+            "{completed}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_paused_download_tells_its_trackers_it_stopped() {
+        let (info, _data) = two_block_torrent();
+        let (url, heard) = recording_tracker_for(None);
+        let info = info.with_tracker_urls(vec![url]);
+        let (session, root) = session(&info, "stopped");
+        let progress = Arc::clone(session.progress());
+        let download =
+            std::thread::spawn(move || session.download_from_trackers_with_retries(0, 100, 1));
+        let started = heard.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(started.contains("event=started"), "{started}");
+        progress.cancel();
+        assert_eq!(
+            download.join().unwrap(),
+            Err(crate::BackendError::Cancelled)
+        );
+        let stopped = heard.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(stopped.contains("event=stopped&numwant=0"), "{stopped}");
         let _ = std::fs::remove_dir_all(root);
     }
 

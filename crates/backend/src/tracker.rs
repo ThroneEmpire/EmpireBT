@@ -177,9 +177,10 @@ fn announce_udp_at(
     announce.extend(request.left.to_be_bytes());
     announce.extend(request.uploaded.to_be_bytes());
     announce.extend(request.event.udp_code().to_be_bytes());
+    // Our address (0: the one the packet came from), key, peers wanted.
     announce.extend(0_u32.to_be_bytes());
-    announce.extend(transaction.to_be_bytes());
-    announce.extend((-1_i32).to_be_bytes());
+    announce.extend(request.key().to_be_bytes());
+    announce.extend(request.num_want().to_be_bytes());
     announce.extend(request.port.to_be_bytes());
     let response = udp_exchange(&socket, &announce, 1, transaction, 20)?;
     let read = |at: usize| u64::from(u32::from_be_bytes(response[at..at + 4].try_into().unwrap()));
@@ -486,41 +487,68 @@ impl Tracker {
     pub fn url(&self) -> &str {
         &self.url
     }
-
-    /// Announces to this tracker alone.
-    pub(crate) fn announce(
-        &self,
-        request: &AnnounceRequest,
-        timeout: Duration,
-    ) -> Result<TrackerResponse, crate::BackendError> {
-        announce_tracker(self, request, timeout)
-    }
 }
 
-/// Announces to a torrent's trackers.
+/// Announces to a torrent's trackers, which are grouped in tiers (BEP 12).
 #[derive(Debug, Default, Clone)]
 pub struct TrackerClient {
     trackers: Vec<Tracker>,
+    /// How many of `trackers`, in order, each tier holds.
+    tiers: Vec<usize>,
 }
 
 impl TrackerClient {
+    /// Each tracker in a tier of its own.
     pub fn new(trackers: Vec<Tracker>) -> Self {
-        Self { trackers }
+        let tiers = vec![1; trackers.len()];
+        Self { trackers, tiers }
     }
 
     pub fn trackers(&self) -> &[Tracker] {
         &self.trackers
     }
 
+    /// Each URL in a tier of its own, such as a magnet link's trackers.
     pub fn from_urls(urls: impl IntoIterator<Item = String>) -> Result<Self, crate::BackendError> {
-        let mut trackers = Vec::new();
-        for url in urls {
-            let tracker = Tracker::new(url)?;
-            if !trackers.contains(&tracker) {
-                trackers.push(tracker);
+        Self::from_tiers(urls.into_iter().map(|url| vec![url]))
+    }
+
+    /// Trackers in tiers, as a torrent's `announce-list` has them. A
+    /// tracker listed twice stays in its first tier.
+    pub fn from_tiers(
+        tiers: impl IntoIterator<Item = Vec<String>>,
+    ) -> Result<Self, crate::BackendError> {
+        let mut client = Self::default();
+        for tier in tiers {
+            let mut size = 0;
+            for url in tier {
+                let tracker = Tracker::new(url)?;
+                if !client.trackers.contains(&tracker) {
+                    client.trackers.push(tracker);
+                    size += 1;
+                }
+            }
+            if size > 0 {
+                client.tiers.push(size);
             }
         }
-        Ok(Self::new(trackers))
+        Ok(client)
+    }
+
+    /// Each tier on its own.
+    pub fn tiers(&self) -> Vec<TrackerClient> {
+        let mut rest = self.trackers.as_slice();
+        self.tiers
+            .iter()
+            .map(|size| {
+                let (tier, after) = rest.split_at(*size);
+                rest = after;
+                Self {
+                    trackers: tier.to_vec(),
+                    tiers: vec![*size],
+                }
+            })
+            .collect()
     }
 
     /// Announces only through this network interface.
@@ -572,19 +600,20 @@ impl TrackerClient {
         Err(last_error.unwrap_or_else(|| tracker_error("no supported tracker is configured")))
     }
 
-    /// Announces to every configured tracker concurrently and returns each
-    /// tracker's result in configuration order. Used where every tracker
-    /// should learn about us, such as seeding.
+    /// Announces to every tier concurrently, and within each tier to its
+    /// trackers in order until one accepts (BEP 12, as qBittorrent does by
+    /// default); returns each tier's result in order. Used where every
+    /// tracker should learn about us, such as seeding.
     pub fn announce_all(
         &self,
         request: &AnnounceRequest,
         timeout: Duration,
     ) -> Vec<Result<TrackerResponse, crate::BackendError>> {
+        let tiers = self.tiers();
         std::thread::scope(|scope| {
-            let workers: Vec<_> = self
-                .trackers
+            let workers: Vec<_> = tiers
                 .iter()
-                .map(|tracker| scope.spawn(move || announce_tracker(tracker, request, timeout)))
+                .map(|tier| scope.spawn(move || tier.announce(request, timeout)))
                 .collect();
             workers
                 .into_iter()
@@ -716,6 +745,7 @@ mod tests {
             uploaded: 0,
             downloaded: 0,
             left: 0,
+            corrupt: 0,
             compact: true,
             event: AnnounceEvent::None,
         };
@@ -832,6 +862,7 @@ mod tests {
             uploaded: 0,
             downloaded: 0,
             left: 1,
+            corrupt: 0,
             compact: true,
             event: AnnounceEvent::Started,
         };
@@ -869,6 +900,7 @@ mod tests {
                 uploaded: 0,
                 downloaded: 0,
                 left: 0,
+                corrupt: 0,
                 compact: true,
                 event: AnnounceEvent::None,
             };
@@ -894,6 +926,110 @@ mod tests {
         assert!(Tracker::new("file:///tmp/tracker").is_err());
     }
 
+    /// An HTTP tracker that answers with no peers and forwards each
+    /// request's target.
+    fn recording_tracker() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/announce", listener.local_addr().unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0; 2048];
+                let size = stream.read(&mut request).unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..size]).into_owned();
+                let body = b"d8:intervali900e5:peers0:e";
+                let _ = stream.write_all(
+                    &[
+                        format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                            .as_bytes(),
+                        body,
+                    ]
+                    .concat(),
+                );
+                if sender.send(text).is_err() {
+                    return;
+                }
+            }
+        });
+        (url, receiver)
+    }
+
+    fn request(event: AnnounceEvent) -> AnnounceRequest {
+        AnnounceRequest {
+            info_hash: [1; 20],
+            peer_id: *b"-EM0100-abcdefghijkl",
+            port: 6881,
+            uploaded: 10,
+            downloaded: 20,
+            left: 30,
+            corrupt: 40,
+            compact: true,
+            event,
+        }
+    }
+
+    #[test]
+    fn announces_with_libtorrents_parameters_in_its_order() {
+        let started = request(AnnounceEvent::Started);
+        assert_eq!(
+            started.query(),
+            format!(
+                "info_hash=%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01\
+                 &peer_id=-EM0100-abcdefghijkl&port=6881&uploaded=10&downloaded=20&left=30\
+                 &corrupt=40&key={:08X}&event=started&numwant=200&compact=1&no_peer_id=1",
+                started.key()
+            )
+        );
+        // Leaving asks for no peers; the key stays with the peer ID.
+        let stopped = request(AnnounceEvent::Stopped);
+        assert!(stopped.query().contains("&event=stopped&numwant=0&"));
+        assert_eq!(stopped.key(), started.key());
+        let mut other = request(AnnounceEvent::None);
+        other.peer_id = *b"-EM0100-mnopqrstuvwx";
+        assert_ne!(other.key(), started.key());
+        assert!(!other.query().contains("event="));
+    }
+
+    #[test]
+    fn announces_to_one_tracker_per_tier_and_to_every_tier() {
+        let (first, first_heard) = recording_tracker();
+        let (backup, backup_heard) = recording_tracker();
+        let (other, other_heard) = recording_tracker();
+        let client = TrackerClient::from_tiers([
+            vec![first.clone(), backup.clone()],
+            vec![other.clone(), first],
+        ])
+        .unwrap();
+        assert_eq!(
+            client.trackers().len(),
+            3,
+            "a repeat stays in its first tier"
+        );
+        let results = client.announce_all(&request(AnnounceEvent::Started), Duration::from_secs(5));
+        assert_eq!(results.len(), 2, "one result per tier");
+        assert!(results.iter().all(Result::is_ok));
+        let wait = Duration::from_secs(2);
+        assert!(first_heard.recv_timeout(wait).is_ok());
+        assert!(other_heard.recv_timeout(wait).is_ok());
+        assert!(
+            backup_heard
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "the backup in the same tier would count the upload twice"
+        );
+
+        // When the first in a tier is down, the next one takes over.
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/announce", listener.local_addr().unwrap())
+        };
+        let client = TrackerClient::from_tiers([vec![dead, backup]]).unwrap();
+        let results = client.announce_all(&request(AnnounceEvent::None), Duration::from_secs(5));
+        assert!(results[0].is_ok(), "{results:?}");
+        assert!(backup_heard.recv_timeout(wait).is_ok());
+    }
+
     #[test]
     fn deduplicates_tracker_urls() {
         let client = TrackerClient::from_urls(vec![
@@ -913,6 +1049,7 @@ mod tests {
             uploaded: 2,
             downloaded: 3,
             left: 4,
+            corrupt: 0,
             compact: true,
             event: AnnounceEvent::None,
         };
@@ -1010,6 +1147,7 @@ d8:intervali60e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
             uploaded: 0,
             downloaded: 0,
             left: 10,
+            corrupt: 0,
             compact: true,
             event: AnnounceEvent::None,
         };
@@ -1057,6 +1195,7 @@ d8:intervali60e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
             uploaded: 0,
             downloaded: 0,
             left: 10,
+            corrupt: 0,
             compact: true,
             event: AnnounceEvent::None,
         };
@@ -1112,30 +1251,64 @@ pub struct AnnounceRequest {
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     pub port: u16,
+    /// Payload bytes sent since the `started` announce.
     pub uploaded: u64,
+    /// Payload bytes received and verified since the `started` announce:
+    /// not data that was already on disk, nor corrupt pieces.
     pub downloaded: u64,
+    /// Bytes still missing, of the whole torrent.
     pub left: u64,
+    /// Bytes of pieces that failed verification since `started`.
+    pub corrupt: u64,
     pub compact: bool,
     pub event: AnnounceEvent,
 }
 
+/// Peers asked of a tracker per announce, as libtorrent asks.
+const NUM_WANT: u32 = 200;
+
 impl AnnounceRequest {
-    /// Builds the query string for an HTTP tracker announce.
+    /// Builds the query string for an HTTP tracker announce, with the
+    /// parameters in the order libtorrent sends them.
     pub fn query(&self) -> String {
+        let event = self
+            .event
+            .http_name()
+            .map(|event| format!("&event={event}"))
+            .unwrap_or_default();
         format!(
-            "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact={}",
+            "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&corrupt={}\
+             &key={:08X}{event}&numwant={}&compact={}&no_peer_id=1",
             percent_encode(&self.info_hash),
             percent_encode(&self.peer_id),
             self.port,
             self.uploaded,
             self.downloaded,
             self.left,
+            self.corrupt,
+            self.key(),
+            self.num_want(),
             u8::from(self.compact)
-        ) + &self
-            .event
-            .http_name()
-            .map(|event| format!("&event={event}"))
-            .unwrap_or_default()
+        )
+    }
+
+    /// Identifies this client to trackers across address changes, as
+    /// every client's `key` does. It follows the peer ID, which is random
+    /// per run (and per network change), so it links nothing further.
+    pub fn key(&self) -> u32 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.peer_id.hash(&mut hasher);
+        hasher.finish() as u32
+    }
+
+    /// Peers wanted: none when leaving.
+    fn num_want(&self) -> u32 {
+        if self.event == AnnounceEvent::Stopped {
+            0
+        } else {
+            NUM_WANT
+        }
     }
 }
 

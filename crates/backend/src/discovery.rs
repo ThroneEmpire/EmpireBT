@@ -12,9 +12,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::{
-    AnnounceEvent, AnnounceRequest, BackendError, Tracker, TrackerClient, TrackerResponse,
-};
+use crate::{AnnounceEvent, AnnounceRequest, BackendError, TrackerClient, TrackerResponse};
 
 /// Re-announce interval when a tracker does not specify one.
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -29,8 +27,10 @@ pub(crate) type OnPeers = Arc<dyn Fn(&[SocketAddr]) + Send + Sync>;
 
 /// One tracker's schedule.
 #[derive(Debug)]
+/// One tier of trackers (BEP 12), announced to as one: its trackers in
+/// order until one accepts.
 struct Schedule {
-    tracker: Tracker,
+    tracker: TrackerClient,
     next: Instant,
     in_flight: bool,
     /// Whether it has accepted our `started` event.
@@ -71,10 +71,10 @@ impl Announcer {
         let now = Instant::now();
         Self {
             schedules: trackers
-                .trackers()
-                .iter()
+                .tiers()
+                .into_iter()
                 .map(|tracker| Schedule {
-                    tracker: tracker.clone(),
+                    tracker,
                     next: now,
                     in_flight: false,
                     started: false,
@@ -210,19 +210,44 @@ impl Announcer {
     /// trackers count completed downloads, but none of them should delay
     /// the switch to seeding.
     pub fn announce_completed(&self, requests: Vec<AnnounceRequest>) {
-        let trackers: Vec<Tracker> = self
+        let tiers: Vec<TrackerClient> = self
             .schedules
             .iter()
             .map(|schedule| schedule.tracker.clone())
             .collect();
         let timeout = self.timeout;
-        std::thread::spawn(move || {
-            let client = TrackerClient::new(trackers);
-            for request in &requests {
-                let _ = client.announce_all(request, timeout);
-            }
-        });
+        std::thread::spawn(move || announce_each(&tiers, &requests, timeout));
     }
+
+    /// Tells the trackers that know us that we are leaving, with the
+    /// final counts, and waits for them briefly: quitting allows only a
+    /// few seconds.
+    pub fn announce_stopped(&self, requests: Vec<AnnounceRequest>) {
+        let tiers: Vec<TrackerClient> = self
+            .schedules
+            .iter()
+            // Including those whose answer to `started` is still on its way.
+            .filter(|schedule| schedule.started || schedule.in_flight)
+            .map(|schedule| schedule.tracker.clone())
+            .collect();
+        announce_each(&tiers, &requests, self.timeout.min(STOPPED_TIMEOUT));
+    }
+}
+
+/// How long a `stopped` announce may take.
+const STOPPED_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Sends each of `requests` to every tier at once, and waits for them.
+fn announce_each(tiers: &[TrackerClient], requests: &[AnnounceRequest], timeout: Duration) {
+    std::thread::scope(|scope| {
+        for tier in tiers {
+            scope.spawn(move || {
+                for request in requests {
+                    let _ = tier.announce(request, timeout);
+                }
+            });
+        }
+    });
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -278,6 +303,7 @@ mod tests {
             uploaded: 0,
             downloaded: 0,
             left: 1,
+            corrupt: 0,
             compact: true,
             event,
         }

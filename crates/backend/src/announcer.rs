@@ -187,11 +187,17 @@ struct Entry {
     uploaded_before: u64,
     /// Latest counter value from the current runtime.
     uploaded_now: u64,
+    /// The counter when announcing began. A finished download stays in the
+    /// runtime as a seed with its counter, and its own announces already
+    /// reported those bytes; counting them again would report uploads
+    /// twice, which private trackers take for cheating.
+    uploaded_base: u64,
 }
 
 impl Entry {
+    /// Bytes uploaded since this entry's `started` announce.
     fn uploaded(&self) -> u64 {
-        self.uploaded_before + self.uploaded_now
+        (self.uploaded_before + self.uploaded_now).saturating_sub(self.uploaded_base)
     }
 }
 
@@ -206,7 +212,7 @@ struct Target {
     key: [u8; 20],
     announce_hashes: Vec<[u8; 20]>,
     peer_id: [u8; 20],
-    trackers: Vec<String>,
+    trackers: Vec<Vec<String>>,
     private: bool,
 }
 
@@ -221,7 +227,7 @@ fn targets(runtime: &Runtime) -> Vec<Target> {
             key: *info.info_hash(),
             announce_hashes: info.swarm_hashes(),
             peer_id: *peer_id,
-            trackers: info.tracker_urls().to_vec(),
+            trackers: info.tracker_tiers().to_vec(),
             private: info.is_private(),
         })
         .collect()
@@ -311,13 +317,18 @@ impl AnnounceLoop {
                 // Stop announces finish on their own threads.
                 drop(self.remove(&key));
             }
+            let counters = runtime
+                .as_ref()
+                .map(|runtime| runtime.uploads())
+                .unwrap_or_default();
             for target in current {
                 if self.entries.contains_key(&target.key) {
                     continue;
                 }
+                let counter = counters.get(&target.key).copied().unwrap_or(0);
                 // Torrents without usable trackers are not announced to
                 // trackers (the DHT loop still covers public ones).
-                let Ok(trackers) = TrackerClient::from_urls(target.trackers)
+                let Ok(trackers) = TrackerClient::from_tiers(target.trackers)
                     .map(|trackers| trackers.with_binding(&self.binding))
                 else {
                     continue;
@@ -336,7 +347,8 @@ impl AnnounceLoop {
                         in_flight: false,
                         failures: 0,
                         uploaded_before: 0,
-                        uploaded_now: 0,
+                        uploaded_now: counter,
+                        uploaded_base: counter,
                     },
                 );
             }
@@ -569,6 +581,7 @@ fn request(
         uploaded,
         downloaded: 0,
         left: 0,
+        corrupt: 0,
         compact: true,
         event,
     }
@@ -658,6 +671,30 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn a_finished_downloads_uploads_are_not_reported_twice() {
+        // The download reported 500 bytes; seeding starts from there.
+        let mut entry = Entry {
+            announce_hashes: Vec::new(),
+            peer_id: [0; 20],
+            trackers: Arc::new(TrackerClient::default()),
+            next_announce: Instant::now(),
+            started: false,
+            in_flight: false,
+            failures: 0,
+            uploaded_before: 0,
+            uploaded_now: 500,
+            uploaded_base: 500,
+        };
+        assert_eq!(entry.uploaded(), 0);
+        entry.uploaded_now = 800;
+        assert_eq!(entry.uploaded(), 300);
+        // A new runtime counts from zero; nothing is lost or repeated.
+        entry.uploaded_before += entry.uploaded_now;
+        entry.uploaded_now = 50;
+        assert_eq!(entry.uploaded(), 350);
     }
 
     #[test]

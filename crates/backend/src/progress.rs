@@ -54,6 +54,7 @@ pub struct TransferProgress {
     total_bytes: AtomicU64,
     verified_bytes: AtomicU64,
     received_bytes: AtomicU64,
+    corrupt_bytes: AtomicU64,
     uploaded_bytes: AtomicU64,
     active_peers: AtomicUsize,
     cancelled: AtomicBool,
@@ -84,6 +85,7 @@ impl Default for TransferProgress {
             total_bytes: AtomicU64::new(0),
             verified_bytes: AtomicU64::new(0),
             received_bytes: AtomicU64::new(0),
+            corrupt_bytes: AtomicU64::new(0),
             uploaded_bytes: AtomicU64::new(0),
             active_peers: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
@@ -127,6 +129,12 @@ impl TransferProgress {
     /// later fail verification. Suitable for rate display.
     pub fn received_bytes(&self) -> u64 {
         self.received_bytes.load(Ordering::Acquire)
+    }
+
+    /// Bytes of pieces that failed verification, which trackers are told
+    /// as `corrupt`.
+    pub fn corrupt_bytes(&self) -> u64 {
+        self.corrupt_bytes.load(Ordering::Acquire)
     }
 
     /// Block payload bytes sent to peers.
@@ -247,6 +255,10 @@ impl TransferProgress {
 
     pub(crate) fn add_uploaded(&self, bytes: u64) {
         self.uploaded_bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    pub(crate) fn add_corrupt(&self, bytes: u64) {
+        self.corrupt_bytes.fetch_add(bytes, Ordering::AcqRel);
     }
 
     pub(crate) fn add_received(&self, bytes: u64) {

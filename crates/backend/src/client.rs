@@ -1656,6 +1656,7 @@ fn fetch_magnet_metadata(
         // The size is unknown until the metadata arrives; any non-zero
         // value marks us as a leecher rather than a seeder.
         left: 1,
+        corrupt: 0,
         compact: true,
         event,
     };

@@ -740,6 +740,9 @@ impl PeerWire {
                 // from whichever peer gets it next.
                 let error = invalid_peer(format!("{address} sent a corrupt copy of piece {index}"));
                 torrent.progress.record_error(&error);
+                torrent
+                    .progress
+                    .add_corrupt(torrent.piece_size(index).unwrap_or(0));
                 if torrent.swarm.piece_corrupt(address) {
                     return Err(invalid_peer(format!(
                         "banned {address} for sending corrupt pieces"

@@ -106,6 +106,8 @@ pub struct TorrentInfo {
     files: Arc<[TorrentFile]>,
     announce: Option<String>,
     tracker_urls: Vec<String>,
+    /// The same trackers in their tiers (BEP 12).
+    tracker_tiers: Vec<Vec<String>>,
     info_hash: [u8; 20],
     source_bytes: Arc<[u8]>,
     /// Byte range of the raw info dictionary within `source_bytes`.
@@ -135,6 +137,7 @@ impl TorrentInfo {
             files: files.into(),
             announce: None,
             tracker_urls: Vec::new(),
+            tracker_tiers: Vec::new(),
             info_hash,
             source_bytes: Arc::from([]),
             info_range: 0..0,
@@ -240,19 +243,29 @@ impl TorrentInfo {
         let announce = find(root_dict, b"announce")
             .map(|value| text(value, "announce"))
             .transpose()?;
-        let mut tracker_urls = Vec::new();
-        if let Some(url) = &announce {
-            tracker_urls.push(url.clone());
-        }
+        // BEP 12: `announce-list`, when there is one, replaces `announce`.
+        let mut tracker_urls: Vec<String> = Vec::new();
+        let mut tracker_tiers = Vec::new();
         if let Some(announce_list) = find(root_dict, b"announce-list") {
             for tier in announce_list.as_list()? {
+                let mut urls = Vec::new();
                 for tracker in tier.as_list()? {
                     let url = text(tracker, "announce-list tracker")?;
                     if !tracker_urls.contains(&url) {
-                        tracker_urls.push(url);
+                        tracker_urls.push(url.clone());
+                        urls.push(url);
                     }
                 }
+                if !urls.is_empty() {
+                    tracker_tiers.push(urls);
+                }
             }
+        }
+        if tracker_urls.is_empty()
+            && let Some(url) = &announce
+        {
+            tracker_urls.push(url.clone());
+            tracker_tiers.push(vec![url.clone()]);
         }
         let mut hash = Sha1::new();
         hash.update(&bytes[info_start..info_end]);
@@ -278,6 +291,7 @@ impl TorrentInfo {
             files: files.into(),
             announce,
             tracker_urls,
+            tracker_tiers,
             info_hash,
             source_bytes: Arc::from(bytes),
             info_range: info_start..info_end,
@@ -432,6 +446,7 @@ impl TorrentInfo {
     /// Lists these trackers, for tests that build torrents in code.
     #[cfg(test)]
     pub(crate) fn with_tracker_urls(mut self, urls: Vec<String>) -> Self {
+        self.tracker_tiers = urls.iter().map(|url| vec![url.clone()]).collect();
         self.tracker_urls = urls;
         self
     }
@@ -439,6 +454,13 @@ impl TorrentInfo {
     /// Returns tracker URLs in announce priority order, without duplicates.
     pub fn tracker_urls(&self) -> &[String] {
         &self.tracker_urls
+    }
+
+    /// The trackers in their tiers (BEP 12). Every tier is announced to,
+    /// but only one tracker in each: the others in a tier are usually the
+    /// same tracker under other names, and would count uploads twice.
+    pub fn tracker_tiers(&self) -> &[Vec<String>] {
+        &self.tracker_tiers
     }
 
     /// Returns the SHA-1 hash used in peer wire handshakes.
@@ -973,6 +995,29 @@ mod tests {
             result,
             Err(crate::BackendError::InvalidMetainfo(_))
         ));
+    }
+
+    #[test]
+    fn keeps_tracker_tiers_and_lets_the_list_replace_announce() {
+        let bytes = b"d8:announce20:http://only.example/13:announce-listll12:http://a.ex/12:http://b.ex/el12:http://c.ex/12:http://a.ex/ee4:infod4:name3:foo6:lengthi4e6:pieces0:12:piece lengthi16384eee";
+        let info = TorrentInfo::from_bytes(bytes).unwrap();
+        assert_eq!(
+            info.tracker_tiers(),
+            [
+                vec!["http://a.ex/".to_owned(), "http://b.ex/".to_owned()],
+                vec!["http://c.ex/".to_owned()],
+            ]
+        );
+        assert_eq!(
+            info.tracker_urls(),
+            ["http://a.ex/", "http://b.ex/", "http://c.ex/"]
+        );
+        let bytes = b"d8:announce20:http://only.example/4:infod4:name3:foo6:lengthi4e6:pieces0:12:piece lengthi16384eee";
+        let info = TorrentInfo::from_bytes(bytes).unwrap();
+        assert_eq!(
+            info.tracker_tiers(),
+            [vec!["http://only.example/".to_owned()]]
+        );
     }
 
     #[test]
