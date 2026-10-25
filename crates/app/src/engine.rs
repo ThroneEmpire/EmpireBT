@@ -243,9 +243,15 @@ impl Handle {
         let (mut client, warnings) = store.load(config.clone())?;
         let settings = Settings {
             peer_id: empirebt_backend::generate_peer_id(),
+            anonymous: config.anonymous(),
             peer_timeout: config.peer_timeout(),
             binding: config.binding(),
         };
+        client.set_anonymous_peer_id(
+            settings
+                .anonymous
+                .then(empirebt_backend::generate_anonymous_peer_id),
+        );
         let dht_state = start_networking(&mut client, &config, &settings, &store);
         let (labels, damaged) = match Labels::load(&store.labels_path()) {
             Ok(labels) => (labels, None),
@@ -380,6 +386,7 @@ fn start_networking(
             Some(store.dht_path()),
         ) {
             Ok(dht) => {
+                dht.set_anonymous(settings.anonymous);
                 client.set_dht(Some(dht));
                 DhtState::Running
             }
@@ -447,6 +454,8 @@ fn publish(engine: &mut Engine, published: &Published) {
 
 struct Settings {
     peer_id: [u8; 20],
+    /// `network.anonymous`: public torrents don't say they are EmpireBT.
+    anonymous: bool,
     peer_timeout: Duration,
     /// The network interface every connection uses.
     binding: empirebt_backend::Binding,
@@ -505,7 +514,6 @@ impl SeedService {
             resync: true,
             announcer: SeedAnnouncer::start_on(
                 settings.binding.clone(),
-                settings.peer_id,
                 port,
                 settings.peer_timeout,
                 dht,
@@ -666,6 +674,8 @@ struct Engine {
     /// it speaks only when they change.
     logged_seeding: Option<String>,
     logged_interface_up: Option<bool>,
+    /// The chosen network interface came back after being down.
+    interface_returned: bool,
 }
 
 /// A `.torrent` URL being downloaded: the URL, where the torrent goes, and
@@ -745,6 +755,7 @@ impl Engine {
             restart_after_rebind: Vec::new(),
             logged_seeding: None,
             logged_interface_up: None,
+            interface_returned: false,
         };
         let saved: Vec<(InfoHash, TransferState)> = engine
             .client
@@ -1162,6 +1173,16 @@ impl Engine {
         }
         self.seeding.tick(&mut self.client, &self.settings);
         self.log_changes();
+        if std::mem::take(&mut self.interface_returned) {
+            // Most likely a VPN reconnected, perhaps at another address:
+            // new sockets, and a new identity, so peers and the DHT cannot
+            // link this address to the last one.
+            let name = self.settings.binding.name().unwrap_or_default().to_owned();
+            self.rebind(
+                self.client.config().listen_port(),
+                format!("{name} is back; reconnected with a new peer ID and DHT node ID"),
+            );
+        }
         self.restart_rebound_downloads();
         if self.last_port_check.elapsed() >= PORT_FILE_POLL {
             self.last_port_check = Instant::now();
@@ -1252,6 +1273,22 @@ impl Engine {
                     self.change_port(port);
                 }
             }
+            "network.anonymous" if !overridden => {
+                let anonymous = value == "true";
+                if anonymous != self.settings.anonymous {
+                    self.settings.anonymous = anonymous;
+                    // Running torrents take their new peer IDs at once.
+                    self.rebind(
+                        self.client.config().listen_port(),
+                        if anonymous {
+                            "Anonymous mode is on: public torrents no longer say they are EmpireBT"
+                        } else {
+                            "Anonymous mode is off"
+                        }
+                        .to_owned(),
+                    );
+                }
+            }
             "network.port_file" => {
                 self.port_file_problem = None;
                 self.follow_port_file();
@@ -1307,6 +1344,13 @@ impl Engine {
         if port == self.client.config().listen_port() {
             return;
         }
+        self.rebind(port, format!("Now taking peers on port {port}"));
+    }
+
+    /// Starts every network service again on `port`, as
+    /// [`Engine::change_port`] describes, with new peer IDs and a new DHT
+    /// node ID; `notice` says why.
+    fn rebind(&mut self, port: u16, notice: String) {
         let mut jobs = Vec::new();
         for (hash, activity) in &mut self.activity {
             let networked = matches!(
@@ -1355,11 +1399,17 @@ impl Engine {
             self.client.config().listen_port()
         );
         self.client.set_listen_port(port);
+        self.settings.peer_id = empirebt_backend::generate_peer_id();
+        self.client.set_anonymous_peer_id(
+            self.settings
+                .anonymous
+                .then(empirebt_backend::generate_anonymous_peer_id),
+        );
         let config = self.client.config().clone();
         self.dht_state = start_networking(&mut self.client, &config, &self.settings, &self.store);
         self.seeding = SeedService::new(port, &self.settings, self.client.dht().cloned());
         self.session_dirty = true;
-        self.notify(Level::Info, format!("Now taking peers on port {port}"));
+        self.notify(Level::Info, notice);
     }
 
     /// Logs the seeding listener and the network interface when their
@@ -1387,6 +1437,9 @@ impl Engine {
             if self.logged_interface_up != Some(up) {
                 if up {
                     tracing::info!(target: "network", "{name} is up");
+                    if self.logged_interface_up == Some(false) {
+                        self.interface_returned = true;
+                    }
                 } else {
                     tracing::warn!(target: "network", "{name} is down; nothing connects until it is back");
                 }
@@ -2398,6 +2451,41 @@ mod tests {
         assert_eq!(shown.value, "512");
         assert!(change("network.upload_limit", "lots").is_err());
         assert!(change("no.such.setting", "1").is_err());
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn anonymous_mode_switches_on_and_off_while_running() {
+        let (handle, root) = engine("anonymous");
+        let (link, hash) = magnet(3);
+        handle.call(Command::Add(link)).unwrap();
+        let change = |value: &str| {
+            handle
+                .call(Command::ChangeSetting {
+                    key: "network.anonymous".to_owned(),
+                    value: value.to_owned(),
+                })
+                .unwrap();
+            handle.snapshot()
+        };
+        let snapshot = change("true");
+        assert!(
+            snapshot
+                .notices
+                .iter()
+                .any(|notice| notice.text.starts_with("Anonymous mode is on")),
+            "{:?}",
+            snapshot.notices
+        );
+        assert!(snapshot.torrent(&hash).is_some(), "torrents stay");
+        let snapshot = change("false");
+        assert!(
+            snapshot
+                .notices
+                .iter()
+                .any(|notice| notice.text == "Anonymous mode is off")
+        );
         handle.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

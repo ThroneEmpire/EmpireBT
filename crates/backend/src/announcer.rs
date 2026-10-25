@@ -69,15 +69,14 @@ impl SeedAnnouncer {
     /// Starts the announcer thread. `port` is the listening port reported
     /// to trackers and the DHT. With `dht`, seeded torrents are also
     /// announced there, so peers without a working tracker can find us.
-    pub fn start(peer_id: [u8; 20], port: u16, timeout: Duration, dht: Option<Arc<Dht>>) -> Self {
-        Self::start_on(crate::Binding::any(), peer_id, port, timeout, dht)
+    pub fn start(port: u16, timeout: Duration, dht: Option<Arc<Dht>>) -> Self {
+        Self::start_on(crate::Binding::any(), port, timeout, dht)
     }
 
     /// Like [`Self::start`], announcing to trackers through one network
     /// interface only.
     pub fn start_on(
         binding: crate::Binding,
-        peer_id: [u8; 20],
         port: u16,
         timeout: Duration,
         dht: Option<Arc<Dht>>,
@@ -88,7 +87,6 @@ impl SeedAnnouncer {
             AnnounceLoop {
                 shared: worker,
                 binding,
-                peer_id,
                 port,
                 timeout,
                 entries: HashMap::new(),
@@ -178,6 +176,8 @@ struct Entry {
     /// Every hash the swarm is known by (two for hybrid torrents); the
     /// first decides the status shown.
     announce_hashes: Vec<[u8; 20]>,
+    /// The peer ID the torrent uses in the runtime.
+    peer_id: [u8; 20],
     trackers: Arc<TrackerClient>,
     next_announce: Instant,
     started: bool,
@@ -205,6 +205,7 @@ struct Outcome {
 struct Target {
     key: [u8; 20],
     announce_hashes: Vec<[u8; 20]>,
+    peer_id: [u8; 20],
     trackers: Vec<String>,
     private: bool,
 }
@@ -214,11 +215,12 @@ struct Target {
 /// announce themselves until they complete.
 fn targets(runtime: &Runtime) -> Vec<Target> {
     runtime
-        .seeding_torrents()
+        .seeding_with_peer_ids()
         .iter()
-        .map(|info| Target {
+        .map(|(info, peer_id)| Target {
             key: *info.info_hash(),
             announce_hashes: info.swarm_hashes(),
+            peer_id: *peer_id,
             trackers: info.tracker_urls().to_vec(),
             private: info.is_private(),
         })
@@ -246,7 +248,6 @@ fn jittered(interval: Duration) -> Duration {
 struct AnnounceLoop {
     shared: Arc<Shared>,
     binding: crate::Binding,
-    peer_id: [u8; 20],
     port: u16,
     timeout: Duration,
     entries: HashMap<[u8; 20], Entry>,
@@ -328,6 +329,7 @@ impl AnnounceLoop {
                     target.key,
                     Entry {
                         announce_hashes: target.announce_hashes,
+                        peer_id: target.peer_id,
                         trackers: Arc::new(trackers),
                         next_announce: Instant::now(),
                         started: false,
@@ -378,7 +380,7 @@ impl AnnounceLoop {
             let requests: Vec<AnnounceRequest> = entry
                 .announce_hashes
                 .iter()
-                .map(|hash| request(*hash, self.peer_id, self.port, entry.uploaded(), event))
+                .map(|hash| request(*hash, entry.peer_id, self.port, entry.uploaded(), event))
                 .collect();
             let (trackers, timeout, sender) = (
                 Arc::clone(&entry.trackers),
@@ -469,7 +471,7 @@ impl AnnounceLoop {
             .map(|hash| {
                 request(
                     *hash,
-                    self.peer_id,
+                    entry.peer_id,
                     self.port,
                     entry.uploaded(),
                     AnnounceEvent::Stopped,
@@ -579,7 +581,8 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
-    /// Serves tracker announces, forwarding each request line.
+    /// Serves tracker announces, forwarding each request (line and
+    /// headers).
     fn recording_tracker() -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/announce", listener.local_addr().unwrap());
@@ -589,11 +592,7 @@ mod tests {
                 let Ok(mut stream) = stream else { return };
                 let mut request = [0; 2048];
                 let size = stream.read(&mut request).unwrap_or(0);
-                let line = String::from_utf8_lossy(&request[..size])
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned();
+                let line = String::from_utf8_lossy(&request[..size]).into_owned();
                 let body = b"d8:completei3e10:incompletei1e8:intervali900e5:peers0:e";
                 let _ = stream.write_all(
                     format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
@@ -605,6 +604,60 @@ mod tests {
             }
         });
         (url, receiver)
+    }
+
+    /// A runtime seeding one small torrent announced at `url`, with
+    /// `peer_id`, in `root`.
+    fn seeding(url: &str, root: &std::path::Path, peer_id: [u8; 20]) -> Arc<Runtime> {
+        let storage = crate::Storage::new(root).unwrap();
+        let data = b"seeded";
+        let hash: [u8; 20] = {
+            use sha1::{Digest, Sha1};
+            Sha1::digest(data).into()
+        };
+        let metainfo = format!(
+            "d8:announce{}:{url}4:infod6:lengthi6e4:name6:seeded12:piece lengthi6e6:pieces20:",
+            url.len()
+        );
+        let mut bytes = metainfo.into_bytes();
+        bytes.extend(hash);
+        bytes.extend(b"ee");
+        let info = crate::TorrentInfo::from_bytes(&bytes).unwrap();
+        storage.write_piece(&info, 0, data).unwrap();
+        let seeder = crate::Seeder::new(info, storage, peer_id, Duration::from_secs(1)).unwrap();
+        Arc::new(Runtime::new(vec![seeder], 1).unwrap())
+    }
+
+    #[test]
+    fn announces_with_each_torrents_peer_id_and_matching_user_agent() {
+        for (peer_id, user_agent) in [
+            (crate::generate_peer_id(), crate::USER_AGENT),
+            (
+                crate::generate_anonymous_peer_id(),
+                crate::ANONYMOUS_USER_AGENT,
+            ),
+        ] {
+            let (url, requests) = recording_tracker();
+            let root = std::env::temp_dir().join(format!(
+                "empirebt-announcer-agent-{}-{}",
+                std::process::id(),
+                peer_id[0]
+            ));
+            let mut announcer = SeedAnnouncer::start(7777, Duration::from_secs(1), None);
+            announcer.track(seeding(&url, &root, peer_id));
+            let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+            let peer_id = std::str::from_utf8(&peer_id).unwrap();
+            assert!(request.contains(&format!("peer_id={peer_id}")), "{request}");
+            assert!(
+                request.contains(&format!("User-Agent: {user_agent}\r\n")),
+                "{request}"
+            );
+            announcer.clear();
+            if let Some(thread) = announcer.stop() {
+                thread.join().unwrap();
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -630,7 +683,7 @@ mod tests {
             crate::Seeder::new(info.clone(), storage, [9; 20], Duration::from_secs(1)).unwrap();
         let runtime = Arc::new(Runtime::new(vec![seeder], 1).unwrap());
 
-        let mut announcer = SeedAnnouncer::start([9; 20], 7777, Duration::from_secs(1), None);
+        let mut announcer = SeedAnnouncer::start(7777, Duration::from_secs(1), None);
         announcer.track(runtime);
         let started = requests.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(started.contains("event=started"), "{started}");

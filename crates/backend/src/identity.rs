@@ -5,6 +5,12 @@
 //! assigned to any client in BEP 20, libtorrent, or Transmission. (`EB`
 //! would be read as EBit.) The version comes from the backend crate's own
 //! version, so it cannot drift from the release.
+//!
+//! In anonymous mode a torrent uses a peer ID without the client code
+//! ([`generate_anonymous_peer_id`]), and that peer ID decides the rest:
+//! a torrent whose peer ID does not [identify](identifies) EmpireBT also
+//! leaves the client name out of its extension handshake and announces
+//! with a generic User-Agent.
 
 /// The two-character client code in peer IDs and DHT messages.
 pub const CLIENT_CODE: [u8; 2] = *b"EM";
@@ -36,17 +42,52 @@ pub(crate) const DHT_VERSION: [u8; 4] = {
     ]
 };
 
+/// What trackers are told the client is.
+pub const USER_AGENT: &str = concat!("EmpireBT/", env!("CARGO_PKG_VERSION"));
+
+/// The User-Agent of anonymous torrents' announces: the one libtorrent's
+/// anonymous mode uses, so they blend in with its users.
+pub const ANONYMOUS_USER_AGENT: &str = "curl/7.81.0";
+
 /// Generates a peer ID: [`PEER_ID_PREFIX`] followed by twelve random
 /// lowercase letters and digits. Printable IDs keep tracker logs and
 /// clients that display peer IDs readable.
 pub fn generate_peer_id() -> [u8; 20] {
-    use std::hash::{BuildHasher, Hasher};
-    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let mut id = [0; 20];
     id[..8].copy_from_slice(&PEER_ID_PREFIX);
+    fill_random(&mut id[8..]);
+    id
+}
+
+/// Generates a peer ID that names no client: twenty random lowercase
+/// letters and digits.
+pub fn generate_anonymous_peer_id() -> [u8; 20] {
+    let mut id = [0; 20];
+    fill_random(&mut id);
+    id
+}
+
+/// Whether a peer ID says it is EmpireBT's, which anonymous ones do not.
+pub fn identifies(peer_id: &[u8; 20]) -> bool {
+    peer_id.starts_with(&PEER_ID_PREFIX)
+}
+
+/// The User-Agent to announce a torrent with its `peer_id`.
+pub fn user_agent_for(peer_id: &[u8; 20]) -> &'static str {
+    if identifies(peer_id) {
+        USER_AGENT
+    } else {
+        ANONYMOUS_USER_AGENT
+    }
+}
+
+/// Fills `id` with random lowercase letters and digits.
+fn fill_random(id: &mut [u8]) {
+    use std::hash::{BuildHasher, Hasher};
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     // RandomState is keyed from the operating system's random source.
     let state = std::collections::hash_map::RandomState::new();
-    for (chunk, salt) in id[8..].chunks_mut(8).zip(0u64..) {
+    for (chunk, salt) in id.chunks_mut(8).zip(0u64..) {
         let mut hasher = state.build_hasher();
         hasher.write_u64(salt);
         hasher.write_u32(std::process::id());
@@ -59,7 +100,6 @@ pub fn generate_peer_id() -> [u8; 20] {
             *byte = ALPHABET[usize::from(value) % ALPHABET.len()];
         }
     }
-    id
 }
 
 /// One Azureus version character: `0`-`9`, then `A`-`Z` for 10-35, as
@@ -220,6 +260,15 @@ mod tests {
     fn peer_ids_are_tagged_printable_and_distinct() {
         let first = generate_peer_id();
         let second = generate_peer_id();
+        assert!(identifies(&first));
+        assert_eq!(user_agent_for(&first), USER_AGENT);
+        // Anonymous ones name no client, and differ every time.
+        let anonymous = generate_anonymous_peer_id();
+        assert!(!identifies(&anonymous));
+        assert_eq!(client_name(&anonymous), None, "{anonymous:?}");
+        assert_eq!(user_agent_for(&anonymous), ANONYMOUS_USER_AGENT);
+        assert!(anonymous.iter().all(u8::is_ascii_alphanumeric));
+        assert_ne!(anonymous, generate_anonymous_peer_id());
         assert!(first.starts_with(&PEER_ID_PREFIX));
         assert!(first[8..].iter().all(u8::is_ascii_alphanumeric));
         assert_ne!(first, second);

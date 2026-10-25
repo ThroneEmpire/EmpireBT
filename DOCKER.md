@@ -106,6 +106,7 @@ Commonly set:
 | `EMPIREBT_NETWORK_DOWNLOAD_LIMIT` | `0` | Download speed limit, KiB/s |
 | `EMPIREBT_NETWORK_MAX_CONNECTIONS` | `500` | Peer connections across all torrents |
 | `EMPIREBT_NETWORK_INTERFACE` | `tun0` | Use only this network interface (see [VPN](#vpn)) |
+| `EMPIREBT_NETWORK_ANONYMOUS` | `true` | Don't tell peers and trackers this is EmpireBT (see [Privacy](README.md#privacy)) |
 | `EMPIREBT_STORAGE_ALLOWED_DIRS` | `/media/films,/media/shows` | More folders the web UI may save torrents in; mount them as volumes too |
 
 You can also run commands in the container, for example to change the

@@ -12,7 +12,8 @@
 
 use empirebt_backend::{
     BackendError, ConnectOptions, DownloadSession, Encryption, Lsd, MagnetLink, PEER_ID_PREFIX,
-    Runtime, Seeder, Storage, TorrentFormat, TorrentInfo, UtpSocket, V2Seeder, generate_peer_id,
+    Runtime, Seeder, Storage, TorrentFormat, TorrentInfo, UtpSocket, V2Seeder,
+    generate_anonymous_peer_id, generate_peer_id,
 };
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -369,12 +370,23 @@ impl EmpireSeeder {
 
     /// Seeds on `address`, such as `[::1]:0` for IPv6.
     fn start_at(info: TorrentInfo, data: &Path, encryption: Encryption, address: &str) -> Self {
+        Self::start_as(info, data, encryption, address, generate_peer_id())
+    }
+
+    /// Seeds with `peer_id`, such as an anonymous one.
+    fn start_as(
+        info: TorrentInfo,
+        data: &Path,
+        encryption: Encryption,
+        address: &str,
+        peer_id: [u8; 20],
+    ) -> Self {
         let storage = Storage::new(data).unwrap();
         let (v1, v2) = if info.format() == TorrentFormat::V2 {
-            let seeder = V2Seeder::new(info, storage, generate_peer_id(), TIMEOUT).unwrap();
+            let seeder = V2Seeder::new(info, storage, peer_id, TIMEOUT).unwrap();
             (Vec::new(), vec![seeder])
         } else {
-            let seeder = Seeder::new(info, storage, generate_peer_id(), TIMEOUT).unwrap();
+            let seeder = Seeder::new(info, storage, peer_id, TIMEOUT).unwrap();
             (vec![seeder], Vec::new())
         };
         // Peers reach the same port over TCP and uTP, as in the client.
@@ -702,6 +714,42 @@ fn libtorrent_shows_empirebt_as_the_client() {
             "{format:?}: libtorrent showed {names:?}"
         );
     }
+}
+
+/// In anonymous mode neither the peer ID nor the extension handshake
+/// gives EmpireBT away, and libtorrent still downloads.
+#[test]
+fn libtorrent_cannot_tell_an_anonymous_empirebt() {
+    let Some(lt) = libtorrent() else { return };
+    let [_, a, b, ..] = PEER_ID_PREFIX.map(char::from);
+    let code = format!("{a}{b} ");
+    let scratch = Scratch::new("identify-anonymous");
+    let (torrent, info) = album_torrent(&lt, &scratch, Format::V1);
+    let seeder = EmpireSeeder::start_as(
+        info,
+        &scratch.join("source"),
+        Encryption::default(),
+        "127.0.0.1:0",
+        generate_anonymous_peer_id(),
+    );
+    // With no client name in the extension handshake, nothing ever
+    // replaces the name from the peer ID, so the probe runs out its time.
+    let output = lt.run_status(&[
+        "identify-peer",
+        path(&torrent),
+        path(&scratch.join("get")),
+        &free_port().to_string(),
+        &seeder.address.to_string(),
+        "8",
+    ]);
+    assert!(output.lines().any(|line| line == "connected"), "{output}");
+    let names = tagged(&output, "client: ");
+    assert!(
+        names
+            .iter()
+            .all(|name| !name.contains("EmpireBT") && !name.starts_with(&code)),
+        "libtorrent showed {names:?}"
+    );
 }
 
 // ----- encryption (MSE) -----------------------------------------------------

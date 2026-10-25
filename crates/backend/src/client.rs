@@ -23,6 +23,9 @@ pub struct Client {
     resume_dirty: Arc<std::sync::Mutex<std::collections::HashSet<[u8; 20]>>>,
     /// Connection and rate limits for every connection of this client.
     limits: Arc<crate::Limits>,
+    /// In anonymous mode, the peer ID public torrents use instead of the
+    /// one they are given.
+    anonymous_peer_id: Option<[u8; 20]>,
 }
 
 /// Clients compare by configuration and torrents; the DHT node is a
@@ -57,6 +60,7 @@ impl Client {
             config,
             storage,
             resume_dirty: Arc::default(),
+            anonymous_peer_id: None,
         }
     }
 
@@ -74,7 +78,27 @@ impl Client {
             runtime: None,
             storage,
             resume_dirty: Arc::default(),
+            anonymous_peer_id: None,
         })
+    }
+
+    /// Anonymous mode: public torrents started from now on use `peer_id`
+    /// (see [`crate::generate_anonymous_peer_id`]), and with it a generic
+    /// User-Agent and no client name in their handshakes. Private
+    /// torrents keep the peer ID they are given, as private trackers
+    /// admit only clients they know. `None` ends anonymous mode.
+    pub fn set_anonymous_peer_id(&mut self, peer_id: Option<[u8; 20]>) {
+        self.anonymous_peer_id = peer_id;
+    }
+
+    /// The peer ID a torrent uses when given `peer_id`: the anonymous one
+    /// in anonymous mode, unless the torrent is private. A magnet link
+    /// without metadata cannot say, and is fetched anonymously.
+    pub fn peer_id_for(&self, info: Option<&TorrentInfo>, peer_id: [u8; 20]) -> [u8; 20] {
+        match self.anonymous_peer_id {
+            Some(anonymous) if !info.is_some_and(TorrentInfo::is_private) => anonymous,
+            _ => peer_id,
+        }
     }
 
     /// Uses a DHT node to find peers for downloads and magnet links, and to
@@ -558,6 +582,7 @@ impl Client {
             {
                 continue;
             }
+            let peer_id = self.peer_id_for(Some(&info), peer_id);
             match info.format() {
                 crate::TorrentFormat::V2 => v2_seeders.push(crate::V2Seeder::from_verified(
                     info,
@@ -629,6 +654,7 @@ impl Client {
             if runtime.contains(&hash) || !storage.has_expected_files(&info)? {
                 continue;
             }
+            let peer_id = self.peer_id_for(Some(&info), peer_id);
             match info.format() {
                 crate::TorrentFormat::V2 => runtime.add_v2_seeder(
                     crate::V2Seeder::from_verified(info, storage, peer_id, timeout),
@@ -751,6 +777,7 @@ impl Client {
         timeout: Duration,
     ) -> Result<usize, BackendError> {
         let info = self.torrent_info(index)?;
+        let peer_id = self.peer_id_for(Some(&info), peer_id);
         let dht = self.dht.clone().filter(|_| !info.is_private());
         let lsd = self.lsd.clone().filter(|_| !info.is_private());
         let session = crate::DownloadSession::new(info, self.storage_at(index), peer_id, timeout)
@@ -894,6 +921,7 @@ impl Client {
         timeout: Duration,
     ) -> Result<crate::TransferHandle, BackendError> {
         let info = self.torrent_info(index)?;
+        let peer_id = self.peer_id_for(Some(&info), peer_id);
         let storage = self.storage_at(index);
         let port = self.config.listen_port();
         let max_connections = self.config.max_peer_connections();
@@ -955,6 +983,7 @@ impl Client {
                 "this magnet link has no trackers or peers, and the DHT is disabled".to_owned(),
             ));
         }
+        let peer_id = self.peer_id_for(None, peer_id);
         let port = self.config.listen_port();
         let options = self.connect_options();
         let dht = self.dht.clone();
@@ -1997,6 +2026,36 @@ mod tests {
             .unwrap();
         assert_eq!(client.files(single)[0].path, PathBuf::from("film/film.mkv"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn anonymous_mode_hides_public_torrents_but_not_private_ones() {
+        let metainfo = |private: bool| {
+            let mut bytes =
+                b"d4:infod6:lengthi4e4:name4:test12:piece lengthi4e6:pieces20:".to_vec();
+            bytes.extend([3; 20]);
+            if private {
+                bytes.extend(b"7:privatei1e");
+            }
+            bytes.extend(b"ee");
+            TorrentInfo::from_bytes(&bytes).unwrap()
+        };
+        let (public, private) = (metainfo(false), metainfo(true));
+        assert!(private.is_private());
+        let own = crate::generate_peer_id();
+        let mut client = Client::new();
+        assert_eq!(client.peer_id_for(Some(&public), own), own);
+        let anonymous = crate::generate_anonymous_peer_id();
+        client.set_anonymous_peer_id(Some(anonymous));
+        assert_eq!(client.peer_id_for(Some(&public), own), anonymous);
+        assert_eq!(client.peer_id_for(None, own), anonymous, "magnet links too");
+        assert_eq!(
+            client.peer_id_for(Some(&private), own),
+            own,
+            "private trackers admit only clients they know"
+        );
+        client.set_anonymous_peer_id(None);
+        assert_eq!(client.peer_id_for(Some(&public), own), own);
     }
 
     #[test]

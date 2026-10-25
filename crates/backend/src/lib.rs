@@ -45,7 +45,10 @@ pub use config_file::{BACKEND_SETTINGS, ConfigFile, Setting, SettingKind};
 pub use dht::Dht;
 pub use error::BackendError;
 pub use http::{HttpResponse, download, http_request};
-pub use identity::{CLIENT_CODE, PEER_ID_PREFIX, client_name, generate_peer_id};
+pub use identity::{
+    ANONYMOUS_USER_AGENT, CLIENT_CODE, PEER_ID_PREFIX, USER_AGENT, client_name,
+    generate_anonymous_peer_id, generate_peer_id, identifies,
+};
 pub use limits::Limits;
 pub use lsd::Lsd;
 pub use magnet::MagnetLink;

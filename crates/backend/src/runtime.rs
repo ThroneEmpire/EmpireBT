@@ -207,12 +207,21 @@ impl Runtime {
 
     /// The metadata of every complete torrent.
     pub fn seeding_torrents(&self) -> Vec<crate::TorrentInfo> {
+        self.seeding_with_peer_ids()
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
+    }
+
+    /// Complete torrents with the peer ID each uses, which trackers are
+    /// told too.
+    pub fn seeding_with_peer_ids(&self) -> Vec<(crate::TorrentInfo, [u8; 20])> {
         self.routes
             .read()
             .by_key
             .values()
             .filter(|torrent| torrent.is_complete())
-            .map(|torrent| torrent.info.clone())
+            .map(|torrent| (torrent.info.clone(), torrent.peer_id))
             .collect()
     }
 

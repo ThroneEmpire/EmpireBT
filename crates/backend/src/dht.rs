@@ -211,6 +211,8 @@ struct Inner {
     state_path: Option<PathBuf>,
     /// uTP connections sharing this UDP port.
     utp: std::sync::OnceLock<Arc<crate::utp::Shared>>,
+    /// Leave the client's name and version (`v`) out of queries.
+    anonymous: AtomicBool,
 }
 
 /// A running DHT: an IPv4 node, and an IPv6 node where the system has
@@ -274,6 +276,14 @@ impl Dht {
             families,
             threads: Mutex::new(threads),
         }))
+    }
+
+    /// Leaves the client's name and version out of DHT messages, for
+    /// anonymous mode.
+    pub fn set_anonymous(&self, anonymous: bool) {
+        for family in &self.families {
+            family.anonymous.store(anonymous, Ordering::Relaxed);
+        }
     }
 
     /// The default public bootstrap nodes.
@@ -554,14 +564,19 @@ struct Lookup {
 }
 
 impl Inner {
-    /// Loads saved state and makes a node for `socket`'s address family.
+    /// Loads saved nodes and makes a node for `socket`'s address family.
+    /// Its id is new every time: one kept across runs (and so across IP
+    /// addresses, such as a VPN's) would let anyone watching the DHT
+    /// follow this node from address to address.
     fn new(socket: UdpSocket, bootstrap: Vec<String>, state_path: Option<PathBuf>) -> Self {
         let v6 = socket.local_addr().is_ok_and(|address| address.is_ipv6());
-        let (own_id, saved_nodes) = state_path
+        let own_id: NodeId = random_bytes();
+        let saved_nodes = state_path
             .as_ref()
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|bytes| load_state(&bytes))
-            .unwrap_or_else(|| (random_bytes(), Vec::new()));
+            .map(|(_, nodes)| nodes)
+            .unwrap_or_default();
         let mut table = RoutingTable::new(own_id);
         for (id, address) in saved_nodes {
             if address.is_ipv6() == v6 {
@@ -587,6 +602,7 @@ impl Inner {
             silent: Mutex::new(HashMap::new()),
             state_path,
             utp: std::sync::OnceLock::new(),
+            anonymous: AtomicBool::new(false),
         }
     }
 
@@ -838,13 +854,17 @@ impl Inner {
             .map(|(key, value)| (key.to_vec(), value))
             .collect();
         arguments.insert(b"id".to_vec(), Value::bytes(self.own_id));
-        let message = Value::dict([
+        let mut message = Value::dict([
             (b"t", Value::bytes(transaction)),
             (b"y", Value::bytes(*b"q")),
             (b"q", Value::bytes(method)),
             (b"a", Value::Dict(arguments)),
-            (b"v", Value::bytes(crate::identity::DHT_VERSION)),
         ]);
+        if !self.anonymous.load(Ordering::Relaxed)
+            && let Value::Dict(entries) = &mut message
+        {
+            entries.insert(b"v".to_vec(), Value::bytes(crate::identity::DHT_VERSION));
+        }
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(transaction, Pending { address, sender });
         }
@@ -1427,6 +1447,30 @@ mod tests {
         let joined = node.node_count();
         node.stop();
         assert!(joined >= 20, "only {joined} nodes after 30 s");
+    }
+
+    #[test]
+    fn takes_a_new_node_id_every_start_but_keeps_known_nodes() {
+        let path = std::env::temp_dir().join(format!("empirebt-dht-id-{}.dat", std::process::id()));
+        let mut bytes = b"EBDHT1".to_vec();
+        bytes.extend([7; 20]);
+        bytes.extend([9; 20]);
+        bytes.extend([127, 0, 0, 1, 0x1a, 0xe1]);
+        std::fs::write(&path, &bytes).unwrap();
+        let start = || {
+            let node =
+                Dht::start_on(&crate::Binding::any(), 0, Vec::new(), Some(path.clone())).unwrap();
+            let id = node.families[0].own_id;
+            let known = node.node_count();
+            node.stop();
+            (id, known)
+        };
+        let (first, known) = start();
+        let (second, _) = start();
+        assert_ne!(first, [7; 20], "the saved id is not reused");
+        assert_ne!(first, second);
+        assert!(known >= 1, "saved nodes still help joining");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

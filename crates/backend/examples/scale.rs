@@ -451,12 +451,8 @@ fn coverage_benchmark(client: &Client, runtime: Arc<empirebt_backend::Runtime>, 
         None,
     )
     .unwrap();
-    let mut announcer = SeedAnnouncer::start(
-        [7; 20],
-        6_881,
-        Duration::from_secs(10),
-        Some(Arc::clone(&dht)),
-    );
+    let mut announcer =
+        SeedAnnouncer::start(6_881, Duration::from_secs(10), Some(Arc::clone(&dht)));
     announcer.track(runtime);
     let hashes: Vec<[u8; 20]> = client
         .torrents()

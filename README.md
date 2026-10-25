@@ -23,7 +23,9 @@ libtorrent, the engine behind qBittorrent and Deluge, in both directions.
 - **Finds peers everywhere:** HTTP, HTTPS and UDP trackers, the DHT, peer
   exchange, and local peer discovery, over IPv4 and IPv6.
 - **Stays inside your VPN:** it can bind every connection to one network
-  interface, and connects nothing while that interface is down.
+  interface, and connects nothing while that interface is down. An
+  optional anonymous mode stops it telling peers and trackers it is
+  EmpireBT ([Privacy](#privacy)).
 - **Two interfaces, one engine:** a terminal dashboard and a secure web UI
   can run in the same process, showing the same torrents. Torrents can be
   organized with categories and tags, and each peer is shown with its
@@ -181,6 +183,7 @@ with comments on first run. Change settings in any of three ways:
 | `network.encryption` | `enabled` | Peer encryption: `enabled` (falls back to plain), `required`, or `disabled` |
 | `network.interface` | empty (any) | Bind every connection to one interface, by name (`wg0`) or address; nothing connects while it is down |
 | `network.lsd` | `true` | Find peers on the local network (never for private torrents) |
+| `network.anonymous` | `false` | Anonymous mode: public torrents don't say they are EmpireBT ([Privacy](#privacy)); applies live |
 | `dht.enabled` | `true` | Find peers without trackers (never for private torrents) |
 | `dht.bootstrap` | public routers | Nodes used to join the DHT |
 | `peers.countries` | `true` | Show peers' countries, from the free DB-IP Lite database, downloaded monthly (applies after restart) |
@@ -258,14 +261,38 @@ connections it already has.
   and an unreachable tracker host is skipped for every torrent for a while.
 - **The mainline DHT** (BEP 5, and BEP 32 for IPv6). Lookups are fast at
   first, then slow gradually to every 15 minutes for a torrent that finds
-  no new peers, without ever stopping. The routing table is saved between
-  runs. Private torrents (BEP 27) stay off the DHT.
+  no new peers, without ever stopping. Known nodes are saved between runs,
+  but the node ID is new every start. Private torrents (BEP 27) stay off
+  the DHT.
 - **Local peer discovery (BEP 14).** It announces on every network
   interface, so a VPN doesn't hide the LAN, and shares UDP port 6771 with
   other clients on the machine.
 - **IPv6 throughout.** Peers, uTP, the DHT, trackers and local discovery
   all work over both IPv4 and IPv6 on the same port. Systems without IPv6
   simply use IPv4.
+
+### Privacy
+
+Every peer in a swarm sees your IP address, whatever client you use: a
+VPN is what hides it (see `network.interface`). EmpireBT also avoids
+making itself easy to follow:
+- **A new DHT node ID every start,** and new peer IDs and DHT node ID
+  whenever the chosen network interface comes back after being down (a
+  VPN reconnecting, often at a new address) or the port changes. A node
+  ID kept across addresses would let anyone watching the DHT follow you
+  from one VPN address to the next.
+- **Anonymous mode** (`network.anonymous`), like qBittorrent's but
+  further. For public torrents EmpireBT then sends a random peer ID that
+  names no client (peers see "Unknown"), leaves its name out of the
+  extension handshake and DHT messages, and announces to trackers as
+  `curl/7.81.0`, the User-Agent libtorrent's anonymous mode uses.
+  qBittorrent's anonymous mode still sends its own peer ID. Private
+  torrents keep saying they are EmpireBT, because private trackers allow
+  only clients they know.
+
+Anonymous mode hides which client you use, not who you are. A client
+that names itself "Unknown" is still unusual, and clients can be told
+apart by how they behave.
 
 ### Connections
 

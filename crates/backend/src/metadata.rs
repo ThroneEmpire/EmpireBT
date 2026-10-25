@@ -20,9 +20,11 @@ const PIECE_SIZE: usize = 16 * 1024;
 const MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
 
 /// Our BEP 10 extension handshake, as seeders send it.
+#[cfg(test)]
 pub(crate) fn extension_handshake(metadata_size: Option<usize>) -> PeerMessage {
     extension_handshake_with(&ExtensionOffer {
         metadata_size,
+        client_version: true,
         ..ExtensionOffer::default()
     })
 }
@@ -38,6 +40,8 @@ pub(crate) struct ExtensionOffer {
     /// Our listen port, which a peer we connected to cannot otherwise
     /// know.
     pub listen_port: Option<u16>,
+    /// Name the client and its version (`v`); not in anonymous mode.
+    pub client_version: bool,
 }
 
 pub(crate) fn extension_handshake_with(offer: &ExtensionOffer) -> PeerMessage {
@@ -55,12 +59,14 @@ pub(crate) fn extension_handshake_with(offer: &ExtensionOffer) -> PeerMessage {
                     .collect(),
             ),
         ),
-        (
-            b"v".to_vec(),
-            Value::bytes(format!("EmpireBT {}", env!("CARGO_PKG_VERSION"))),
-        ),
         (b"reqq".to_vec(), Value::Int(250)),
     ];
+    if offer.client_version {
+        entries.push((
+            b"v".to_vec(),
+            Value::bytes(format!("EmpireBT {}", env!("CARGO_PKG_VERSION"))),
+        ));
+    }
     if let Some(size) = offer.metadata_size {
         entries.push((b"metadata_size".to_vec(), Value::Int(size as i64)));
     }
@@ -253,7 +259,10 @@ pub fn fetch_metadata_from_peer_with(
     if !connection.supports_extensions() {
         return Err(invalid("peer does not support the extension protocol"));
     }
-    connection.send(&extension_handshake(None))?;
+    connection.send(&extension_handshake_with(&ExtensionOffer {
+        client_version: crate::identity::identifies(&peer_id),
+        ..ExtensionOffer::default()
+    }))?;
 
     let mut remote = RemoteMetadata::default();
     let mut pieces: Vec<Option<Vec<u8>>> = Vec::new();
@@ -520,6 +529,22 @@ fn invalid(message: &str) -> crate::BackendError {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn anonymous_handshakes_leave_out_the_client_name() {
+        let client = |offer: &ExtensionOffer| {
+            let PeerMessage::Extended { payload, .. } = extension_handshake_with(offer) else {
+                panic!("not an extended message");
+            };
+            parse_extension_handshake(&payload).unwrap().client
+        };
+        let named = client(&ExtensionOffer {
+            client_version: true,
+            ..ExtensionOffer::default()
+        });
+        assert!(named.is_some_and(|name| name.starts_with("EmpireBT")));
+        assert_eq!(client(&ExtensionOffer::default()), None);
+    }
 
     /// Serves `info` over ut_metadata to one peer, like a seeder would.
     fn metadata_peer(info: Vec<u8>, info_hash: [u8; 20]) -> SocketAddr {

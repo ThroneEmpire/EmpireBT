@@ -138,7 +138,15 @@ pub(crate) fn request(
         .map_err(|error| Error::Unreachable(error.to_string()))?
         .find(|address| binding.reaches(address))
         .ok_or_else(|| Error::Unreachable("hostname resolved to no addresses".to_owned()))?;
-    request_at(address, url, target, timeout, limit, binding)
+    request_at(
+        address,
+        url,
+        target,
+        crate::identity::USER_AGENT,
+        timeout,
+        limit,
+        binding,
+    )
 }
 
 /// Like [`request`], with a method, extra header lines (each ending in
@@ -165,13 +173,16 @@ struct Message<'a> {
     target: &'a str,
     headers: &'a str,
     body: &'a [u8],
+    user_agent: &'a str,
 }
 
-/// Like [`request`], to the server at `address` (one of `url`'s host's).
+/// Like [`request`], to the server at `address` (one of `url`'s host's),
+/// saying it is `user_agent`.
 pub(crate) fn request_at(
     address: std::net::SocketAddr,
     url: &Url,
     target: &str,
+    user_agent: &str,
     timeout: Duration,
     limit: u64,
     binding: &crate::Binding,
@@ -181,6 +192,7 @@ pub(crate) fn request_at(
         target,
         headers: "",
         body: &[],
+        user_agent,
     };
     send_at(address, url, &message, timeout, limit, binding)
 }
@@ -213,11 +225,8 @@ fn send_at(
     };
     let mut http_request = format!(
         "{} {} HTTP/1.0\r\nHost: {host_header}\r\nConnection: close\r\n\
-         User-Agent: EmpireBT/{}\r\nAccept: */*\r\n{}{length}\r\n",
-        message.method,
-        message.target,
-        env!("CARGO_PKG_VERSION"),
-        message.headers,
+         User-Agent: {}\r\nAccept: */*\r\n{}{length}\r\n",
+        message.method, message.target, message.user_agent, message.headers,
     )
     .into_bytes();
     http_request.extend(message.body);
@@ -326,6 +335,7 @@ pub fn http_request(
         target: &parsed.path,
         headers: &lines,
         body,
+        user_agent: crate::identity::USER_AGENT,
     };
     send(&parsed, &message, timeout, limit, binding)
         .map(|response| HttpResponse {

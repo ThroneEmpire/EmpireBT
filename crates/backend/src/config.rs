@@ -13,6 +13,7 @@ pub struct ClientConfig {
     peer_timeout: Duration,
     dht_enabled: bool,
     lsd_enabled: bool,
+    anonymous: bool,
     interface: Option<String>,
     dht_bootstrap: Vec<String>,
     encryption: crate::Encryption,
@@ -31,6 +32,7 @@ impl Default for ClientConfig {
             peer_timeout: Duration::from_secs(10),
             dht_enabled: true,
             lsd_enabled: true,
+            anonymous: false,
             interface: None,
             dht_bootstrap: crate::Dht::default_bootstrap(),
             encryption: crate::Encryption::default(),
@@ -102,6 +104,17 @@ impl ClientConfig {
 
     pub fn lsd_enabled(&self) -> bool {
         self.lsd_enabled
+    }
+
+    /// Anonymous mode: public torrents use a peer ID that names no client,
+    /// a generic User-Agent, and no client name in handshakes or the DHT.
+    pub fn with_anonymous(mut self, anonymous: bool) -> Self {
+        self.anonymous = anonymous;
+        self
+    }
+
+    pub fn anonymous(&self) -> bool {
+        self.anonymous
     }
 
     /// Uses only this network interface, by name (`wg0`) or IPv4 address,

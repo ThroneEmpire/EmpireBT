@@ -209,6 +209,9 @@ def identify_peer(source, save, port, peer, seconds):
             next_connect = time.time() + 3
         for info in handle.get_peer_info():
             note_encryption(info)
+            if "connected" not in seen:
+                seen.append("connected")
+                print("connected", flush=True)
             client = info.client.decode() if isinstance(info.client, bytes) else info.client
             if client and client not in seen:
                 seen.append(client)

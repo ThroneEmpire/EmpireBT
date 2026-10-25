@@ -655,9 +655,12 @@ fn announce_http_tracker(
     let target = format!("{}{separator}{}", url.path, request.query());
     let addresses = family_addresses(tracker, &format!("{}:{}", url.host, url.port))?;
     let binding = tracker.binding.clone();
+    let user_agent = crate::identity::user_agent_for(&request.peer_id);
     over_each_family(
         addresses,
-        Arc::new(move |address| http_announce_at(address, &url, &target, timeout, &binding)),
+        Arc::new(move |address| {
+            http_announce_at(address, &url, &target, user_agent, timeout, &binding)
+        }),
     )
 }
 
@@ -665,15 +668,23 @@ fn http_announce_at(
     address: SocketAddr,
     url: &crate::http::Url,
     target: &str,
+    user_agent: &str,
     timeout: Duration,
     binding: &crate::Binding,
 ) -> Result<TrackerResponse, Failure> {
-    let response =
-        crate::http::request_at(address, url, target, timeout, MAX_HTTP_RESPONSE, binding)
-            .map_err(|error| match error {
-                crate::http::Error::Unreachable(message) => unreachable(message),
-                crate::http::Error::Invalid(message) => tracker_error(message).into(),
-            })?;
+    let response = crate::http::request_at(
+        address,
+        url,
+        target,
+        user_agent,
+        timeout,
+        MAX_HTTP_RESPONSE,
+        binding,
+    )
+    .map_err(|error| match error {
+        crate::http::Error::Unreachable(message) => unreachable(message),
+        crate::http::Error::Invalid(message) => tracker_error(message).into(),
+    })?;
     if response.status != 200 {
         return Err(tracker_error(format!(
             "tracker returned HTTP status {}",
@@ -751,6 +762,7 @@ mod tests {
                 address,
                 &url,
                 &target,
+                crate::identity::USER_AGENT,
                 Duration::from_secs(10),
                 &crate::Binding::any(),
             )
