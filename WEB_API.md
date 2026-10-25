@@ -71,8 +71,8 @@ for the right password.
 | `GET /api/session` | | `{"signedIn": true}`, or `401` |
 | `GET /api/state` | | Everything, see [State](#state) |
 | `GET /api/events` | | Live updates, see [Live updates](#live-updates) |
-| `POST /api/torrents` | `{"source": "magnet:…"}` or an `http(s)://` URL of a `.torrent` file; optionally `"savePath"`, `"category"`, `"tags": [...]` | `{"added": hash}`, or `202 {"fetching": true}` for URLs |
-| `POST /api/torrents/upload?savePath=…&category=…&tags=a,b` | the `.torrent` file's bytes (each query value optional, URL-encoded) | `{"added": hash}` |
+| `POST /api/torrents` | `{"source": "magnet:…"}` or an `http(s)://` URL of a `.torrent` file; optionally `"savePath"`, `"category"`, `"tags": [...]`, `"layout"` | `{"added": hash}`, or `202 {"fetching": true}` for URLs |
+| `POST /api/torrents/upload?savePath=…&category=…&tags=a,b&layout=…` | the `.torrent` file's bytes (each query value optional, URL-encoded) | `{"added": hash}` |
 | `GET /api/torrents/{hash}` | | [Details](#details) |
 | `GET /api/torrents/{hash}/peers` | | [Peers](#peers) |
 | `POST /api/torrents/{hash}/start` | | `204` |
@@ -82,6 +82,8 @@ for the right password.
 | `DELETE /api/torrents/{hash}` | | `204`; downloaded files stay on disk |
 | `PUT /api/torrents/{hash}/category` | `{"category": "ISOs"}` (`null` for none) | `204`; a new name creates the category |
 | `PUT /api/torrents/{hash}/tags` | `{"tags": ["linux", "web"]}` | `204`; replaces all tags |
+| `PUT /api/torrents/{hash}/name` | `{"name": "My album"}` (`null` or empty for its own name) | `204`; only the name shown changes |
+| `POST /api/torrents/{hash}/rename` | `{"from": "album/01.flac", "to": "album/01 - Intro.flac"}` | `204`; renames a file or folder on disk, see [Renaming](#renaming) |
 | `POST /api/categories` | `{"name": "ISOs"}` | `204` |
 | `PUT /api/categories/folder` | `{"name": "Films", "savePath": "/media/films"}` (`null` or empty takes the folder away) | `204`; makes the category if new |
 | `POST /api/categories/remove` | `{"name": "ISOs"}` | `204`; torrents keep their other labels |
@@ -102,6 +104,11 @@ and answers `403` for anything else, including paths with `..`:
 - category folders (all of these appear as `lists.saveDirs` in the
   state);
 - any folder inside one of those.
+
+`layout` places a new torrent's files: `original` (the default, as the
+torrent has them), `subfolder` (a single file goes in a folder named after
+it) or `nosubfolder` (a torrent's files go straight in the save folder,
+without its top folder).
 
 Settings take the same text values as `empirebt config set`. Settings
 under `storage.*` and `web.*`, and `network.interface`, answer `403`. They
@@ -249,7 +256,11 @@ curl -N -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/events
 ```json
 {
   "torrent": { "…": "as in the state" },
-  "files": [ { "path": "album/01.flac", "size": 31457280 } ],
+  "originalName": "album",
+  "files": [
+    { "path": "album/01.flac", "size": 31457280 },
+    { "path": "album/02 - Live.flac", "original": "album/02.flac", "size": 28311552 }
+  ],
   "trackers": ["udp://tracker.example:6969/announce"],
   "pieces": 1458,
   "verifiedPieces": 614,
@@ -271,6 +282,26 @@ curl -N -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/events
   are empty or `null` until a magnet link's metadata arrives.
 - `announce` describes seeding announces. It is `null` while the torrent
   is not seeding.
+- `originalName` is the torrent's own name; `torrent.name` is the name
+  shown, which may have been changed.
+- Each file's `path` is where it is, relative to `savePath`, with `/`
+  between folders. `original` is there only for files renamed or moved:
+  their path in the torrent.
+
+## Renaming
+
+`POST /api/torrents/{hash}/rename` takes a file's or a folder's `path` as
+the details give it, and the path it should have. A folder moves with
+everything in it. A `to` in another folder moves it there, making folders
+as needed; folders left empty are removed.
+
+- Files on disk move straight away, all or none, and a seeding torrent
+  keeps seeding under the new names.
+- A torrent that is downloading or being checked answers `400`: pause it
+  first.
+- Paths must stay inside the torrent's folder (no `..`, nothing absolute),
+  and may not take the place of another of its files or of a file already
+  on disk.
 
 ## Peers
 

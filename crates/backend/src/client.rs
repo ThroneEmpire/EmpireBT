@@ -1,5 +1,7 @@
 use crate::{BackendError, ClientConfig, Dht, MagnetLink, Torrent, TorrentInfo};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -241,12 +243,247 @@ impl Client {
         Ok(())
     }
 
-    /// Storage rooted at a torrent's folder.
+    /// Storage rooted at a torrent's folder, finding its files under the
+    /// names they have on disk.
     fn storage_for(&self, torrent: &Torrent) -> crate::Storage {
-        match torrent.save_dir() {
+        let storage = match torrent.save_dir() {
             Some(dir) if dir != self.storage.root() => self.storage.at(dir),
-            _ => self.storage.clone(),
+            _ => self.storage.at(self.storage.root()),
+        };
+        storage.with_renames(torrent.renames().clone())
+    }
+
+    /// Chooses the name shown for a torrent; `None` shows its own again.
+    /// Its files are not touched.
+    pub fn rename_torrent(
+        &mut self,
+        index: usize,
+        name: Option<String>,
+    ) -> Result<(), BackendError> {
+        let name = name
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty());
+        if let Some(name) = &name
+            && (name.chars().any(char::is_control) || name.chars().count() > MAX_NAME)
+        {
+            return Err(BackendError::InvalidConfiguration(format!(
+                "a torrent's name is at most {MAX_NAME} characters, without line breaks"
+            )));
         }
+        self.torrents
+            .get_mut(index)
+            .ok_or_else(|| BackendError::TorrentNotFound(index.to_string()))?
+            .set_display_name(name);
+        Ok(())
+    }
+
+    /// A torrent's files (padding left out), each with the torrent's path
+    /// and the one it has on disk, relative to the torrent's folder.
+    pub fn files(&self, index: usize) -> Vec<crate::TorrentFileName> {
+        let Some(torrent) = self.torrents.get(index) else {
+            return Vec::new();
+        };
+        let Some(info) = torrent.info() else {
+            return Vec::new();
+        };
+        let renames = torrent.renames().table();
+        info.files()
+            .iter()
+            .filter(|file| !file.is_padding())
+            .map(|file| crate::TorrentFileName {
+                original: file.path().to_owned(),
+                path: renames
+                    .get(file.path())
+                    .cloned()
+                    .unwrap_or_else(|| file.path().to_owned()),
+                length: file.length(),
+            })
+            .collect()
+    }
+
+    /// Lays out a torrent's files before any are written: as the torrent
+    /// says, inside a folder of its own, or without its top folder. A
+    /// magnet link gets it once its metadata arrives.
+    pub fn set_content_layout(
+        &mut self,
+        index: usize,
+        layout: crate::ContentLayout,
+    ) -> Result<(), BackendError> {
+        let files = self.files(index);
+        let torrent = self
+            .torrents
+            .get_mut(index)
+            .ok_or_else(|| BackendError::TorrentNotFound(index.to_string()))?;
+        if torrent.info().is_none() {
+            torrent.set_pending_layout(layout);
+            return Ok(());
+        }
+        torrent.set_pending_layout(crate::ContentLayout::Original);
+        let name = Path::new(torrent.name());
+        let single = files.len() == 1 && files[0].original == name;
+        let table: BTreeMap<PathBuf, PathBuf> = match layout {
+            crate::ContentLayout::Original => BTreeMap::new(),
+            // A single file goes in a folder named after it.
+            crate::ContentLayout::Subfolder if single => {
+                let folder = name
+                    .file_stem()
+                    .map_or_else(|| name.to_owned(), PathBuf::from);
+                std::iter::once((name.to_owned(), folder.join(name))).collect()
+            }
+            crate::ContentLayout::Subfolder => BTreeMap::new(),
+            crate::ContentLayout::NoSubfolder if single => BTreeMap::new(),
+            // Files go straight in the save folder, without the top folder.
+            crate::ContentLayout::NoSubfolder => files
+                .iter()
+                .filter_map(|file| {
+                    let inside = file.original.strip_prefix(name).ok()?;
+                    (!inside.as_os_str().is_empty())
+                        .then(|| (file.original.clone(), inside.to_owned()))
+                })
+                .collect(),
+        };
+        torrent.renames().replace(table);
+        Ok(())
+    }
+
+    /// Takes names on disk another client gave a torrent's files (for an
+    /// import), without moving anything: the torrent's path to the one
+    /// used instead. Each must stay inside the torrent's folder.
+    pub fn adopt_names(
+        &mut self,
+        index: usize,
+        table: BTreeMap<PathBuf, PathBuf>,
+    ) -> Result<(), BackendError> {
+        if let Some((_, path)) = table.iter().find(|(_, path)| !is_plain_relative(path)) {
+            return Err(BackendError::InvalidConfiguration(format!(
+                "{} is not a name inside the torrent's folder",
+                path.display()
+            )));
+        }
+        self.torrents
+            .get(index)
+            .ok_or_else(|| BackendError::TorrentNotFound(index.to_string()))?
+            .renames()
+            .replace(table);
+        Ok(())
+    }
+
+    /// Renames a file or a folder of a torrent, by its path on disk
+    /// relative to the torrent's folder, to `to`. Files already on disk
+    /// are moved there (all of them, or none); the names apply at once to
+    /// running transfers and seeding. Returns how many files moved.
+    pub fn rename_path(
+        &mut self,
+        index: usize,
+        from: &Path,
+        to: &Path,
+    ) -> Result<usize, BackendError> {
+        let invalid = BackendError::InvalidConfiguration;
+        // `a/./b` is `a/b`.
+        let (from, to): (PathBuf, PathBuf) =
+            (from.components().collect(), to.components().collect());
+        let (from, to) = (from.as_path(), to.as_path());
+        if !is_plain_relative(to) {
+            return Err(invalid(format!(
+                "{} is not a name inside the torrent's folder",
+                to.display()
+            )));
+        }
+        let files = self.files(index);
+        let moving: Vec<(PathBuf, PathBuf, PathBuf)> = files
+            .iter()
+            .filter_map(|file| {
+                let rest = file.path.strip_prefix(from).ok()?;
+                let target = if rest.as_os_str().is_empty() {
+                    to.to_owned()
+                } else {
+                    to.join(rest)
+                };
+                Some((file.original.clone(), file.path.clone(), target))
+            })
+            .collect();
+        if moving.is_empty() {
+            return Err(invalid(format!(
+                "the torrent has no file or folder {}",
+                from.display()
+            )));
+        }
+        if moving.iter().all(|(_, path, target)| path == target) {
+            return Ok(0);
+        }
+        // Two files may not end up with one name, nor one inside another.
+        let staying: Vec<&Path> = files
+            .iter()
+            .filter(|file| {
+                !moving
+                    .iter()
+                    .any(|(original, _, _)| *original == file.original)
+            })
+            .map(|file| file.path.as_path())
+            .collect();
+        for (_, _, target) in &moving {
+            if staying
+                .iter()
+                .any(|path| path.starts_with(target) || target.starts_with(path))
+            {
+                return Err(invalid(format!(
+                    "{} is already taken by another file of the torrent",
+                    target.display()
+                )));
+            }
+        }
+        let torrent = self
+            .torrents
+            .get(index)
+            .ok_or_else(|| BackendError::TorrentNotFound(index.to_string()))?;
+        let storage = self.storage_for(torrent);
+        let root = storage.root().to_owned();
+        // Move what is on disk, undoing it all if one move fails.
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let result = moving.iter().try_for_each(|(_, path, target)| {
+            let (old, new) = (root.join(path), root.join(target));
+            if !old.exists() {
+                return Ok(());
+            }
+            if new.exists() {
+                return Err(invalid(format!("{} already exists", new.display())));
+            }
+            if let Some(parent) = new.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| BackendError::Io(error.to_string()))?;
+            }
+            storage.forget(&old);
+            std::fs::rename(&old, &new)
+                .map_err(|error| BackendError::Io(format!("{}: {error}", old.display())))?;
+            moved.push((old, new));
+            Ok(())
+        });
+        if let Err(error) = result {
+            for (old, new) in moved.iter().rev() {
+                let _ = std::fs::rename(new, old);
+            }
+            return Err(error);
+        }
+        // Folders left empty by the move go too.
+        for (old, _) in &moved {
+            let mut folder = old.parent();
+            while let Some(dir) = folder.filter(|dir| dir.starts_with(&root) && *dir != root) {
+                if std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
+                folder = dir.parent();
+            }
+        }
+        let mut table = (*torrent.renames().table()).clone();
+        for (original, _, target) in &moving {
+            if target == original {
+                table.remove(original);
+            } else {
+                table.insert(original.clone(), target.clone());
+            }
+        }
+        torrent.renames().replace(table);
+        Ok(moved.len())
     }
 
     fn storage_at(&self, index: usize) -> crate::Storage {
@@ -833,7 +1070,19 @@ impl Client {
             }
             (crate::TransferKind::Verify, Err(_)) => {}
         }
+        if kind == crate::TransferKind::Metadata && result.is_ok() {
+            self.apply_pending_layout(index);
+        }
         result
+    }
+
+    /// Gives a magnet link's files the layout chosen for them, now that
+    /// they are known.
+    fn apply_pending_layout(&mut self, index: usize) {
+        let layout = self.torrents[index].pending_layout();
+        if layout != crate::ContentLayout::Original {
+            let _ = self.set_content_layout(index, layout);
+        }
     }
 
     /// Whether a torrent's resume data still matches its files, so its saved
@@ -1047,7 +1296,87 @@ impl Client {
                 }
             }
         }
-        self.save_resume(&dir.join(SESSION_RESUME))
+        self.save_resume(&dir.join(SESSION_RESUME))?;
+        self.save_names(&dir.join(SESSION_NAMES))
+    }
+
+    /// Writes each torrent's chosen name and renamed files, where it has
+    /// any, and removes the files of torrents without them.
+    fn save_names(&self, dir: &std::path::Path) -> Result<(), BackendError> {
+        std::fs::create_dir_all(dir).map_err(|error| BackendError::Io(error.to_string()))?;
+        let mut keep = std::collections::HashSet::new();
+        for torrent in &self.torrents {
+            let Some(hash) = torrent.info_hash() else {
+                continue;
+            };
+            let table = torrent.renames().table();
+            let layout = torrent.pending_layout();
+            if torrent.chosen_name().is_none()
+                && table.is_empty()
+                && layout == crate::ContentLayout::Original
+            {
+                continue;
+            }
+            let mut text = format!("{NAMES_HEADER}\n");
+            if let Some(name) = torrent.chosen_name() {
+                text.push_str(&format!("name\t{name}\n"));
+            }
+            if layout != crate::ContentLayout::Original {
+                text.push_str(&format!("layout\t{}\n", layout.key()));
+            }
+            for (original, path) in table.iter() {
+                let slashed = |path: &Path| path.to_string_lossy().replace('\\', "/");
+                text.push_str(&format!("file\t{}\t{}\n", slashed(original), slashed(path)));
+            }
+            let name = format!("{}.names", hex(hash));
+            let path = dir.join(&name);
+            if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+                write_atomically(&path, text.as_bytes())?;
+            }
+            keep.insert(name);
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if !keep.contains(entry.file_name().to_string_lossy().as_ref()) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads what [`Client::save_names`] saved into `torrent`; lines that
+    /// do not hold safe names are skipped.
+    fn load_names(torrent: &mut Torrent, path: &std::path::Path) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let mut lines = text.lines();
+        if lines.next() != Some(NAMES_HEADER) {
+            return;
+        }
+        let mut table = BTreeMap::new();
+        for line in lines {
+            let mut fields = line.split('\t');
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some("name"), Some(name), None) if !name.is_empty() => {
+                    torrent.set_display_name(Some(name.to_owned()));
+                }
+                (Some("layout"), Some(layout), None) => {
+                    if let Some(layout) = crate::ContentLayout::parse(layout) {
+                        torrent.set_pending_layout(layout);
+                    }
+                }
+                (Some("file"), Some(original), Some(renamed)) => {
+                    let (original, renamed) = (PathBuf::from(original), PathBuf::from(renamed));
+                    if is_plain_relative(&original) && is_plain_relative(&renamed) {
+                        table.insert(original, renamed);
+                    }
+                }
+                _ => {}
+            }
+        }
+        torrent.renames().replace(table);
     }
 
     /// Writes resume files that changed since the last save, and removes
@@ -1185,6 +1514,10 @@ impl Client {
                             .ok()
                             .and_then(|bytes| crate::ResumeData::decode(&bytes).ok()),
                     );
+                    let names = dir
+                        .join(SESSION_NAMES)
+                        .join(format!("{}.names", hex(&hash)));
+                    Self::load_names(&mut torrent, &names);
                     client.torrents.push(torrent);
                 }
                 Err(error) => warnings.push(format!(
@@ -1210,10 +1543,28 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), BackendE
         .map_err(|error| BackendError::Io(format!("{}: {error}", path.display())))
 }
 
+/// Longest name shown for a torrent, in characters.
+const MAX_NAME: usize = 255;
+
+/// A path that stays inside the folder it is relative to: plain names only,
+/// no `..`, no root, nothing empty or with control characters.
+fn is_plain_relative(path: &Path) -> bool {
+    path.components().count() > 0
+        && path.components().all(|part| match part {
+            std::path::Component::Normal(name) => name
+                .to_str()
+                .is_some_and(|name| !name.is_empty() && !name.chars().any(char::is_control)),
+            _ => false,
+        })
+}
+
 const SESSION_DIR_MAGIC: &[u8; 7] = b"EMPBT4\0";
 const SESSION_INDEX: &str = "index";
 const SESSION_TORRENTS: &str = "torrents";
 const SESSION_RESUME: &str = "resume";
+/// Torrents' chosen names and renamed files.
+const SESSION_NAMES: &str = "names";
+const NAMES_HEADER: &str = "EmpireBT names 1";
 
 const SESSION_MAGIC: &[u8; 7] = b"EMPBT2\0";
 const RECORD_METAINFO: u8 = 0;
@@ -1470,6 +1821,263 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, BackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A torrent `album` with `album/a.flac` (3 bytes) and
+    /// `album/disc/b.flac` (4 bytes) in one piece, and a client saving in
+    /// `dir`, with both files written there.
+    fn album_client(dir: &Path) -> (Client, usize) {
+        use sha1::{Digest, Sha1};
+        let _ = std::fs::remove_dir_all(dir);
+        let hash: [u8; 20] = Sha1::digest(b"abcdefg").into();
+        let mut bytes = b"d4:infod5:filesld6:lengthi3e4:pathl6:a.flaceed6:lengthi4e4:pathl4:disc6:b.flaceee4:name5:album12:piece lengthi16384e6:pieces20:".to_vec();
+        bytes.extend(hash);
+        bytes.extend(b"ee");
+        let info = TorrentInfo::from_bytes(&bytes).unwrap();
+        let mut client =
+            Client::with_config(ClientConfig::new().with_download_directory(dir)).unwrap();
+        let index = client.add_torrent(info);
+        std::fs::create_dir_all(dir.join("album/disc")).unwrap();
+        std::fs::write(dir.join("album/a.flac"), b"abc").unwrap();
+        std::fs::write(dir.join("album/disc/b.flac"), b"defg").unwrap();
+        (client, index)
+    }
+
+    fn verified(client: &Client, index: usize) -> usize {
+        let info = client.torrent_info(index).unwrap();
+        let progress = std::sync::Arc::new(crate::TransferProgress::new());
+        verify_local_data(&info, &client.storage_at(index), &progress).unwrap()
+    }
+
+    #[test]
+    fn renaming_files_and_folders_moves_them_and_keeps_them_verifiable() {
+        let dir = std::env::temp_dir().join(format!("empirebt-rename-{}", std::process::id()));
+        let (mut client, index) = album_client(&dir);
+        assert_eq!(verified(&client, index), 1);
+
+        let moved = client
+            .rename_path(
+                index,
+                Path::new("album/a.flac"),
+                Path::new("album/01 - a.flac"),
+            )
+            .unwrap();
+        assert_eq!(moved, 1);
+        assert!(dir.join("album/01 - a.flac").exists());
+        assert!(!dir.join("album/a.flac").exists());
+
+        // A folder moves with everything in it; the emptied one goes.
+        client
+            .rename_path(index, Path::new("album"), Path::new("Album (2024)"))
+            .unwrap();
+        assert!(dir.join("Album (2024)/01 - a.flac").exists());
+        assert!(dir.join("Album (2024)/disc/b.flac").exists());
+        assert!(!dir.join("album").exists());
+        let paths: Vec<_> = client
+            .files(index)
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("Album (2024)/01 - a.flac"),
+                PathBuf::from("Album (2024)/disc/b.flac")
+            ]
+        );
+        assert_eq!(
+            verified(&client, index),
+            1,
+            "the data is found under its new names"
+        );
+
+        // Renaming back to the torrent's own names leaves no table.
+        client
+            .rename_path(index, Path::new("Album (2024)"), Path::new("album"))
+            .unwrap();
+        client
+            .rename_path(
+                index,
+                Path::new("album/01 - a.flac"),
+                Path::new("album/a.flac"),
+            )
+            .unwrap();
+        assert!(client.torrents()[index].renames().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn renames_that_would_clash_or_escape_are_refused() {
+        let dir = std::env::temp_dir().join(format!("empirebt-rename-bad-{}", std::process::id()));
+        let (mut client, index) = album_client(&dir);
+        for to in [
+            "album/disc/b.flac",
+            "album/disc",
+            "../outside",
+            "/etc/a",
+            "",
+        ] {
+            assert!(
+                client
+                    .rename_path(index, Path::new("album/a.flac"), Path::new(to))
+                    .is_err(),
+                "{to:?}"
+            );
+        }
+        assert!(
+            client
+                .rename_path(index, Path::new("album/missing"), Path::new("album/x"))
+                .is_err()
+        );
+        // A file in the way that is not the torrent's is not overwritten.
+        std::fs::write(dir.join("album/other.txt"), b"mine").unwrap();
+        assert!(
+            client
+                .rename_path(
+                    index,
+                    Path::new("album/a.flac"),
+                    Path::new("album/other.txt")
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(dir.join("album/other.txt")).unwrap(), b"mine");
+        assert!(dir.join("album/a.flac").exists());
+        assert!(client.torrents()[index].renames().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_folder_rename_moves_nothing() {
+        let dir = std::env::temp_dir().join(format!("empirebt-rename-undo-{}", std::process::id()));
+        let (mut client, index) = album_client(&dir);
+        // The second file's new place is taken on disk.
+        std::fs::create_dir_all(dir.join("new/disc")).unwrap();
+        std::fs::write(dir.join("new/disc/b.flac"), b"other").unwrap();
+        assert!(
+            client
+                .rename_path(index, Path::new("album"), Path::new("new"))
+                .is_err()
+        );
+        assert!(dir.join("album/a.flac").exists());
+        assert!(dir.join("album/disc/b.flac").exists());
+        assert!(!dir.join("new/a.flac").exists());
+        assert!(client.torrents()[index].renames().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn content_layouts_place_files_with_or_without_the_top_folder() {
+        let dir = std::env::temp_dir().join(format!("empirebt-layout-{}", std::process::id()));
+        let (mut client, index) = album_client(&dir);
+        client
+            .set_content_layout(index, crate::ContentLayout::NoSubfolder)
+            .unwrap();
+        let paths: Vec<_> = client
+            .files(index)
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(
+            paths,
+            [PathBuf::from("a.flac"), PathBuf::from("disc/b.flac")]
+        );
+        client
+            .set_content_layout(index, crate::ContentLayout::Original)
+            .unwrap();
+        assert!(client.torrents()[index].renames().is_empty());
+
+        let single = {
+            let mut bytes =
+                b"d4:infod6:lengthi4e4:name8:film.mkv12:piece lengthi4e6:pieces20:".to_vec();
+            bytes.extend([3; 20]);
+            bytes.extend(b"ee");
+            client.add_torrent(TorrentInfo::from_bytes(&bytes).unwrap())
+        };
+        client
+            .set_content_layout(single, crate::ContentLayout::Subfolder)
+            .unwrap();
+        assert_eq!(client.files(single)[0].path, PathBuf::from("film/film.mkv"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_magnet_links_layout_waits_for_its_metadata_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("empirebt-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut client = Client::new();
+        let index = client.add_magnet(
+            MagnetLink::parse("magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a")
+                .unwrap(),
+        );
+        client
+            .set_content_layout(index, crate::ContentLayout::NoSubfolder)
+            .unwrap();
+        client.save_session_dir(&dir).unwrap();
+        let (mut loaded, _) = Client::load_session_dir(ClientConfig::default(), &dir).unwrap();
+        assert_eq!(
+            loaded.torrents()[0].pending_layout(),
+            crate::ContentLayout::NoSubfolder
+        );
+
+        // The metadata arrives: the files go without the top folder.
+        let mut bytes = b"d4:infod5:filesld6:lengthi3e4:pathl5:a.txteed6:lengthi4e4:pathl5:b.txteee4:name5:album12:piece lengthi16384e6:pieces20:".to_vec();
+        bytes.extend([7; 20]);
+        bytes.extend(b"ee");
+        loaded.torrents[0].set_info(TorrentInfo::from_bytes(&bytes).unwrap());
+        loaded.apply_pending_layout(0);
+        let paths: Vec<_> = loaded.files(0).into_iter().map(|file| file.path).collect();
+        assert_eq!(paths, [PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+        assert_eq!(
+            loaded.torrents()[0].pending_layout(),
+            crate::ContentLayout::Original
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chosen_names_and_renamed_files_survive_a_session_round_trip() {
+        let dir = std::env::temp_dir().join(format!("empirebt-names-{}", std::process::id()));
+        let data = dir.join("data");
+        let session = dir.join("session");
+        let (mut client, index) = album_client(&data);
+        let _ = std::fs::remove_dir_all(&session);
+        client
+            .rename_torrent(index, Some("  My album  ".to_owned()))
+            .unwrap();
+        assert!(
+            client
+                .rename_torrent(index, Some("two\nlines".to_owned()))
+                .is_err()
+        );
+        client
+            .rename_path(index, Path::new("album/disc"), Path::new("album/CD 1"))
+            .unwrap();
+        client.save_session_dir(&session).unwrap();
+
+        let config = ClientConfig::new().with_download_directory(&data);
+        let (loaded, problems) = Client::load_session_dir(config.clone(), &session).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        let torrent = &loaded.torrents()[0];
+        assert_eq!(torrent.display_name(), "My album");
+        assert_eq!(torrent.name(), "album");
+        assert_eq!(loaded.files(0)[1].path, PathBuf::from("album/CD 1/b.flac"));
+        assert_eq!(verified(&loaded, 0), 1);
+
+        // Clearing both removes the saved names.
+        client.rename_torrent(index, None).unwrap();
+        client
+            .rename_path(index, Path::new("album/CD 1"), Path::new("album/disc"))
+            .unwrap();
+        client.save_session_dir(&session).unwrap();
+        assert_eq!(
+            std::fs::read_dir(session.join(SESSION_NAMES))
+                .unwrap()
+                .count(),
+            0
+        );
+        let (loaded, _) = Client::load_session_dir(config, &session).unwrap();
+        assert_eq!(loaded.torrents()[0].display_name(), "album");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn default_client_has_default_configuration() {

@@ -8,9 +8,9 @@ use crate::snapshot::{
 };
 use crate::{InfoHash, Store};
 use empirebt_backend::{
-    AnnounceStatus, BackendError, Client, ClientConfig, ConfigFile, Dht, MagnetLink, Runtime,
-    SeedAnnouncer, TorrentInfo, TransferHandle, TransferKind, TransferPhase, TransferProgress,
-    TransferState, UtpSocket,
+    AnnounceStatus, BackendError, Client, ClientConfig, ConfigFile, ContentLayout, Dht, MagnetLink,
+    Runtime, SeedAnnouncer, TorrentInfo, TransferHandle, TransferKind, TransferPhase,
+    TransferProgress, TransferState, UtpSocket,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -90,6 +90,20 @@ pub enum Command {
     RemoveTag(String),
     /// The peers connected for a torrent, answered as [`Reply::Peers`].
     Peers(InfoHash),
+    /// Chooses the name shown for a torrent; `None` shows its own again.
+    /// Its files are not touched.
+    RenameTorrent {
+        torrent: InfoHash,
+        name: Option<String>,
+    },
+    /// Renames or moves a file or folder of a torrent, by its path in the
+    /// torrent's folder (as [`TorrentView::files`] gives it), moving what
+    /// is on disk.
+    RenamePath {
+        torrent: InfoHash,
+        from: PathBuf,
+        to: PathBuf,
+    },
 }
 
 /// A torrent to add, and how.
@@ -105,6 +119,8 @@ pub struct AddRequest {
     pub tags: Vec<String>,
     /// Whether to start it; unset follows `console.start_on_add`.
     pub start: Option<bool>,
+    /// How its files are laid out in the folder.
+    pub layout: ContentLayout,
 }
 
 impl AddRequest {
@@ -116,6 +132,7 @@ impl AddRequest {
             category: None,
             tags: Vec::new(),
             start: None,
+            layout: ContentLayout::Original,
         }
     }
 }
@@ -127,6 +144,7 @@ struct Placement {
     category: Option<String>,
     tags: BTreeSet<String>,
     start: Option<bool>,
+    layout: ContentLayout,
 }
 
 /// What [`AddRequest`] adds.
@@ -786,6 +804,7 @@ impl Engine {
                         .map(|name| clean(name))
                         .collect::<Result<_, _>>()?,
                     start: request.start,
+                    layout: request.layout,
                 };
                 match request.source {
                     AddSource::Link(source) => self.add(&source, placement),
@@ -864,6 +883,49 @@ impl Engine {
                 }
                 self.save_labels()
             }
+            Command::RenameTorrent { torrent, name } => {
+                let index = self.index(&torrent)?;
+                let before = self.name(&torrent);
+                self.client
+                    .rename_torrent(index, name)
+                    .map_err(|error| Failure::new(error.to_string()))?;
+                self.session_dirty = true;
+                tracing::info!(target: "torrent", "{before} is now shown as {}", self.name(&torrent));
+                Ok(Reply::Done)
+            }
+            Command::RenamePath { torrent, from, to } => {
+                let index = self.index(&torrent)?;
+                // Writes or checks running meanwhile could recreate or miss
+                // the files being moved; seeding only reads, and a read
+                // that misses during the move is just retried by the peer.
+                match self.activity.get(&torrent).and_then(Activity::job_kind) {
+                    Some(TransferKind::Download) => {
+                        return Err(Failure::new(format!(
+                            "Pause {} before renaming its files",
+                            self.name(&torrent)
+                        )));
+                    }
+                    Some(TransferKind::Verify) => {
+                        return Err(Failure::new(format!(
+                            "{} is being checked; rename its files afterwards",
+                            self.name(&torrent)
+                        )));
+                    }
+                    _ => {}
+                }
+                self.client
+                    .rename_path(index, &from, &to)
+                    .map_err(|error| Failure::new(error.to_string()))?;
+                self.session_dirty = true;
+                tracing::info!(
+                    target: "torrent",
+                    "{}: renamed {} to {}",
+                    self.name(&torrent),
+                    from.display(),
+                    to.display()
+                );
+                Ok(Reply::Done)
+            }
             Command::Peers(torrent) => {
                 self.known(&torrent)?;
                 // A torrent not in the runtime (paused, or a magnet link
@@ -886,10 +948,13 @@ impl Engine {
 
     /// Fails unless the torrent is in the list.
     fn known(&self, hash: &InfoHash) -> Result<(), Failure> {
-        match self.client.torrent_index(hash) {
-            Some(_) => Ok(()),
-            None => Err(Failure::new("there is no such torrent")),
-        }
+        self.index(hash).map(drop)
+    }
+
+    fn index(&self, hash: &InfoHash) -> Result<usize, Failure> {
+        self.client
+            .torrent_index(hash)
+            .ok_or_else(|| Failure::new("there is no such torrent"))
     }
 
     fn save_labels(&mut self) -> Result<Reply, Failure> {
@@ -1044,7 +1109,9 @@ impl Engine {
         };
         Some(TorrentView {
             hash,
-            name: torrent.name().to_owned(),
+            name: torrent.display_name().to_owned(),
+            original_name: torrent.name().to_owned(),
+            renames: torrent.renames().table(),
             save_dir: self
                 .client
                 .save_dir(index)
@@ -1466,6 +1533,12 @@ impl Engine {
                 .set_save_dir(index, dir)
                 .map_err(|error| Failure::new(error.to_string()))?;
         }
+        // A magnet link gets it once its metadata arrives.
+        if placement.layout != ContentLayout::Original {
+            self.client
+                .set_content_layout(index, placement.layout)
+                .map_err(|error| Failure::new(error.to_string()))?;
+        }
         self.session_dirty = true;
         if placement.category.is_some() || !placement.tags.is_empty() {
             if placement.category.is_some() {
@@ -1617,7 +1690,7 @@ impl Engine {
             Level::Info,
             format!(
                 "Removed {} — downloaded files are still in {}",
-                torrent.name(),
+                torrent.display_name(),
                 self.client.config().download_directory().display()
             ),
         );
@@ -1833,7 +1906,7 @@ impl Engine {
     fn name(&self, hash: &InfoHash) -> String {
         self.client
             .torrent_index(hash)
-            .map(|index| self.client.torrents()[index].name().to_owned())
+            .map(|index| self.client.torrents()[index].display_name().to_owned())
             .unwrap_or_default()
     }
 }
@@ -2231,6 +2304,74 @@ mod tests {
         assert!(
             handle
                 .call(Command::AddTorrent(b"not a torrent".to_vec()))
+                .is_err()
+        );
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renames_torrents_and_their_files_and_lays_out_new_ones() {
+        let (handle, root) = engine("renames");
+        let save = root.join("saved");
+        let mut torrent = b"d4:infod5:filesld6:lengthi3e4:pathl5:a.txteed6:lengthi4e4:pathl5:b.txteee4:name5:album12:piece lengthi16384e6:pieces20:".to_vec();
+        torrent.extend([7; 20]);
+        torrent.extend(b"ee");
+        let mut request = AddRequest::new(AddSource::Torrent(torrent));
+        request.save_dir = Some(save.clone());
+        request.start = Some(false);
+        request.layout = ContentLayout::NoSubfolder;
+        let Ok(Reply::Added(hash)) = handle.call(Command::AddWith(request)) else {
+            panic!("not added");
+        };
+        let paths = |handle: &Handle| -> Vec<PathBuf> {
+            let snapshot = handle.snapshot();
+            let torrent = snapshot.torrent(&hash).unwrap();
+            torrent.files().into_iter().map(|file| file.path).collect()
+        };
+        assert_eq!(
+            paths(&handle),
+            [PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+        );
+
+        handle
+            .call(Command::RenameTorrent {
+                torrent: hash,
+                name: Some("My album".to_owned()),
+            })
+            .unwrap();
+        let snapshot = handle.snapshot();
+        let view = snapshot.torrent(&hash).unwrap();
+        assert_eq!(
+            (view.name.as_str(), view.original_name.as_str()),
+            ("My album", "album")
+        );
+
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::write(save.join("a.txt"), b"abc").unwrap();
+        // The check queued on adding may still be running.
+        let rename = || {
+            handle.call(Command::RenamePath {
+                torrent: hash,
+                from: "a.txt".into(),
+                to: "Disc 1/01 a.txt".into(),
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Err(failure) = rename() {
+            assert!(failure.message.contains("checked"), "{failure}");
+            assert!(Instant::now() < deadline, "the check never ended");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read(save.join("Disc 1/01 a.txt")).unwrap(), b"abc");
+        assert_eq!(paths(&handle)[0], PathBuf::from("Disc 1/01 a.txt"));
+        assert!(
+            handle
+                .call(Command::RenamePath {
+                    torrent: hash,
+                    from: "b.txt".into(),
+                    to: "../escape".into(),
+                })
                 .is_err()
         );
         handle.shutdown();

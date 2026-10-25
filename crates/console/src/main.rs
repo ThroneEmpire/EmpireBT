@@ -114,6 +114,11 @@ enum Command {
     Add {
         #[arg(required = true, value_name = "FILE|MAGNET")]
         sources: Vec<String>,
+        /// How the files are laid out: `original` (as the torrent has them),
+        /// `subfolder` (a single file in a folder named after it), or
+        /// `nosubfolder` (without the torrent's top folder).
+        #[arg(long, value_name = "LAYOUT", default_value = "original", value_parser = parse_layout)]
+        layout: empirebt_backend::ContentLayout,
     },
     /// Print the torrent list.
     List,
@@ -345,7 +350,7 @@ fn run(cli: Cli) -> Result<(), String> {
         | Command::Import { .. } => {
             unreachable!("handled above")
         }
-        Command::Add { sources } => {
+        Command::Add { sources, layout } => {
             // Like the dashboard; the dashboard starts these when it opens.
             let start_on_add = config_file.get("console.start_on_add").as_deref() != Some("false");
             let mut failed = false;
@@ -357,6 +362,7 @@ fn run(cli: Cli) -> Result<(), String> {
                         }
                         Ok(link) => {
                             let index = client.add_magnet(link);
+                            let _ = client.set_content_layout(index, layout);
                             if start_on_add {
                                 let _ = client.mark_started(index);
                             }
@@ -383,6 +389,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     Ok(info) => {
                         let name = info.name().to_owned();
                         let index = client.add_torrent(info);
+                        let _ = client.set_content_layout(index, layout);
                         if start_on_add {
                             let _ = client.mark_started(index);
                         }
@@ -414,6 +421,11 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn parse_layout(text: &str) -> Result<empirebt_backend::ContentLayout, String> {
+    empirebt_backend::ContentLayout::parse(text)
+        .ok_or_else(|| "use original, subfolder, or nosubfolder".to_owned())
 }
 
 struct QbittorrentImport<'a> {
@@ -559,6 +571,14 @@ fn print_import_plan(plan: &empirebt_app::qbittorrent::Plan) {
         }
         if !torrent.tags.is_empty() {
             line.push_str(&format!(", tags {}", torrent.tags.join(", ")));
+        }
+        if let Some(shown) = &torrent.shown_name {
+            line.push_str(&format!(", shown as {shown}"));
+        }
+        match torrent.renames.len() {
+            0 => {}
+            1 => line.push_str(", 1 file under another name"),
+            count => line.push_str(&format!(", {count} files under other names")),
         }
         println!("{line}");
         for warning in &torrent.warnings {

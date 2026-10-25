@@ -443,6 +443,63 @@ fn a_signed_in_browser_drives_the_engine() {
     assert_eq!(details["savePath"], films.to_string_lossy().as_ref());
     assert_eq!(details["torrent"]["category"], "Films");
     assert_eq!(details["torrent"]["tags"], serde_json::json!(["hd", "new"]));
+    // A single file can go in a folder of its own, and be shown by
+    // another name.
+    let mut clip = b"d4:infod6:lengthi7e4:name8:clip.mkv12:piece lengthi16384e6:pieces20:".to_vec();
+    clip.extend([8; 20]);
+    clip.extend(b"ee");
+    let refused = send(
+        running.port,
+        "POST",
+        "/api/torrents/upload?layout=sideways",
+        &[("Cookie", &cookie), ("X-EmpireBT", "1")],
+        &clip,
+    );
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    let clip = send(
+        running.port,
+        "POST",
+        "/api/torrents/upload?layout=subfolder",
+        &[("Cookie", &cookie), ("X-EmpireBT", "1")],
+        &clip,
+    );
+    assert_eq!(clip.status, 200, "{}", clip.body);
+    let clip = clip.json()["added"].as_str().unwrap().to_owned();
+    let renamed = browser(
+        &running,
+        &cookie,
+        "PUT",
+        &format!("/api/torrents/{clip}/name"),
+        r#"{"name":"Holiday clip"}"#,
+    );
+    assert_eq!(renamed.status, 204, "{}", renamed.body);
+    let escape = browser(
+        &running,
+        &cookie,
+        "POST",
+        &format!("/api/torrents/{clip}/rename"),
+        r#"{"from":"clip/clip.mkv","to":"../clip.mkv"}"#,
+    );
+    assert!(escape.status >= 400, "{}", escape.body);
+    let details = browser(
+        &running,
+        &cookie,
+        "GET",
+        &format!("/api/torrents/{clip}"),
+        "",
+    )
+    .json();
+    assert_eq!(details["torrent"]["name"], "Holiday clip");
+    assert_eq!(details["originalName"], "clip.mkv");
+    assert_eq!(details["files"][0]["path"], "clip/clip.mkv");
+    assert_eq!(details["files"][0]["original"], "clip.mkv");
+    browser(
+        &running,
+        &cookie,
+        "DELETE",
+        &format!("/api/torrents/{clip}"),
+        "",
+    );
     browser(
         &running,
         &cookie,

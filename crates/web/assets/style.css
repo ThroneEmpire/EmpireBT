@@ -458,7 +458,21 @@ button.chip { padding: 6px 12px; font-size: 13px; }
 .files { width: 100%; border-collapse: collapse; }
 .files td { padding: 7px 8px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .files tr:last-child td { border-bottom: none; }
-.files td.num { white-space: nowrap; color: var(--muted); }
+.files td.num { white-space: nowrap; color: var(--muted); width: 1%; }
+.files td.path { padding-left: calc(8px + var(--depth, 0) * 18px); }
+.files tr.folder td.path { font-weight: 600; }
+.files tr.folder td.path .icon { width: 15px; height: 15px; margin-right: 6px; vertical-align: -2px; color: var(--muted); }
+.files .renamed { margin-left: 8px; font-size: 11px; color: var(--faint); }
+.files td.act { width: 1%; padding: 0 2px; }
+/* The pencil: a tap target big enough for a finger. */
+button.rename { display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0; border-radius: 50%; background: none; color: var(--muted); }
+button.rename .icon { width: 17px; height: 17px; }
+button.rename:active { transform: scale(0.9); background: var(--surface-2); }
+@media (hover: hover) { button.rename:hover { background: var(--surface-2); color: var(--text); } }
+.name-row { display: flex; align-items: center; gap: 8px; padding: 0 0 12px; margin-bottom: 4px; border-bottom: 1px solid var(--line); }
+.name-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.name-text .label { font-size: 12px; color: var(--muted); }
+.name-text .faint { font-size: 12px; color: var(--faint); }
 .trackers { margin: 0; padding: 0; list-style: none; }
 .trackers li { padding: 7px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .trackers li:last-child { border-bottom: none; }
@@ -811,6 +825,9 @@ input[type="file"]::file-selector-button {
   .field .label { width: auto; font-size: 12px; }
   .files, .trackers { background: var(--surface); border-radius: var(--radius-big); }
   .files td { padding: 10px 14px; }
+  .files td.path { padding-left: calc(14px + var(--depth, 0) * 16px); }
+  .files td.act { padding: 0 6px 0 0; }
+  .name-row { background: var(--surface); border-radius: var(--radius-big); padding: 10px 8px 10px 16px; margin-bottom: 14px; border-bottom: none; }
   .trackers li { padding: 10px 14px; }
 
   /* Peers as two-line entries: where, then what it is doing. */

@@ -118,7 +118,7 @@ def prepare_data():
             "/work/config", "/work/downloads", stdout=subprocess.DEVNULL)
         shutil.rmtree(WORK, ignore_errors=True)
     sources, torrents, downloads = WORK / "sources", WORK / "torrents", WORK / "downloads"
-    for folder in (sources, torrents, downloads / "linux", downloads / "complete",
+    for folder in (sources, torrents, downloads / "linux", downloads / "complete", downloads / "flat",
                    downloads / "incomplete", WORK / "config"):
         folder.mkdir(parents=True, exist_ok=True)
 
@@ -127,7 +127,8 @@ def prepare_data():
     make_torrent(sources / "mini.iso", torrents / "mini.torrent")
     shutil.copy(sources / "mini.iso", downloads / "linux/mini.iso")
 
-    # 2. Complete multi-file album; one file is renamed in qBittorrent.
+    # 2. Complete multi-file album; one file, and the torrent's name, are
+    #    renamed in qBittorrent.
     album = sources / "album"
     album.mkdir()
     for number, size in enumerate((20000, 30000, 25000), start=1):
@@ -154,6 +155,15 @@ def prepare_data():
     (sources / "hybrid.dat").write_bytes(pattern(50000, 13))
     make_torrent(sources / "hybrid.dat", torrents / "hybrid.torrent", "hybrid")
     shutil.copy(sources / "hybrid.dat", downloads / "complete/hybrid.dat")
+
+    # 6. Two files laid out without the torrent's folder, complete.
+    flat = sources / "flat"
+    flat.mkdir()
+    (flat / "one.txt").write_bytes(pattern(20000, 17))
+    (flat / "two.txt").write_bytes(pattern(30000, 19))
+    make_torrent(flat, torrents / "flat.torrent")
+    for name in ("one.txt", "two.txt"):
+        shutil.copy(flat / name, downloads / "flat" / name)
     return torrents, downloads
 
 
@@ -212,6 +222,7 @@ def add_torrents(api, torrents):
     add("partial", savepath="/downloads/complete", stopped=True, autoTMM=False)
     add("pair", savepath="/downloads/complete", autoTMM=False, stopped=True)
     add("hybrid", category="Films", savepath="/downloads/complete", autoTMM=False)
+    add("flat", savepath="/downloads/flat", contentLayout="NoSubfolder", autoTMM=False)
     api.post("/api/v2/torrents/add", {
         "urls": "magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a&dn=never-resolved"
                 "&tr=udp%3A%2F%2Ftracker.example%3A6969%2Fannounce",
@@ -221,11 +232,12 @@ def add_torrents(api, torrents):
     for _ in range(30):
         time.sleep(1)
         hashes = {torrent["name"]: torrent["hash"] for torrent in json.loads(api.get("/api/v2/torrents/info"))}
-        if len(hashes) == 6:
+        if len(hashes) == 7:
             break
     api.post("/api/v2/torrents/renameFile", {
         "hash": hashes["album"], "oldPath": "album/02.flac", "newPath": "album/02 - renamed.flac",
     })
+    api.post("/api/v2/torrents/rename", {"hash": hashes["album"], "name": "Album (renamed)"})
     api.post("/api/v2/torrents/filePrio", {"hash": hashes["pair"], "id": "0", "priority": "0"})
     # qBittorrent keeps trackers in its resume data, not its .torrent copy.
     api.post("/api/v2/torrents/addTrackers", {
@@ -239,6 +251,7 @@ def add_torrents(api, torrents):
         time.sleep(1)
         info = {torrent["name"]: torrent for torrent in json.loads(api.get("/api/v2/torrents/info"))}
         if (info["mini.iso"]["progress"] == 1 and info["hybrid.dat"]["progress"] == 1
+                and info["Album (renamed)"]["progress"] == 1 and info["flat"]["progress"] == 1
                 and info["partial.bin"]["progress"] == 0.5 and not info["pair"]["state"].startswith("checking")):
             return
     log("qBittorrent did not settle; the test may fail")

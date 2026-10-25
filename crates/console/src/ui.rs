@@ -1,7 +1,7 @@
 //! Renders the dashboard: header, torrent table, detail pane, footer, and
 //! modal dialogs.
 
-use crate::app::{App, DetailTab, Filter, LabelKind, Mode, Sort};
+use crate::app::{AddField, App, DetailTab, Filter, LAYOUTS, LabelKind, Mode, Sort};
 use crate::format;
 use crate::input::PathInput;
 use empirebt_app::{DhtState, Level, SeedStatus, Status, TorrentView as RowView};
@@ -48,6 +48,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Label { .. } => draw_label(frame, app),
         Mode::Filter { .. } => draw_filter(frame, app),
         Mode::Sort { .. } => draw_sort(frame, app),
+        Mode::PickFile { .. } => draw_pick_file(frame, app),
+        Mode::Rename { .. } => draw_rename(frame, app),
     }
 }
 
@@ -565,7 +567,7 @@ fn draw_overview(frame: &mut Frame, row: &RowView, area: Rect) {
 }
 
 fn draw_files(frame: &mut Frame, row: &RowView, area: Rect) {
-    let Some(info) = &row.info else {
+    if row.info.is_none() {
         frame.render_widget(
             Line::from(Span::styled(
                 "The file list appears once the metadata arrives from peers.",
@@ -574,13 +576,8 @@ fn draw_files(frame: &mut Frame, row: &RowView, area: Rect) {
             area,
         );
         return;
-    };
-    // Hybrid torrents' padding files are an implementation detail.
-    let files: Vec<_> = info
-        .files()
-        .iter()
-        .filter(|file| !file.is_padding())
-        .collect();
+    }
+    let files = crate::app::file_entries(row);
     let visible = area.height as usize;
     let shown = if files.len() > visible {
         visible.saturating_sub(1)
@@ -592,8 +589,8 @@ fn draw_files(frame: &mut Frame, row: &RowView, area: Rect) {
         .take(shown)
         .map(|file| {
             Row::new([
-                Cell::from(file.path().display().to_string()),
-                Cell::from(Line::from(format::bytes(file.length())).right_aligned()),
+                Cell::from(file_line(file, false)),
+                Cell::from(Line::from(format::bytes(file.size)).right_aligned()),
             ])
         })
         .collect();
@@ -606,6 +603,153 @@ fn draw_files(frame: &mut Frame, row: &RowView, area: Rect) {
     frame.render_widget(
         Table::new(rows, [Constraint::Fill(1), Constraint::Length(10)]).column_spacing(2),
         area,
+    );
+}
+
+/// A file or folder, indented under the folder it is in.
+fn file_line(file: &crate::app::FileEntry, chosen: bool) -> Line<'static> {
+    let indent = "  ".repeat(file.depth);
+    let mut spans = vec![Span::raw(indent)];
+    if file.folder {
+        spans.push(Span::styled(
+            format!("{}/", file.name),
+            Style::new().fg(Color::Yellow).bold(),
+        ));
+    } else {
+        spans.push(Span::raw(file.name.clone()));
+    }
+    if file.renamed {
+        spans.push(Span::styled("  renamed", Style::new().fg(MUTED)));
+    }
+    let line = Line::from(spans);
+    if chosen {
+        line.style(Style::new().bg(Color::Indexed(236)).bold())
+    } else {
+        line
+    }
+}
+
+fn draw_pick_file(frame: &mut Frame, app: &App) {
+    let Mode::PickFile { selected, .. } = &app.mode else {
+        return;
+    };
+    let entries = app.picked_files();
+    let shown = entries.len().clamp(1, 16);
+    let first = (*selected + 1).saturating_sub(shown);
+    let height = shown as u16 + 5;
+    let inner = dialog(frame, "Rename which file or folder?", 76, height);
+    let [list, hint] =
+        Layout::vertical([Constraint::Length(shown as u16), Constraint::Length(2)]).areas(inner);
+    let lines: Vec<Line> = entries
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .map(|(index, entry)| {
+            let chosen = index == *selected;
+            let mut line = file_line(entry, chosen);
+            line.spans.insert(
+                0,
+                Span::styled(if chosen { "▌ " } else { "  " }, Style::new().fg(ACCENT)),
+            );
+            line
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), list);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw(""),
+            key_hints(&[("↑↓", "select"), ("Enter", "rename"), ("Esc", "close")]),
+        ]),
+        hint,
+    );
+}
+
+fn draw_rename(frame: &mut Frame, app: &App) {
+    let Mode::Rename {
+        torrent,
+        path,
+        input,
+        error,
+    } = &app.mode
+    else {
+        return;
+    };
+    let row = app.rows().find(|row| row.hash == *torrent);
+    let (title, subject, about) = match (path, row) {
+        (None, row) => (
+            "Rename torrent",
+            row.map_or(String::new(), |row| row.original_name.clone()),
+            "Only the name shown changes; leave it empty for the torrent's own name.".to_owned(),
+        ),
+        (Some(path), _) => {
+            let folder = row.is_some_and(|row| {
+                row.files()
+                    .iter()
+                    .any(|file| file.path != *path && file.path.starts_with(path))
+            });
+            (
+                if folder {
+                    "Rename folder"
+                } else {
+                    "Rename file"
+                },
+                path.display().to_string(),
+                "Renamed on disk, and it keeps seeding. A / moves it into a folder.".to_owned(),
+            )
+        }
+    };
+    let height = 10 + u16::from(error.is_some());
+    let inner = dialog(frame, title, 76, height);
+    let [label, field, error_area, hint] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(u16::from(error.is_some())),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(subject, Style::new().bold())),
+            Line::from(Span::styled(about, Style::new().fg(Color::Gray))),
+        ]),
+        label,
+    );
+    let field_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(MUTED));
+    let field_inner = field_block.inner(field);
+    frame.render_widget(field_block, field);
+    let prompt = "› ";
+    let room = (field_inner.width as usize).saturating_sub(prompt.len() + 1);
+    let offset = input.cursor().saturating_sub(room);
+    let visible: String = input.text().chars().skip(offset).take(room + 1).collect();
+    frame.render_widget(
+        Line::from(vec![
+            Span::styled(prompt, Style::new().fg(ACCENT).bold()),
+            Span::raw(visible),
+        ]),
+        field_inner,
+    );
+    frame.set_cursor_position(Position::new(
+        field_inner.x + (prompt.chars().count() + input.cursor() - offset) as u16,
+        field_inner.y,
+    ));
+    if let Some(error) = error {
+        frame.render_widget(
+            Line::from(Span::styled(
+                format!("✕ {error}"),
+                Style::new().fg(Color::LightRed),
+            )),
+            error_area,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw(""),
+            key_hints(&[("Enter", "rename"), ("Esc", "cancel")]),
+        ]),
+        hint,
     );
 }
 
@@ -898,16 +1042,20 @@ fn draw_add(frame: &mut Frame, app: &App) {
     let Mode::Add {
         input,
         save,
-        on_save,
+        layout,
+        field,
         error,
     } = &app.mode
     else {
         return;
     };
-    let focused = if *on_save { save } else { input };
-    let candidates = focused.candidates();
+    let candidates = match field {
+        AddField::Source => input.candidates(),
+        AddField::Save => save.candidates(),
+        AddField::Layout => &[],
+    };
     let candidate_lines = candidates.len().min(5) as u16;
-    let height = 13 + candidate_lines + u16::from(error.is_some());
+    let height = 16 + candidate_lines + u16::from(error.is_some());
     let inner = dialog(frame, "Add torrent", 76, height);
 
     let [
@@ -915,6 +1063,8 @@ fn draw_add(frame: &mut Frame, app: &App) {
         source_field,
         save_label,
         save_field,
+        layout_label,
+        layout_field,
         list,
         error_area,
         hint,
@@ -923,6 +1073,8 @@ fn draw_add(frame: &mut Frame, app: &App) {
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Length(candidate_lines),
         Constraint::Length(u16::from(error.is_some())),
         Constraint::Length(2),
@@ -934,9 +1086,34 @@ fn draw_add(frame: &mut Frame, app: &App) {
         label("Path or URL of a .torrent file, or a magnet link"),
         source_label,
     );
-    draw_input(frame, input, source_field, !*on_save);
+    draw_input(frame, input, source_field, *field == AddField::Source);
     frame.render_widget(label("Save in"), save_label);
-    draw_input(frame, save, save_field, *on_save);
+    draw_input(frame, save, save_field, *field == AddField::Save);
+    frame.render_widget(label("Content layout"), layout_label);
+    let on_layout = *field == AddField::Layout;
+    let chosen = LAYOUTS
+        .iter()
+        .find(|(choice, _)| choice == layout)
+        .map_or("", |(_, text)| *text);
+    let arrows = Style::new()
+        .fg(if on_layout { ACCENT } else { MUTED })
+        .bold();
+    let mut choice = vec![
+        Span::styled("  ‹ ", arrows),
+        Span::styled(
+            chosen,
+            if on_layout {
+                Style::new().bold()
+            } else {
+                Style::new()
+            },
+        ),
+        Span::styled(" ›", arrows),
+    ];
+    if on_layout {
+        choice.push(Span::styled("  ←→ change", Style::new().fg(MUTED)));
+    }
+    frame.render_widget(Line::from(choice), layout_field);
 
     let mut shown: Vec<Line> = candidates
         .iter()
@@ -1457,6 +1634,8 @@ fn draw_help(frame: &mut Frame, app: &App) {
             &[
                 ("t", "edit tags (comma-separated)"),
                 ("C", "set category"),
+                ("R", "rename the torrent (the name shown)"),
+                ("r", "rename a file or folder on disk"),
                 ("f", "filter by category or tag"),
                 ("S", "sort: by upload speed, size, progress…"),
                 ("esc", "show all torrents again"),

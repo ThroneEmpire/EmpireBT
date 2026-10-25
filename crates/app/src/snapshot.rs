@@ -2,7 +2,9 @@
 
 use crate::InfoHash;
 use empirebt_backend::{AnnounceStatus, Setting, TorrentInfo};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// The whole application at one moment. Cheap to share: interfaces hold it
@@ -152,7 +154,13 @@ impl Status {
 #[derive(Debug, Clone)]
 pub struct TorrentView {
     pub hash: InfoHash,
+    /// The name shown: the one chosen for it, or else its own.
     pub name: String,
+    /// The torrent's own name.
+    pub original_name: String,
+    /// Files with names on disk other than the torrent's: its path to the
+    /// one used instead.
+    pub renames: Arc<BTreeMap<PathBuf, PathBuf>>,
     /// The folder its files are in.
     pub save_dir: PathBuf,
     /// Metadata, which a magnet link only has once peers provided it.
@@ -175,7 +183,38 @@ pub struct TorrentView {
     pub tags: Vec<String>,
 }
 
+/// A file of a torrent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileView {
+    /// Its path in the torrent.
+    pub original: PathBuf,
+    /// Its path on disk, relative to the torrent's folder.
+    pub path: PathBuf,
+    pub length: u64,
+}
+
 impl TorrentView {
+    /// Its files, padding left out, with their paths on disk; empty until
+    /// a magnet link's metadata arrives.
+    pub fn files(&self) -> Vec<FileView> {
+        let Some(info) = &self.info else {
+            return Vec::new();
+        };
+        info.files()
+            .iter()
+            .filter(|file| !file.is_padding())
+            .map(|file| FileView {
+                original: file.path().to_owned(),
+                path: self
+                    .renames
+                    .get(file.path())
+                    .cloned()
+                    .unwrap_or_else(|| file.path().to_owned()),
+                length: file.length(),
+            })
+            .collect()
+    }
+
     pub fn size(&self) -> Option<u64> {
         self.info.as_ref().map(TorrentInfo::total_length)
     }

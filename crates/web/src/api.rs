@@ -26,7 +26,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use empirebt_app::{
-    AddRequest, AddSource, Command, Handle, InfoHash, Level, SeedStatus, Snapshot, TorrentView,
+    AddRequest, AddSource, Command, ContentLayout, Handle, InfoHash, Level, SeedStatus, Snapshot,
+    TorrentView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -112,6 +113,8 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/torrents/{hash}", get(details).delete(remove))
         .route("/api/torrents/{hash}/category", put(set_category))
         .route("/api/torrents/{hash}/tags", put(set_tags))
+        .route("/api/torrents/{hash}/name", put(rename_torrent))
+        .route("/api/torrents/{hash}/rename", post(rename_path))
         .route("/api/torrents/{hash}/peers", get(peers))
         .route("/api/torrents/{hash}/{action}", post(action))
         .route("/api/categories", post(create_category))
@@ -664,20 +667,20 @@ async fn details(State(state): State<Shared>, Path(hash): Path<String>) -> Respo
         return error(StatusCode::NOT_FOUND, "there is no such torrent");
     };
     let info = torrent.info.as_ref();
-    let files: Vec<_> = info
-        .map(|info| {
-            info.files()
-                .iter()
-                .filter(|file| !file.is_padding())
-                .map(|file| {
-                    json!({
-                        "path": file.path().to_string_lossy(),
-                        "size": file.length(),
-                    })
-                })
-                .collect()
+    let files: Vec<_> = torrent
+        .files()
+        .iter()
+        .map(|file| {
+            let mut entry = json!({
+                "path": slashed(&file.path),
+                "size": file.length,
+            });
+            if file.path != file.original {
+                entry["original"] = slashed(&file.original).into();
+            }
+            entry
         })
-        .unwrap_or_default();
+        .collect();
     let announce = torrent.announce.as_ref().map(|status| {
         json!({
             "trackersOk": status.trackers_ok,
@@ -689,6 +692,7 @@ async fn details(State(state): State<Shared>, Path(hash): Path<String>) -> Respo
     });
     axum::Json(json!({
         "torrent": torrent_json(torrent),
+        "originalName": torrent.original_name,
         "files": files,
         "trackers": torrent.trackers,
         "pieces": info.map(|info| info.piece_count().max(info.v2_piece_count())),
@@ -783,6 +787,14 @@ async fn peers(State(state): State<Shared>, Path(hash): Path<String>) -> Respons
     }
 }
 
+/// A path inside a torrent with `/` between its parts on every system.
+fn slashed(path: &std::path::Path) -> String {
+    path.iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[derive(Deserialize)]
 struct Add {
     source: String,
@@ -791,6 +803,21 @@ struct Add {
     category: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    layout: Option<String>,
+}
+
+/// `original` (or nothing), `subfolder`, or `nosubfolder`.
+#[allow(clippy::result_large_err)]
+fn layout(text: Option<&str>) -> Result<ContentLayout, Response> {
+    match text.map(str::trim).filter(|text| !text.is_empty()) {
+        None => Ok(ContentLayout::Original),
+        Some(text) => ContentLayout::parse(text).ok_or_else(|| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "layout is original, subfolder, or nosubfolder",
+            )
+        }),
+    }
 }
 
 /// The same options for an upload, in the query string; `tags` is
@@ -801,6 +828,7 @@ struct UploadOptions {
     save_path: Option<String>,
     category: Option<String>,
     tags: Option<String>,
+    layout: Option<String>,
 }
 
 /// The folder a browser asked to save a torrent in, if it may: the
@@ -843,9 +871,11 @@ async fn add_to(
     save_dir: Option<std::path::PathBuf>,
     category: Option<String>,
     tags: Vec<String>,
+    layout: ContentLayout,
 ) -> Response {
     let request = AddRequest {
         save_dir,
+        layout,
         category: category.filter(|name| !name.trim().is_empty()),
         tags: tags
             .into_iter()
@@ -872,12 +902,17 @@ async fn add(State(state): State<Shared>, axum::Json(add): axum::Json<Add>) -> R
         Ok(save_dir) => save_dir,
         Err(response) => return response,
     };
+    let layout = match layout(add.layout.as_deref()) {
+        Ok(layout) => layout,
+        Err(response) => return response,
+    };
     add_to(
         &state,
         AddSource::Link(source.to_owned()),
         save_dir,
         add.category,
         add.tags,
+        layout,
     )
     .await
 }
@@ -889,6 +924,10 @@ async fn upload(
 ) -> Response {
     let save_dir = match allowed_save_dir(&state.engine.snapshot(), options.save_path.as_deref()) {
         Ok(save_dir) => save_dir,
+        Err(response) => return response,
+    };
+    let layout = match layout(options.layout.as_deref()) {
+        Ok(layout) => layout,
         Err(response) => return response,
     };
     let tags = options
@@ -903,6 +942,7 @@ async fn upload(
         save_dir,
         options.category,
         tags,
+        layout,
     )
     .await
 }
@@ -977,6 +1017,52 @@ async fn set_tags(
 #[derive(Deserialize)]
 struct NameBody {
     name: String,
+}
+
+#[derive(Deserialize)]
+struct TorrentNameBody {
+    name: Option<String>,
+}
+
+/// Chooses the name shown for a torrent; empty or `null` shows its own.
+async fn rename_torrent(
+    State(state): State<Shared>,
+    Path(hash): Path<String>,
+    axum::Json(body): axum::Json<TorrentNameBody>,
+) -> Response {
+    match known_hash(&state, &hash) {
+        Ok(torrent) => {
+            let name = body.name.filter(|name| !name.trim().is_empty());
+            run(&state, Command::RenameTorrent { torrent, name }).await
+        }
+        Err(response) => response,
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    from: String,
+    to: String,
+}
+
+/// Renames a file or folder of a torrent, both paths relative to its
+/// folder; the engine keeps them inside it.
+async fn rename_path(
+    State(state): State<Shared>,
+    Path(hash): Path<String>,
+    axum::Json(body): axum::Json<RenameBody>,
+) -> Response {
+    match known_hash(&state, &hash) {
+        Ok(torrent) => {
+            let command = Command::RenamePath {
+                torrent,
+                from: body.from.into(),
+                to: body.to.trim().into(),
+            };
+            run(&state, command).await
+        }
+        Err(response) => response,
+    }
 }
 
 async fn create_category(
@@ -1085,6 +1171,8 @@ mod tests {
                 .map(|index| TorrentView {
                     hash: unique(index),
                     name: format!("torrent {index}"),
+                    original_name: format!("torrent {index}"),
+                    renames: Default::default(),
                     save_dir: "/data".into(),
                     info: None,
                     trackers: Vec::new(),

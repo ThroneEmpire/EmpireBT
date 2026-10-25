@@ -28,6 +28,9 @@ libtorrent, the engine behind qBittorrent and Deluge, in both directions.
   can run in the same process, showing the same torrents. Torrents can be
   organized with categories and tags, and each peer is shown with its
   country.
+- **Your names, on disk:** rename a torrent, or its files and folders,
+  even while it seeds. When adding a torrent, choose to put it in a folder
+  of its own or leave out its top folder.
 
 ## Getting started
 
@@ -48,7 +51,7 @@ cargo run --release -p empirebt-console -- [COMMAND]
 | `empirebt` | Opens the terminal dashboard |
 | `empirebt ui --web` | Opens the dashboard and serves the web UI too |
 | `empirebt serve` | Serves the web UI without the dashboard, until Ctrl-C |
-| `empirebt add <files, URLs, or magnets…>` | Adds torrents without opening anything (`-d <folder>` saves them there) |
+| `empirebt add <files, URLs, or magnets…>` | Adds torrents without opening anything (`-d <folder>` saves them there; `--layout nosubfolder` leaves out the top folder, `--layout subfolder` puts a single file in a folder) |
 | `empirebt list` / `empirebt remove <number>` | Lists or removes torrents (files stay on disk) |
 | `empirebt config` / `empirebt config set <key> <value>` | Shows or changes settings |
 | `empirebt web password` / `token <name>` / `revoke-tokens` | Manages access to the web UI (works while EmpireBT runs) |
@@ -84,10 +87,12 @@ and imports once you confirm.
 - **Progress, without a recheck.** qBittorrent's verified pieces are
   trusted; use `--recheck` to check everything instead.
 - **Categories (with their folders) and tags.**
+- **Names:** files renamed or moved in qBittorrent, torrents laid out
+  without their top folder (or in a folder of their own), and names given
+  to torrents.
 - **Magnet links whose metadata never arrived.**
 
 **What doesn't, yet:**
-- **Torrents with renamed files are skipped,** with the reason shown.
 - **Torrents with skipped files come over paused,** because EmpireBT would
   download every file.
 - **Share limits are noted but not kept.**
@@ -104,11 +109,13 @@ files, peers (address, country, client, connection, speeds) and trackers.
 
 | Key | Action |
 | --- | --- |
-| `a` | Add a `.torrent` file, URL, or magnet link, and choose its folder (↑↓ switch fields, Tab completes paths; pasting works) |
+| `a` | Add a `.torrent` file, URL, or magnet link, and choose its folder and content layout (↑↓ switch fields, Tab completes paths, ←→ change the layout; pasting works) |
 | `s` / `p` | Start / pause |
 | `v` | Recheck the downloaded data |
 | `x` | Remove |
 | `C` / `t` | Set the category / edit the tags (Tab completes known names) |
+| `R` | Rename the torrent (only the name shown; empty shows its own again) |
+| `r` | Rename a file or folder on disk: pick it, then type its new name (`/` moves it into a folder) |
 | `f` / `Esc` | Show one category or tag / show everything again |
 | `S` | Sort the list: by upload or download speed, size, progress, peers, time left, name |
 | `c` | Settings |
@@ -122,7 +129,9 @@ one-time login link, and on the very first start a password.
 
 The web UI shows the same torrents and actions as the dashboard. It sorts
 and filters thousands of torrents smoothly, shows a peer list with country
-flags, and lets you choose its theme and accent colour. On a phone it
+flags, and lets you choose its theme and accent colour. Its Files tab
+shows a torrent's folders and files; the ✎ next to each renames it, and
+the one by the name renames the torrent. On a phone it
 switches to a touch layout.
 
 Signing in is always required. Any address other than loopback is served

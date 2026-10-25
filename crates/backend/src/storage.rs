@@ -1,8 +1,8 @@
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::{TorrentInfo, V2File};
@@ -18,7 +18,57 @@ const DEFAULT_OPEN_FILES: usize = 512;
 pub struct Storage {
     root: PathBuf,
     files: Arc<FilePool>,
+    /// A torrent's files whose names on disk differ from the torrent's.
+    renames: Option<Renames>,
 }
+
+/// The names a torrent's files have on disk where they differ from the
+/// torrent's own (renamed files, or another content layout): the
+/// torrent's relative path to the one used instead. One table is shared
+/// by the torrent's transfers, seeders, and the client, so a rename
+/// applies to all of them at once.
+#[derive(Debug, Clone, Default)]
+pub struct Renames(Arc<RwLock<Arc<BTreeMap<PathBuf, PathBuf>>>>);
+
+impl Renames {
+    pub fn new(table: BTreeMap<PathBuf, PathBuf>) -> Self {
+        Self(Arc::new(RwLock::new(Arc::new(table))))
+    }
+
+    /// The table as it is now.
+    pub fn table(&self) -> Arc<BTreeMap<PathBuf, PathBuf>> {
+        self.0
+            .read()
+            .map(|table| Arc::clone(&table))
+            .unwrap_or_default()
+    }
+
+    pub fn replace(&self, table: BTreeMap<PathBuf, PathBuf>) {
+        if let Ok(mut current) = self.0.write() {
+            *current = Arc::new(table);
+        }
+    }
+
+    /// Where a file of the torrent is, relative to its folder.
+    pub fn resolve(&self, original: &Path) -> PathBuf {
+        self.table()
+            .get(original)
+            .cloned()
+            .unwrap_or_else(|| original.to_owned())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table().is_empty()
+    }
+}
+
+impl PartialEq for Renames {
+    fn eq(&self, other: &Self) -> bool {
+        self.table() == other.table()
+    }
+}
+
+impl Eq for Renames {}
 
 impl PartialEq for Storage {
     fn eq(&self, other: &Self) -> bool {
@@ -217,6 +267,7 @@ impl Storage {
         Ok(Self {
             root,
             files: Arc::new(FilePool::new(DEFAULT_OPEN_FILES)),
+            renames: None,
         })
     }
 
@@ -226,7 +277,21 @@ impl Storage {
         Self {
             root: root.into(),
             files: Arc::clone(&self.files),
+            renames: None,
         }
+    }
+
+    /// The same storage, finding a torrent's files under the names
+    /// `renames` gives them.
+    pub fn with_renames(mut self, renames: Renames) -> Self {
+        self.renames = Some(renames);
+        self
+    }
+
+    /// Closes a cached handle to the file at `path`, for files moved or
+    /// renamed on disk.
+    pub(crate) fn forget(&self, path: &Path) {
+        self.files.forget(path);
     }
 
     /// Changes how many files may stay open at once.
@@ -281,7 +346,10 @@ impl Storage {
         {
             return None;
         }
-        Some(self.root.join(relative_path))
+        match &self.renames {
+            Some(renames) => Some(self.root.join(renames.resolve(relative_path))),
+            None => Some(self.root.join(relative_path)),
+        }
     }
 
     /// Reads a verified-safe relative path from storage.

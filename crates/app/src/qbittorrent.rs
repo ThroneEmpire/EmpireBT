@@ -184,6 +184,11 @@ pub struct Planned {
     pub state: TransferState,
     /// Verified pieces, when trusted.
     pub pieces: Option<Vec<bool>>,
+    /// The name qBittorrent shows, when it was changed from the torrent's.
+    pub shown_name: Option<String>,
+    /// Files qBittorrent keeps under other names (renamed, or laid out
+    /// without the torrent's folder): the torrent's path to the one used.
+    pub renames: BTreeMap<PathBuf, PathBuf>,
     source: Option<Source>,
 }
 
@@ -326,6 +331,8 @@ fn plan_torrent(
             TransferState::Downloading
         },
         pieces: None,
+        shown_name: None,
+        renames: BTreeMap::new(),
         source: None,
     };
     if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -364,30 +371,51 @@ fn plan_torrent(
     planned.hash = Some(*info.info_hash());
     planned.name = info.name().to_owned();
     planned.source = Some(Source::Metainfo(metainfo));
+    let shown = text("name").trim();
+    if !shown.is_empty() && shown != info.name() {
+        planned.shown_name = Some(shown.to_owned());
+    }
 
-    // Files as qBittorrent has them now: renamed or skipped ones show.
+    // Files as qBittorrent has them now, named relative to the folder they
+    // are in: renamed ones, and the layout chosen, show.
     let files = qbittorrent.json(&format!("/api/v2/torrents/files?hash={id}"))?;
     let files = files.as_array().map(Vec::as_slice).unwrap_or_default();
-    let expected = expected_paths(&info);
-    let renamed: Vec<&str> = files
+    let names: Vec<&str> = files
         .iter()
-        .filter_map(|file| {
-            let index = file.get("index")?.as_u64()? as usize;
-            let name = file.get("name")?.as_str()?;
-            (expected.get(index).is_some_and(|path| path != name)).then_some(name)
-        })
+        .filter_map(|file| file.get("name")?.as_str())
         .collect();
-    if !renamed.is_empty() {
-        planned.skip = Some(format!(
-            "files were renamed or moved inside the torrent in qBittorrent ({}), and EmpireBT \
-             cannot follow that yet",
-            renamed.join(", ")
-        ));
-        return Ok(planned);
+    let expected = expected_paths(&info);
+    let originals: Vec<&Path> = info
+        .files()
+        .iter()
+        .filter(|file| !file.is_padding())
+        .map(|file| file.path())
+        .collect();
+    for file in files {
+        let (Some(index), Some(name)) = (
+            file.get("index").and_then(Value::as_u64),
+            file.get("name").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let index = index as usize;
+        let (Some(expected), Some(original)) = (expected.get(index), originals.get(index)) else {
+            continue;
+        };
+        if expected != name {
+            let path: PathBuf = name.split('/').collect();
+            if !plain_relative(&path) {
+                planned.skip = Some(format!(
+                    "qBittorrent names a file {name}, outside its folder"
+                ));
+                return Ok(planned);
+            }
+            planned.renames.insert(original.to_path_buf(), path);
+        }
     }
 
     // Where the files are now: in the incomplete folder until done.
-    let folder = content_folder(text("content_path"), &info).or_else(|| {
+    let folder = storage_folder(text("content_path"), &names).or_else(|| {
         let save = text("save_path");
         (!save.is_empty()).then(|| save.to_owned())
     });
@@ -446,10 +474,10 @@ fn plan_torrent(
         .iter()
         .map(|state| state.as_i64() == Some(2))
         .collect();
-    // The content (a file, or the torrent's folder) shows whether paths
-    // are right here; skipped files may never have been made.
-    let content = folder.join(info.name());
-    if pieces.iter().any(|piece| *piece) && !content.exists() {
+    // Files on disk show whether paths are right here; skipped files may
+    // never have been made, so one is enough.
+    let found = names.iter().any(|name| folder.join(name).exists());
+    if pieces.iter().any(|piece| *piece) && !found {
         planned.state = TransferState::Paused;
         planned.warnings.push(format!(
             "its files are not where qBittorrent has them ({}); it comes over paused, to be \
@@ -509,12 +537,38 @@ fn expected_paths(info: &TorrentInfo) -> Vec<String> {
         .collect()
 }
 
-/// The folder holding a torrent's content: `content_path` is the file
-/// itself for a single file, or the torrent's own folder otherwise.
-fn content_folder(content: &str, info: &TorrentInfo) -> Option<String> {
+/// The folder qBittorrent's file `names` are relative to, from
+/// `content_path`: the one file itself, the folder all files are in, or,
+/// for files without one folder in common, that folder itself.
+fn storage_folder(content: &str, names: &[&str]) -> Option<String> {
     let content = content.trim_end_matches('/');
-    let (folder, last) = content.rsplit_once('/')?;
-    (last == info.name() && !folder.is_empty()).then(|| folder.to_owned())
+    let top = match names {
+        [single] if !single.contains('/') => Some(*single),
+        _ => {
+            let tops: Option<Vec<&str>> = names
+                .iter()
+                .map(|name| name.split_once('/').map(|(top, _)| top))
+                .collect();
+            tops.filter(|tops| {
+                tops.first()
+                    .is_some_and(|first| tops.iter().all(|top| top == first))
+            })
+            .map(|tops| tops[0])
+        }
+    };
+    let folder = match top {
+        Some(top) => content.strip_suffix(top)?.strip_suffix('/')?,
+        None => content,
+    };
+    (!folder.is_empty()).then(|| folder.to_owned())
+}
+
+/// A path made only of names: nothing absolute, no `..`.
+fn plain_relative(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
 }
 
 /// Rewrites the first matching prefix of `text`.
@@ -604,6 +658,15 @@ pub fn import(plan: &Plan, store: &Store, config: &ClientConfig) -> Result<Impor
         client
             .set_save_dir(index, folder.clone())
             .map_err(|error| error.to_string())?;
+        // Names first: progress is checked against the files under them.
+        if !planned.renames.is_empty() {
+            client
+                .adopt_names(index, planned.renames.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        if planned.shown_name.is_some() {
+            let _ = client.rename_torrent(index, planned.shown_name.clone());
+        }
         let running = planned.state != TransferState::Paused;
         let adopted = planned
             .pieces
@@ -641,6 +704,35 @@ pub fn import(plan: &Plan, store: &Store, config: &ClientConfig) -> Result<Impor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_the_folder_file_names_are_relative_to() {
+        let folder = |content: &str, names: &[&str]| storage_folder(content, names);
+        // As the torrent has it: its folder, or the one file.
+        assert_eq!(
+            folder("/dl/album", &["album/a.flac", "album/disc/b.flac"]).as_deref(),
+            Some("/dl")
+        );
+        assert_eq!(
+            folder("/dl/film.mkv", &["film.mkv"]).as_deref(),
+            Some("/dl")
+        );
+        // A renamed top folder, and a single file put in a folder.
+        assert_eq!(
+            folder("/dl/Album (2024)/", &["Album (2024)/a.flac"]).as_deref(),
+            Some("/dl")
+        );
+        assert_eq!(
+            folder("/dl/film", &["film/film.mkv"]).as_deref(),
+            Some("/dl")
+        );
+        // Without the torrent's folder: the files are in the folder itself.
+        assert_eq!(
+            folder("/dl", &["a.flac", "disc/b.flac"]).as_deref(),
+            Some("/dl")
+        );
+        assert_eq!(folder("/elsewhere", &["album/a.flac"]), None);
+    }
 
     #[test]
     fn maps_path_prefixes() {

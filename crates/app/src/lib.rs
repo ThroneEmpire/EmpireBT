@@ -15,12 +15,13 @@ pub mod qbittorrent;
 mod snapshot;
 pub mod store;
 
+pub use empirebt_backend::ContentLayout;
 pub use engine::{AddRequest, AddSource, Command, Failure, Handle, Reply};
 pub use geoip::ATTRIBUTION as GEOIP_ATTRIBUTION;
 pub use labels::{MAX_NAME, clean_name};
 pub use snapshot::{
-    DhtState, Level, Network, Notice, PeerView, RateMeter, SeedStatus, SettingView, Snapshot,
-    Status, TorrentView,
+    DhtState, FileView, Level, Network, Notice, PeerView, RateMeter, SeedStatus, SettingView,
+    Snapshot, Status, TorrentView,
 };
 pub use store::{Store, default_data_dir, home_dir};
 

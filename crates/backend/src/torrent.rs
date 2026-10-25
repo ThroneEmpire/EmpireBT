@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{MagnetLink, ResumeData, TorrentInfo, TransferState};
+use crate::{MagnetLink, Renames, ResumeData, TorrentInfo, TransferState};
 
 /// A torrent managed by the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +16,12 @@ pub struct Torrent {
     /// The folder its files are in; the client's download directory when
     /// unset.
     save_dir: Option<PathBuf>,
+    /// A name chosen for it, shown instead of the torrent's own.
+    display_name: Option<String>,
+    /// Files whose names on disk differ from the torrent's.
+    renames: Renames,
+    /// The layout to give a magnet link's files once its metadata arrives.
+    pending_layout: ContentLayout,
 }
 
 impl Torrent {
@@ -28,6 +34,9 @@ impl Torrent {
             magnet: None,
             resume: None,
             save_dir: None,
+            display_name: None,
+            renames: Renames::default(),
+            pending_layout: ContentLayout::Original,
         }
     }
 
@@ -47,6 +56,9 @@ impl Torrent {
             magnet: Some(link),
             resume: None,
             save_dir: None,
+            display_name: None,
+            renames: Renames::default(),
+            pending_layout: ContentLayout::Original,
         }
     }
 
@@ -59,12 +71,43 @@ impl Torrent {
             magnet: None,
             resume: None,
             save_dir: None,
+            display_name: None,
+            renames: Renames::default(),
+            pending_layout: ContentLayout::Original,
         }
     }
 
     /// Returns the display name of the torrent.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The name shown for it: one chosen for it, or the torrent's own.
+    pub fn display_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// A name chosen for it, if any.
+    pub fn chosen_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    pub fn set_display_name(&mut self, name: Option<String>) {
+        self.display_name = name;
+    }
+
+    /// Its files' names on disk where they differ from the torrent's.
+    pub fn renames(&self) -> &Renames {
+        &self.renames
+    }
+
+    /// The layout a magnet link's files get once its metadata arrives.
+    pub fn pending_layout(&self) -> ContentLayout {
+        self.pending_layout
+    }
+
+    pub(crate) fn set_pending_layout(&mut self, layout: ContentLayout) {
+        self.pending_layout = layout;
     }
 
     /// The folder its files are in, when one was chosen for it.
@@ -157,5 +200,47 @@ mod tests {
 
         torrent.pause();
         assert_eq!(torrent.state(), TransferState::Paused);
+    }
+}
+
+/// A torrent's file: its path in the torrent, and the one it has on disk,
+/// both relative to the torrent's folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentFileName {
+    pub original: PathBuf,
+    pub path: PathBuf,
+    pub length: u64,
+}
+
+/// How a torrent's files are laid out in its folder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContentLayout {
+    /// As the torrent says.
+    #[default]
+    Original,
+    /// A single-file torrent goes in a folder named after it.
+    Subfolder,
+    /// A multi-file torrent's files go straight in the folder, without
+    /// the torrent's top folder.
+    NoSubfolder,
+}
+
+impl ContentLayout {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "original" => Some(Self::Original),
+            "subfolder" => Some(Self::Subfolder),
+            "nosubfolder" | "no-subfolder" | "no_subfolder" => Some(Self::NoSubfolder),
+            _ => None,
+        }
+    }
+
+    /// The name [`ContentLayout::parse`] reads.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::Subfolder => "subfolder",
+            Self::NoSubfolder => "nosubfolder",
+        }
     }
 }

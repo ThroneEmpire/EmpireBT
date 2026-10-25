@@ -818,16 +818,107 @@ function renderOverview(body, torrent) {
   values.flat().forEach(([, value], index) => { if (nodes[index]) setText(nodes[index], value); });
 }
 
+// The files as folders holding files, each with its total size.
+function fileTree(files) {
+  const root = { folders: new Map(), files: [], size: 0 };
+  for (const file of files) {
+    const parts = file.path.split("/");
+    const name = parts.pop();
+    let folder = root;
+    root.size += file.size;
+    let path = "";
+    for (const part of parts) {
+      path = path ? `${path}/${part}` : part;
+      if (!folder.folders.has(part)) folder.folders.set(part, { name: part, path, folders: new Map(), files: [], size: 0 });
+      folder = folder.folders.get(part);
+      folder.size += file.size;
+    }
+    folder.files.push({ ...file, name });
+  }
+  return root;
+}
+
+const byName = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+
+function renameButton(label, onClick) {
+  return element("button", { class: "rename", title: label, attrs: { type: "button", "aria-label": label }, on: { click: onClick } }, [icon("rename")]);
+}
+
 function filesView() {
   const details = ui.details;
   if (!details) return [element("p", { class: "muted", text: "Loading…" })];
-  if (details.torrent.magnet) return [element("p", { class: "muted", text: "The file list arrives with the metadata." })];
-  return [element("table", { class: "files" }, [
-    element("tbody", {}, details.files.map((file) => element("tr", {}, [
-      element("td", { class: "path", text: file.path }),
-      element("td", { class: "num", text: bytes(file.size) }),
-    ]))),
-  ])];
+  const torrent = details.torrent;
+  const renamedShown = torrent.name !== details.originalName;
+  const nameRow = element("div", { class: "name-row" }, [
+    element("div", { class: "name-text" }, [
+      element("span", { class: "label", text: "Name" }),
+      element("span", { class: "value", text: torrent.name }),
+      renamedShown ? element("span", { class: "faint", text: `Its own name: ${details.originalName}` }) : null,
+    ]),
+    renameButton("Rename the torrent", () => renameTorrentDialog(torrent, details.originalName)),
+  ]);
+  if (torrent.magnet) return [nameRow, element("p", { class: "muted", text: "The file list arrives with the metadata." })];
+  const rows = [];
+  const walk = (folder, depth) => {
+    for (const child of [...folder.folders.values()].sort(byName)) {
+      rows.push(element("tr", { class: "folder" }, [
+        element("td", { class: "path", attrs: { style: `--depth: ${depth}` } }, [icon("category"), element("span", { text: child.name })]),
+        element("td", { class: "num", text: bytes(child.size) }),
+        element("td", { class: "act" }, [renameButton(`Rename the folder ${child.name}`, () => renamePathDialog(torrent, child.path, true))]),
+      ]));
+      walk(child, depth + 1);
+    }
+    for (const file of folder.files.sort(byName)) {
+      rows.push(element("tr", {}, [
+        element("td", { class: "path", attrs: { style: `--depth: ${depth}` }, title: file.original ? `Renamed from ${file.original}` : "" }, [
+          element("span", { text: file.name }),
+          file.original ? element("span", { class: "renamed", text: "renamed" }) : null,
+        ]),
+        element("td", { class: "num", text: bytes(file.size) }),
+        element("td", { class: "act" }, [renameButton(`Rename ${file.name}`, () => renamePathDialog(torrent, file.path, false))]),
+      ]));
+    }
+  };
+  walk(fileTree(details.files), 0);
+  return [nameRow, element("table", { class: "files" }, [element("tbody", {}, rows)])];
+}
+
+function renameTorrentDialog(torrent, originalName) {
+  const input = element("input", { attrs: { type: "text", value: torrent.name, placeholder: originalName, maxlength: "255", spellcheck: "false" } });
+  const form = openDialog("Rename torrent", [
+    input,
+    element("p", { class: "muted", text: `Only the name shown changes; its files keep theirs. Leave it empty to show its own name, ${originalName}.` }),
+  ], [cancelButton(), element("button", { class: "primary", text: "Rename", attrs: { type: "submit" } })]);
+  form.addEventListener("submit", submitter(form, async () => {
+    await api(`/api/torrents/${torrent.hash}/name`, { method: "PUT", body: { name: input.value.trim() || null } });
+    loadDetails();
+  }));
+}
+
+// Renames a file or folder where it is; a `/` in the new name moves it
+// into a folder, made if needed.
+function renamePathDialog(torrent, path, folder) {
+  const parts = path.split("/");
+  const name = parts.pop();
+  const parent = parts.join("/");
+  const input = element("input", { attrs: { type: "text", value: name, required: "", spellcheck: "false", autocapitalize: "off", autocorrect: "off" } });
+  const form = openDialog(folder ? "Rename folder" : "Rename file", [
+    input,
+    element("p", { class: "muted", text: `${folder ? "Everything in it moves along. " : ""}The ${folder ? "folder" : "file"} is renamed on disk${parent ? ` inside ${parent}` : ""}; it keeps seeding. Use / to move it into a folder.` }),
+  ], [cancelButton(), element("button", { class: "primary", text: "Rename", attrs: { type: "submit" } })]);
+  // Select the name without its extension, as file managers do.
+  if (!narrow.matches) {
+    const dot = folder ? -1 : name.lastIndexOf(".");
+    input.setSelectionRange(0, dot > 0 ? dot : name.length);
+  }
+  form.addEventListener("submit", submitter(form, async () => {
+    const chosen = input.value.trim().replace(/^\/+|\/+$/g, "");
+    if (!chosen) throw new ApiError(400, "Type a name.");
+    if (chosen === name) return;
+    const to = parent ? `${parent}/${chosen}` : chosen;
+    await api(`/api/torrents/${torrent.hash}/rename`, { method: "POST", body: { from: path, to } });
+    loadDetails();
+  }));
 }
 
 function trackersView() {
@@ -1147,6 +1238,11 @@ function addDialog() {
   const categories = element("datalist", { attrs: { id: "add-categories" } },
     ui.lists.categories.map((name) => element("option", { attrs: { value: name } })));
   const tags = element("input", { attrs: { type: "text", placeholder: "none, or several separated by commas" } });
+  const layout = element("select", {}, [
+    ["original", "As the torrent has it"],
+    ["subfolder", "In a folder of its own"],
+    ["nosubfolder", "Without its top folder"],
+  ].map(([value, text]) => element("option", { text, attrs: { value } })));
   // Picking a category moves "Save in" to its folder, unless typed over.
   let typedFolder = false;
   saveTo.addEventListener("input", () => { typedFolder = true; });
@@ -1167,6 +1263,9 @@ function addDialog() {
     saveTo,
     suggestions,
     element("p", { class: "muted", text: "The download folder, a folder inside it, a category's folder, or one set in storage.allowed_dirs." }),
+    element("label", { text: "Content layout" }),
+    layout,
+    element("p", { class: "muted", text: "A single file can go in a folder named after it; a torrent's files can go straight in the save folder." }),
   ], [cancelButton(), element("button", { class: "primary", text: "Add", attrs: { type: "submit" } })]);
   form.addEventListener("submit", submitter(form, async () => {
     const lines = source.value.split("\n").map((line) => line.trim()).filter(Boolean);
@@ -1174,10 +1273,12 @@ function addDialog() {
     const savePath = saveTo.value.trim() || undefined;
     const chosenCategory = category.value.trim() || undefined;
     const chosenTags = tags.value.split(",").map((tag) => tag.trim()).filter(Boolean);
+    const chosenLayout = layout.value === "original" ? undefined : layout.value;
     for (const line of lines) {
-      await api("/api/torrents", { method: "POST", body: { source: line, savePath, category: chosenCategory, tags: chosenTags } });
+      await api("/api/torrents", { method: "POST", body: { source: line, savePath, category: chosenCategory, tags: chosenTags, layout: chosenLayout } });
     }
     const query = new URLSearchParams();
+    if (chosenLayout) query.set("layout", chosenLayout);
     if (savePath) query.set("savePath", savePath);
     if (chosenCategory) query.set("category", chosenCategory);
     if (chosenTags.length) query.set("tags", chosenTags.join(","));

@@ -4,12 +4,13 @@
 
 use crate::input::PathInput;
 use empirebt_app::{
-    AddRequest, AddSource, Command, DhtState, Failure, Handle, InfoHash, Notice, PeerView, Reply,
-    SeedStatus, SettingView, Snapshot, TorrentView,
+    AddRequest, AddSource, Command, ContentLayout, DhtState, Failure, Handle, InfoHash, Notice,
+    PeerView, Reply, SeedStatus, SettingView, Snapshot, TorrentView,
 };
 use empirebt_backend::SettingKind;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,12 +36,26 @@ pub enum Mode {
     Sort {
         selected: usize,
     },
+    /// Choosing a file or folder of a torrent to rename.
+    PickFile {
+        torrent: InfoHash,
+        selected: usize,
+    },
+    /// Renaming a torrent (`path` unset: the name shown) or one of its
+    /// files or folders, by its path in the torrent's folder.
+    Rename {
+        torrent: InfoHash,
+        path: Option<PathBuf>,
+        input: PathInput,
+        error: Option<String>,
+    },
     Add {
         input: PathInput,
         /// The folder to save it in, the download directory at first.
         save: PathInput,
-        /// Whether the folder field has the cursor.
-        on_save: bool,
+        layout: ContentLayout,
+        /// The field with the cursor.
+        field: AddField,
         error: Option<String>,
     },
     ConfirmRemove(InfoHash),
@@ -76,6 +91,108 @@ impl WebInfo {
             fingerprint: web.certificate_fingerprint().map(str::to_owned),
         }
     }
+}
+
+/// A file or folder of a torrent, in the order the Files tab lists them:
+/// each folder before what is in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    /// Its path on disk, relative to the torrent's folder.
+    pub path: PathBuf,
+    pub name: String,
+    /// How many folders it is in.
+    pub depth: usize,
+    pub folder: bool,
+    /// Its size, or what the folder holds.
+    pub size: u64,
+    /// Whether it has a name other than the torrent's.
+    pub renamed: bool,
+}
+
+/// A torrent's files and folders as a tree, by their names on disk.
+pub fn file_entries(torrent: &TorrentView) -> Vec<FileEntry> {
+    let mut files = torrent.files();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut entries: Vec<FileEntry> = Vec::new();
+    // The folders the previous file was in, and where their entries are.
+    let mut open: Vec<(PathBuf, usize)> = Vec::new();
+    for file in files {
+        let parents: Vec<&Path> = file
+            .path
+            .ancestors()
+            .skip(1)
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .collect();
+        let parents: Vec<&Path> = parents.into_iter().rev().collect();
+        let shared = open
+            .iter()
+            .zip(&parents)
+            .take_while(|((open, _), parent)| open == *parent)
+            .count();
+        open.truncate(shared);
+        for parent in &parents[shared..] {
+            open.push((parent.to_path_buf(), entries.len()));
+            entries.push(FileEntry {
+                path: parent.to_path_buf(),
+                name: name_of(parent),
+                depth: open.len() - 1,
+                folder: true,
+                size: 0,
+                renamed: false,
+            });
+        }
+        for (_, index) in &open {
+            entries[*index].size += file.length;
+        }
+        entries.push(FileEntry {
+            name: name_of(&file.path),
+            depth: parents.len(),
+            folder: false,
+            size: file.length,
+            renamed: file.path != file.original,
+            path: file.path,
+        });
+    }
+    entries
+}
+
+fn name_of(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+}
+
+/// The fields of the add dialog, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddField {
+    Source,
+    Save,
+    Layout,
+}
+
+impl AddField {
+    fn cycle(self, step: isize) -> Self {
+        const ALL: [AddField; 3] = [AddField::Source, AddField::Save, AddField::Layout];
+        let index = ALL.iter().position(|field| *field == self).unwrap_or(0) as isize;
+        ALL[(index + step).rem_euclid(ALL.len() as isize) as usize]
+    }
+}
+
+/// The content layouts in the add dialog's order, with their labels.
+pub const LAYOUTS: [(ContentLayout, &str); 3] = [
+    (ContentLayout::Original, "As the torrent has it"),
+    (
+        ContentLayout::Subfolder,
+        "In a folder of its own (a single file)",
+    ),
+    (ContentLayout::NoSubfolder, "Without its top folder"),
+];
+
+fn next_layout(layout: ContentLayout, step: isize) -> ContentLayout {
+    let index = LAYOUTS
+        .iter()
+        .position(|(choice, _)| *choice == layout)
+        .unwrap_or(0) as isize;
+    LAYOUTS[(index + step).rem_euclid(LAYOUTS.len() as isize) as usize].0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -513,6 +630,8 @@ impl App {
             Mode::Label { .. } => self.handle_label_key(key),
             Mode::Filter { .. } => self.handle_filter_key(key),
             Mode::Sort { .. } => self.handle_sort_key(key),
+            Mode::PickFile { .. } => self.handle_pick_file_key(key),
+            Mode::Rename { .. } => self.handle_rename_key(key),
             Mode::Settings { .. } => self.handle_settings_key(key),
             Mode::ConfirmRemove(hash) => {
                 let hash = *hash;
@@ -530,28 +649,32 @@ impl App {
             Mode::Add {
                 input,
                 save,
-                on_save,
+                layout,
+                field,
                 error,
             } => {
                 let control = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
                     KeyCode::Esc => self.mode = Mode::Normal,
-                    KeyCode::Up | KeyCode::Down => *on_save = !*on_save,
+                    KeyCode::Up => *field = field.cycle(-1),
+                    KeyCode::Down => *field = field.cycle(1),
                     KeyCode::Enter => {
                         if input.text().trim().is_empty() {
                             *error = Some(
                                 "Type a .torrent file path or URL, or paste a magnet link"
                                     .to_owned(),
                             );
-                            *on_save = false;
+                            *field = AddField::Source;
                             return;
                         }
                         let source = AddSource::Link(input.text().to_owned());
+                        let layout = *layout;
                         let folder = save.text().trim();
                         let save_dir =
                             (!folder.is_empty()).then(|| std::path::PathBuf::from(folder));
                         match self.call(Command::AddWith(AddRequest {
                             save_dir,
+                            layout,
                             ..AddRequest::new(source)
                         })) {
                             Ok(reply) => {
@@ -570,8 +693,21 @@ impl App {
                             }
                         }
                     }
+                    KeyCode::Left | KeyCode::Char('h') if *field == AddField::Layout => {
+                        *layout = next_layout(*layout, -1);
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') | KeyCode::Tab
+                        if *field == AddField::Layout =>
+                    {
+                        *layout = next_layout(*layout, 1);
+                    }
+                    _ if *field == AddField::Layout => {}
                     code => {
-                        let field = if *on_save { save } else { input };
+                        let field = if *field == AddField::Save {
+                            save
+                        } else {
+                            input
+                        };
                         match code {
                             KeyCode::Tab => field.complete(),
                             KeyCode::Char('u') if control => field.clear(),
@@ -602,7 +738,8 @@ impl App {
         Mode::Add {
             input,
             save,
-            on_save: false,
+            layout: ContentLayout::Original,
+            field: AddField::Source,
             error: None,
         }
     }
@@ -612,13 +749,18 @@ impl App {
             Mode::Add {
                 input,
                 save,
-                on_save,
+                field,
                 error,
+                ..
             } => {
-                if *on_save { save } else { input }.paste(text);
+                match field {
+                    AddField::Source => input.paste(text),
+                    AddField::Save => save.paste(text),
+                    AddField::Layout => return,
+                }
                 *error = None;
             }
-            Mode::Label { input, error, .. } => {
+            Mode::Label { input, error, .. } | Mode::Rename { input, error, .. } => {
                 input.paste(text);
                 *error = None;
             }
@@ -704,6 +846,24 @@ impl App {
                     }
                     KeyCode::Char('C') => {
                         self.edit_label(hash, LabelKind::Category);
+                        return;
+                    }
+                    KeyCode::Char('R') => {
+                        self.rename(hash, None);
+                        return;
+                    }
+                    KeyCode::Char('r') => {
+                        if self
+                            .view
+                            .torrent(&hash)
+                            .is_some_and(|torrent| torrent.info.is_some())
+                        {
+                            self.tab = DetailTab::Files;
+                            self.mode = Mode::PickFile {
+                                torrent: hash,
+                                selected: 0,
+                            };
+                        }
                         return;
                     }
                     _ => return,
@@ -882,6 +1042,122 @@ impl App {
                 if let Some(completed) = complete_label(input.text(), known, kind) {
                     input.clear();
                     input.paste(&completed);
+                }
+            }
+            KeyCode::Char('u') if control => input.clear(),
+            KeyCode::Char('w') if control => input.delete_word(),
+            KeyCode::Char(character) if !control => {
+                input.insert(character);
+                *error = None;
+            }
+            KeyCode::Backspace => input.backspace(),
+            KeyCode::Delete => input.delete(),
+            KeyCode::Left => input.left(),
+            KeyCode::Right => input.right(),
+            KeyCode::Home => input.home(),
+            KeyCode::End => input.end(),
+            _ => {}
+        }
+    }
+
+    /// Opens the rename dialog for a torrent's name, or one of its files
+    /// or folders, with the current name in it.
+    fn rename(&mut self, torrent: InfoHash, path: Option<PathBuf>) {
+        let Some(view) = self.view.torrent(&torrent) else {
+            return;
+        };
+        let current = match &path {
+            Some(path) => name_of(path),
+            None => view.name.clone(),
+        };
+        let mut input = PathInput::default();
+        input.paste(&current);
+        self.mode = Mode::Rename {
+            torrent,
+            path,
+            input,
+            error: None,
+        };
+    }
+
+    /// The files and folders of the torrent being renamed.
+    pub fn picked_files(&self) -> Vec<FileEntry> {
+        match &self.mode {
+            Mode::PickFile { torrent, .. } => self
+                .view
+                .torrent(torrent)
+                .map(file_entries)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_pick_file_key(&mut self, key: KeyEvent) {
+        let entries = self.picked_files();
+        let Mode::PickFile { torrent, selected } = &mut self.mode else {
+            return;
+        };
+        let last = entries.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(last),
+            KeyCode::PageUp => *selected = selected.saturating_sub(10),
+            KeyCode::PageDown => *selected = (*selected + 10).min(last),
+            KeyCode::Home | KeyCode::Char('g') => *selected = 0,
+            KeyCode::End | KeyCode::Char('G') => *selected = last,
+            KeyCode::Enter | KeyCode::Char('r') => {
+                let torrent = *torrent;
+                if let Some(entry) = entries.get(*selected) {
+                    self.rename(torrent, Some(entry.path.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_rename_key(&mut self, key: KeyEvent) {
+        let Mode::Rename {
+            torrent,
+            path,
+            input,
+            error,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                let text = input.text().trim().trim_matches('/').to_owned();
+                let command = match path {
+                    None => Command::RenameTorrent {
+                        torrent: *torrent,
+                        name: Some(text).filter(|name| !name.is_empty()),
+                    },
+                    Some(_) if text.is_empty() => {
+                        *error = Some("Type a name.".to_owned());
+                        return;
+                    }
+                    Some(path) if name_of(path) == text => {
+                        self.mode = Mode::Normal;
+                        return;
+                    }
+                    // A `/` in the name moves it into a folder there.
+                    Some(path) => Command::RenamePath {
+                        torrent: *torrent,
+                        to: path.parent().unwrap_or(Path::new("")).join(&text),
+                        from: path.clone(),
+                    },
+                };
+                match self.call(command) {
+                    Ok(_) => self.mode = Mode::Normal,
+                    Err(failure) => {
+                        if let Mode::Rename { error, .. } = &mut self.mode {
+                            *error = Some(failure.message);
+                        }
+                    }
                 }
             }
             KeyCode::Char('u') if control => input.clear(),
@@ -1237,6 +1513,101 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal));
         let torrent = &app.engine.snapshot().torrents[0];
         assert_eq!(torrent.save_dir, folder);
+        app.engine.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renames_torrents_and_picks_files_and_folders_to_rename() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-console-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut torrent = b"d4:infod5:filesld6:lengthi3e4:pathl4:disc6:b.flaceed6:lengthi4e4:pathl6:a.flaceed6:lengthi5e4:pathl4:disc6:c.flaceee4:name5:album12:piece lengthi16384e6:pieces20:".to_vec();
+        torrent.extend([7; 20]);
+        torrent.extend(b"ee");
+        let file = root.join("album.torrent");
+        std::fs::write(&file, torrent).unwrap();
+        let mut app = dashboard(&root);
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        app.handle_paste(&file.to_string_lossy());
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        app.table.select(Some(0));
+
+        let view = app.engine.snapshot().torrents[0].clone();
+        let tree: Vec<_> = file_entries(&view)
+            .into_iter()
+            .map(|entry| (entry.path, entry.depth, entry.folder, entry.size))
+            .collect();
+        assert_eq!(
+            tree,
+            [
+                (PathBuf::from("album"), 0, true, 12),
+                (PathBuf::from("album/a.flac"), 1, false, 4),
+                (PathBuf::from("album/disc"), 1, true, 8),
+                (PathBuf::from("album/disc/b.flac"), 2, false, 3),
+                (PathBuf::from("album/disc/c.flac"), 2, false, 5),
+            ]
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('R')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_paste("Best album");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.engine.snapshot().torrents[0].name, "Best album");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let Mode::Rename { path, input, .. } = &app.mode else {
+            panic!("the rename dialog is not open");
+        };
+        assert_eq!(path.as_deref(), Some(Path::new("album/disc")));
+        assert_eq!(input.text(), "disc");
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(&app.mode, Mode::Rename { error: Some(_), .. }),
+            "an empty name is refused"
+        );
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        app.engine.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn adds_a_torrent_without_its_top_folder() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-console-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut torrent = b"d4:infod5:filesld6:lengthi3e4:pathl5:a.txteed6:lengthi4e4:pathl5:b.txteee4:name5:album12:piece lengthi16384e6:pieces20:".to_vec();
+        torrent.extend([7; 20]);
+        torrent.extend(b"ee");
+        let file = root.join("album.torrent");
+        std::fs::write(&file, torrent).unwrap();
+
+        let mut app = dashboard(&root);
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        app.handle_paste(&file.to_string_lossy());
+        // Up from the first field wraps around to the layout.
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        app.handle_key(KeyEvent::from(KeyCode::Right));
+        app.handle_key(KeyEvent::from(KeyCode::Right));
+        // Typing on the layout field changes nothing.
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        let Mode::Add { layout, input, .. } = &app.mode else {
+            panic!("the add dialog is not open");
+        };
+        assert_eq!(*layout, ContentLayout::NoSubfolder);
+        assert_eq!(input.text(), file.to_string_lossy());
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal));
+        let torrent = app.engine.snapshot().torrents[0].clone();
+        let paths: Vec<_> = torrent.files().into_iter().map(|file| file.path).collect();
+        assert_eq!(paths, [PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
         app.engine.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

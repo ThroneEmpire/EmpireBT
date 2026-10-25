@@ -5,9 +5,9 @@ EmpireBT has four kinds of tests. Only the first three run in
 
 | Kind | Where | Count | Needs |
 | --- | --- | --- | --- |
-| Backend unit tests | `crates/backend/src/*.rs` (`mod tests`) | ~190 | nothing |
-| Application tests | `crates/app/src/*.rs` (`mod tests`), `crates/app/tests/qbittorrent.rs` | 27 + 1 (+1 opt in) | nothing |
-| Console unit tests | `crates/console/src/*.rs` (`mod tests`) | 15 | nothing |
+| Backend unit tests | `crates/backend/src/*.rs` (`mod tests`) | ~195 | nothing |
+| Application tests | `crates/app/src/*.rs` (`mod tests`), `crates/app/tests/qbittorrent.rs` | 29 + 1 (+1 opt in) | nothing |
+| Console unit tests | `crates/console/src/*.rs` (`mod tests`) | 20 | nothing |
 | Web UI tests | `crates/web/src/*.rs` and `crates/web/tests/web.rs` | 9 + 10 | nothing |
 | libtorrent interop tests | `interop/tests/libtorrent.rs` | 36 | libtorrent (skipped without it) |
 | Scale benchmark | `crates/backend/examples/scale.rs` | — | run by hand, release build |
@@ -115,8 +115,8 @@ cargo test -p empirebt-interop        # ~6 s
 How it works:
 
 1. `setup_libtorrent.py` downloads the pinned libtorrent Python wheel
-   (2.1.1) from PyPI into `interop/.libtorrent/`, which git ignores, after
-   checking its SHA-256.
+   (2.1.2, from GitHub, as it was not published on PyPI) into
+   `interop/.libtorrent/`, which git ignores, after checking its SHA-256.
 2. `lt_peer.py` is a small libtorrent client with the commands `make`,
    `magnet`, `seed`, `download`, `identify` (decode a peer ID), and
    `identify-peer` (show the client name, encryption, and transport
@@ -224,7 +224,8 @@ The default versions are 5.1.2 (before qBittorrent changed its sign-in) and
 5.3.0. For each version, `interop/qbittorrent.py` starts the linuxserver
 image and adds torrents in every case the importer handles:
 - complete, in a category with automatic management;
-- a renamed file;
+- a renamed file, in a torrent given a name of its own;
+- files laid out without the torrent's folder;
 - half done and stopped, in the incomplete folder;
 - a skipped file;
 - a hybrid;

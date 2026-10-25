@@ -229,16 +229,32 @@ fn imports_from(live: &Live) {
     assert_eq!(mini.category.as_deref(), Some("Linux"));
     assert_eq!(mini.tags, ["iso"]);
     assert_eq!(mini.progress(), Some(1.0));
-    // A renamed file: skipped, with the reason.
+    // A renamed file, and a name of its own: both come over.
     let album = torrent("album");
-    assert!(
-        album
-            .skip
-            .as_deref()
-            .unwrap_or_default()
-            .contains("renamed"),
-        "{version}: {:?}",
-        album.skip
+    assert_eq!(album.skip, None, "{version}");
+    assert_eq!(album.state, TransferState::Seeding, "{version}");
+    assert_eq!(album.shown_name.as_deref(), Some("Album (renamed)"));
+    assert_eq!(album.folder, Some(downloads.join("complete")));
+    assert_eq!(
+        album.renames,
+        [(
+            PathBuf::from("album/02.flac"),
+            PathBuf::from("album/02 - renamed.flac")
+        )]
+        .into()
+    );
+    // Laid out without the torrent's folder.
+    let flat = torrent("flat");
+    assert_eq!(flat.skip, None, "{version}");
+    assert_eq!(flat.state, TransferState::Seeding, "{version}");
+    assert_eq!(flat.folder, Some(downloads.join("flat")));
+    assert_eq!(
+        flat.renames,
+        [
+            (PathBuf::from("flat/one.txt"), PathBuf::from("one.txt")),
+            (PathBuf::from("flat/two.txt"), PathBuf::from("two.txt")),
+        ]
+        .into()
     );
     // Half done and stopped, its files still in the incomplete folder.
     let partial = torrent("partial.bin");
@@ -272,13 +288,13 @@ fn imports_from(live: &Live) {
     // Planning changes nothing.
     assert!(store.load(config.clone()).unwrap().0.torrents().is_empty());
     let imported = qbittorrent::import(&plan, &store, &config).unwrap();
-    assert_eq!(imported.torrents, 5);
+    assert_eq!(imported.torrents, 7);
     assert_eq!(imported.categories, 3);
     assert_eq!(imported.tags, 3);
 
     // Trusted progress needs no check: the resume data matches the files.
     let (mut client, _) = store.load(config.clone()).unwrap();
-    assert_eq!(client.torrents().len(), 5);
+    assert_eq!(client.torrents().len(), 7);
     let position = |client: &empirebt_backend::Client, name: &str| {
         client
             .torrents()
@@ -302,6 +318,22 @@ fn imports_from(live: &Live) {
     let hybrid = position(&client, "hybrid.dat");
     let check = client.spawn_verify(hybrid).unwrap();
     assert_eq!(client.finish_transfer(check), Ok(4));
+    // Renamed files are found under their names: trusted, and verified.
+    for name in ["album", "flat"] {
+        let index = position(&client, name);
+        assert!(client.resume_is_current(index), "{version}: {name}");
+        let check = client.spawn_verify(index).unwrap();
+        assert!(client.finish_transfer(check).is_ok(), "{version}: {name}");
+        assert_eq!(
+            client.torrents()[index].state(),
+            TransferState::Seeding,
+            "{version}: {name}"
+        );
+    }
+    assert_eq!(
+        client.torrents()[position(&client, "album")].display_name(),
+        "Album (renamed)"
+    );
     let magnet = position(&client, "never-resolved");
     assert_eq!(
         client.torrents()[magnet].magnet().unwrap().trackers(),
@@ -314,7 +346,6 @@ fn imports_from(live: &Live) {
         again
             .torrents
             .iter()
-            .filter(|torrent| torrent.name != "album")
             .all(|torrent| torrent.skip.as_deref() == Some("already in EmpireBT"))
     );
 
