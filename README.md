@@ -259,6 +259,10 @@ connections it already has.
 
 ### Finding peers
 
+- **Seeds connect out.** A seeding torrent connects to the downloaders
+  trackers and the DHT return, as libtorrent's seeds do, so it serves
+  them even when they cannot reach it (behind a NAT, or a VPN without a
+  forwarded port).
 - **Trackers.** EmpireBT announces to every tier of HTTP, HTTPS and UDP
   trackers at once, each on its own interval, and within a tier to one
   tracker, moving to the next if it fails (BEP 12, as qBittorrent does by

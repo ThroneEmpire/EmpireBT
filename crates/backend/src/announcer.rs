@@ -437,6 +437,16 @@ impl AnnounceLoop {
             } else {
                 entry.started = true;
                 entry.failures = 0;
+                // Downloaders that cannot reach us (we may be behind a NAT
+                // or a VPN without a forwarded port) still get the data if
+                // we connect to them, as libtorrent's seeds do.
+                if let Some((runtime, _)) = &self.tracked_runtime {
+                    dial_peers(
+                        runtime,
+                        &key,
+                        accepted.iter().flat_map(|response| response.peers()),
+                    );
+                }
                 let interval = accepted
                     .iter()
                     .filter_map(|response| response.interval())
@@ -556,14 +566,40 @@ fn dht_loop(shared: &Shared, dht: &Arc<Dht>, port: u16) {
                 target.key,
                 target.announce_hashes.clone(),
             );
+            let runtime = tracked.as_ref().map(|(runtime, _)| Arc::clone(runtime));
             std::thread::spawn(move || {
                 for hash in &hashes {
-                    dht.announce(hash, port);
+                    let peers = dht.announce(hash, port);
+                    if let Some(runtime) = &runtime {
+                        dial_peers(runtime, &key, peers.iter());
+                    }
                 }
                 let _ = sender.send(key);
             });
         }
         std::thread::sleep(POLL);
+    }
+}
+
+/// Peers dialed at most per announce; the runtime's own limits on dials
+/// and connections apply too.
+const DIALS_PER_ANNOUNCE: usize = 50;
+
+/// Connects to peers a tracker or the DHT returned for a torrent we seed.
+/// Ones already connected, banned, or beyond the limits are skipped.
+fn dial_peers<'a>(
+    runtime: &Arc<Runtime>,
+    key: &[u8; 20],
+    peers: impl Iterator<Item = &'a std::net::SocketAddr>,
+) {
+    let mut dialed = 0;
+    for peer in peers {
+        if dialed >= DIALS_PER_ANNOUNCE {
+            break;
+        }
+        if runtime.dial(*peer, key) {
+            dialed += 1;
+        }
     }
 }
 
@@ -671,6 +707,57 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn a_seed_dials_the_downloaders_its_tracker_returns() {
+        // A downloader that only listens: it cannot reach us, we reach it.
+        let downloader = TcpListener::bind("127.0.0.1:0").unwrap();
+        let downloader_address = downloader.local_addr().unwrap();
+        let tracker = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/announce", tracker.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let std::net::SocketAddr::V4(peer) = downloader_address else {
+                return;
+            };
+            for mut stream in tracker.incoming().flatten() {
+                let _ = stream.read(&mut [0; 2048]);
+                let mut body = b"d8:intervali900e5:peers6:".to_vec();
+                body.extend(peer.ip().octets());
+                body.extend(peer.port().to_be_bytes());
+                body.push(b'e');
+                let _ = stream.write_all(&[b"HTTP/1.0 200 OK\r\n\r\n".as_slice(), &body].concat());
+            }
+        });
+        let root =
+            std::env::temp_dir().join(format!("empirebt-announcer-dial-{}", std::process::id()));
+        let runtime = seeding(&url, &root, crate::generate_peer_id());
+        let listener = runtime.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serving = {
+            let (runtime, stop) = (Arc::clone(&runtime), Arc::clone(&stop));
+            std::thread::spawn(move || runtime.serve_until(&listener, &stop))
+        };
+        let mut announcer = SeedAnnouncer::start(7777, Duration::from_secs(2), None);
+        announcer.track(Arc::clone(&runtime));
+        downloader
+            .set_nonblocking(false)
+            .and_then(|()| {
+                let (mut stream, _) = downloader.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                // Its handshake, encrypted by default.
+                let mut opening = [0; 20];
+                stream.read_exact(&mut opening)?;
+                Ok(())
+            })
+            .expect("the seed connected to the downloader");
+        announcer.clear();
+        if let Some(thread) = announcer.stop() {
+            thread.join().unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        let _ = serving.join();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
