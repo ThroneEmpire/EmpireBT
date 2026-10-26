@@ -108,6 +108,14 @@ impl Announcer {
         self.schedules.iter().all(|schedule| schedule.answered)
     }
 
+    /// Makes every tracker not already being asked due now.
+    pub fn reannounce_now(&mut self) {
+        let now = Instant::now();
+        for schedule in &mut self.schedules {
+            schedule.next = schedule.next.min(now);
+        }
+    }
+
     /// When the next announce is due, unless every tracker is busy.
     pub fn next_due(&self) -> Option<Instant> {
         self.schedules

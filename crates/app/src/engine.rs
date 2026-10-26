@@ -57,6 +57,9 @@ pub enum Command {
     Toggle(InfoHash),
     /// Queues a check of the torrent's local data.
     Recheck(InfoHash),
+    /// Announces a running or seeding torrent to its trackers and the DHT
+    /// now, rather than when next due, to find new peers.
+    Reannounce(InfoHash),
     /// Removes the torrent from the list. Downloaded files stay on disk.
     Remove(InfoHash),
     /// Removes the torrent and deletes its downloaded files, once its
@@ -884,6 +887,7 @@ impl Engine {
                 }
                 Ok(Reply::Done)
             }
+            Command::Reannounce(hash) => self.reannounce(hash),
             Command::Remove(hash) => {
                 self.remove(hash, false);
                 Ok(Reply::Done)
@@ -1755,6 +1759,30 @@ impl Engine {
         activity.error = None;
         self.verify_queue.push_back(hash);
         true
+    }
+
+    /// Announces now: a download or metadata fetch through its own
+    /// transfer, a seed through the seeding announcer.
+    fn reannounce(&mut self, hash: InfoHash) -> Result<Reply, Failure> {
+        self.known(&hash)?;
+        let name = self.name(&hash);
+        let transfer = self
+            .activity
+            .get(&hash)
+            .and_then(|activity| activity.job.as_ref())
+            .filter(|job| job.kind() != TransferKind::Verify);
+        if let Some(job) = transfer {
+            job.progress().request_reannounce();
+        } else if !self.seeding.announcer.reannounce(&hash) {
+            // A notice rather than a failure, so every interface shows it.
+            self.notify(
+                Level::Info,
+                format!("{name} is not running; start it to announce it"),
+            );
+            return Ok(Reply::Done);
+        }
+        self.notify(Level::Info, format!("Reannouncing {name}"));
+        Ok(Reply::Done)
     }
 
     /// Removes a torrent; with `delete_files`, its files are deleted once
@@ -2702,6 +2730,24 @@ mod tests {
                 .iter()
                 .any(|notice| notice.text == "Anonymous mode is off")
         );
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reannouncing_a_paused_torrent_says_to_start_it() {
+        let (handle, root) = engine("reannounce");
+        let (link, hash) = magnet(4);
+        handle.call(Command::Add(link)).unwrap();
+        handle.call(Command::Reannounce(hash)).unwrap();
+        assert!(
+            handle
+                .snapshot()
+                .notices
+                .iter()
+                .any(|notice| notice.text == "test-4 is not running; start it to announce it")
+        );
+        assert!(handle.call(Command::Reannounce([0; 20])).is_err());
         handle.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

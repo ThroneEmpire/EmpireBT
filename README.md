@@ -115,6 +115,7 @@ files, peers (address, country, client, connection, speeds) and trackers.
 | `a` | Add a `.torrent` file, URL, or magnet link, and choose its folder and content layout (↑↓ switch fields, Tab completes paths, ←→ change the layout; pasting works) |
 | `s` / `p` | Start / pause |
 | `v` | Recheck the downloaded data |
+| `A` | Reannounce now: ask trackers and the DHT for peers instead of waiting |
 | `x` | Remove; `d` in the dialog deletes the downloaded files too |
 | `C` / `t` | Set the category / edit the tags (Tab completes known names) |
 | `R` | Rename the torrent (only the name shown; empty shows its own again) |

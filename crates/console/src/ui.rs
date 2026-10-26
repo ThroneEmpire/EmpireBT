@@ -1649,6 +1649,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
                 ("p", "pause downloading or seeding"),
                 ("space", "toggle start / pause"),
                 ("v", "recheck local data"),
+                ("A", "reannounce now: ask trackers and the DHT for peers"),
                 ("x  del", "remove from the list (keeps files)"),
             ],
         ),

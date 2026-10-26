@@ -58,6 +58,8 @@ pub struct TransferProgress {
     uploaded_bytes: AtomicU64,
     active_peers: AtomicUsize,
     cancelled: AtomicBool,
+    /// Announce to every tracker now, not when next due.
+    reannounce: AtomicBool,
     last_error: Mutex<Option<String>>,
     /// Swarm counts from the latest tracker response; `UNKNOWN` until
     /// a tracker reports them.
@@ -89,6 +91,7 @@ impl Default for TransferProgress {
             uploaded_bytes: AtomicU64::new(0),
             active_peers: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
+            reannounce: AtomicBool::new(false),
             last_error: Mutex::new(None),
             seeders: AtomicU64::new(UNKNOWN),
             leechers: AtomicU64::new(UNKNOWN),
@@ -160,6 +163,17 @@ impl TransferProgress {
     /// piece boundary, so stopping can take up to the peer timeout.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Asks the transfer to announce to its trackers now rather than when
+    /// next due, to find new peers.
+    pub fn request_reannounce(&self) {
+        self.reannounce.store(true, Ordering::Release);
+    }
+
+    /// Whether a reannounce was asked for since the last call.
+    pub(crate) fn take_reannounce(&self) -> bool {
+        self.reannounce.swap(false, Ordering::AcqRel)
     }
 
     pub fn is_cancelled(&self) -> bool {

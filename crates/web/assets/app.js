@@ -923,7 +923,17 @@ function renamePathDialog(torrent, path, folder) {
 
 function trackersView() {
   const details = ui.details;
+  const torrent = selectedTorrent();
   const trackers = details ? details.trackers : [];
+  // Asks trackers and the DHT for peers now rather than when next due.
+  const reannounce = torrent && element("button", {
+    class: "reannounce",
+    attrs: { type: "button" },
+    on: {
+      click: (event) => busy(event.currentTarget,
+        act(api(`/api/torrents/${torrent.hash}/reannounce`, { method: "POST" }))),
+    },
+  }, [icon("recheck"), element("span", { text: "Reannounce now" })]);
   const lines = trackers.length
     ? trackers.map((url) => element("li", { text: url }))
     : [element("li", { class: "muted", text: "No trackers: peers are found through the DHT and peer exchange." })];
@@ -931,7 +941,7 @@ function trackersView() {
   const summary = announce && announce.trackersTotal
     ? element("p", { text: `Seeding announced to ${announce.trackersOk}/${announce.trackersTotal} trackers${announce.lastError ? ` · ${announce.lastError}` : ""}` })
     : null;
-  return [summary, element("ul", { class: "trackers" }, lines)].filter(Boolean);
+  return [reannounce, summary, element("ul", { class: "trackers" }, lines)].filter(Boolean);
 }
 
 

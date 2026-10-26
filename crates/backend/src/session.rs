@@ -493,6 +493,9 @@ impl DownloadSession {
             let mut last_error = None;
             let collect = |announcer: &mut crate::discovery::Announcer,
                            last_error: &mut Option<crate::BackendError>| {
+                if self.progress.take_reannounce() {
+                    announcer.reannounce_now();
+                }
                 announcer.start_due(&hashes, request);
                 let collected = announcer.collect();
                 if let Some(best) = &collected.best {
@@ -1258,6 +1261,27 @@ mod tests {
     }
 
     #[test]
+    fn a_running_download_reannounces_when_asked() {
+        let (info, _data) = two_block_torrent();
+        let (url, heard) = recording_tracker_for(None);
+        let info = info.with_tracker_urls(vec![url]);
+        let (session, root) = session(&info, "reannounce");
+        let progress = Arc::clone(session.progress());
+        let download =
+            std::thread::spawn(move || session.download_from_trackers_with_retries(0, 4, 100));
+        let started = heard.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(started.contains("event=started"), "{started}");
+        // Next due in 60 s, as the tracker said; asked now, it goes now.
+        assert!(heard.recv_timeout(Duration::from_millis(500)).is_err());
+        progress.request_reannounce();
+        let again = heard.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!again.contains("event="), "{again}");
+        progress.cancel();
+        let _ = download.join();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_paused_download_tells_its_trackers_it_stopped() {
         let (info, _data) = two_block_torrent();
         let (url, heard) = recording_tracker_for(None);
@@ -1265,7 +1289,7 @@ mod tests {
         let (session, root) = session(&info, "stopped");
         let progress = Arc::clone(session.progress());
         let download =
-            std::thread::spawn(move || session.download_from_trackers_with_retries(0, 100, 1));
+            std::thread::spawn(move || session.download_from_trackers_with_retries(0, 4, 100));
         let started = heard.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(started.contains("event=started"), "{started}");
         progress.cancel();

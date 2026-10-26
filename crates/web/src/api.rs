@@ -987,6 +987,7 @@ async fn action(
         "pause" => Command::Pause(hash),
         "toggle" => Command::Toggle(hash),
         "recheck" => Command::Recheck(hash),
+        "reannounce" => Command::Reannounce(hash),
         _ => return not_found().await,
     };
     run(&state, command).await

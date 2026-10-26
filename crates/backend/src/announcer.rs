@@ -49,6 +49,9 @@ struct Shared {
     status: Mutex<HashMap<[u8; 20], AnnounceStatus>>,
     dht_announced: Mutex<HashMap<[u8; 20], Instant>>,
     shutdown: AtomicBool,
+    /// Torrents to announce now, to trackers and to the DHT.
+    reannounce_trackers: Mutex<std::collections::HashSet<[u8; 20]>>,
+    reannounce_dht: Mutex<std::collections::HashSet<[u8; 20]>>,
 }
 
 /// Announces every torrent served by a seeding [`Runtime`] to all of its
@@ -120,6 +123,35 @@ impl SeedAnnouncer {
         if let Ok(mut current) = self.shared.runtime.lock() {
             *current = None;
         }
+    }
+
+    /// Announces a seeded torrent to its trackers and the DHT now rather
+    /// than when next due, to find new downloaders. Returns whether the
+    /// torrent is being seeded.
+    pub fn reannounce(&self, info_hash: &[u8; 20]) -> bool {
+        let seeded = self
+            .shared
+            .runtime
+            .lock()
+            .ok()
+            .and_then(|runtime| runtime.clone())
+            .is_some_and(|runtime| {
+                runtime
+                    .seeding_torrents()
+                    .iter()
+                    .any(|info| info.info_hash() == info_hash)
+            });
+        if seeded {
+            for set in [
+                &self.shared.reannounce_trackers,
+                &self.shared.reannounce_dht,
+            ] {
+                if let Ok(mut set) = set.lock() {
+                    set.insert(*info_hash);
+                }
+            }
+        }
+        seeded
     }
 
     pub fn status(&self, info_hash: &[u8; 20]) -> Option<AnnounceStatus> {
@@ -369,6 +401,17 @@ impl AnnounceLoop {
     /// Starts announces for due torrents, up to the worker limit.
     fn announce_due(&mut self) {
         let now = Instant::now();
+        let forced = self
+            .shared
+            .reannounce_trackers
+            .lock()
+            .map(|mut forced| std::mem::take(&mut *forced))
+            .unwrap_or_default();
+        for key in forced {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.next_announce = entry.next_announce.min(now);
+            }
+        }
         let mut due: Vec<([u8; 20], Instant)> = self
             .entries
             .iter()
@@ -543,6 +586,11 @@ fn dht_loop(shared: &Shared, dht: &Arc<Dht>, port: u16) {
                 (runtime, revision)
             });
         }
+        if let Ok(mut forced) = shared.reannounce_dht.lock() {
+            for key in forced.drain() {
+                next.remove(&key);
+            }
+        }
         while let Ok(key) = finished.try_recv() {
             in_flight.remove(&key);
             next.insert(key, Instant::now() + jittered(DHT_INTERVAL));
@@ -707,6 +755,34 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn reannounces_a_seed_at_once_when_asked() {
+        let (url, requests) = recording_tracker();
+        let root =
+            std::env::temp_dir().join(format!("empirebt-announcer-again-{}", std::process::id()));
+        let runtime = seeding(&url, &root, crate::generate_peer_id());
+        let hash = *runtime.seeding_torrents()[0].info_hash();
+        let mut announcer = SeedAnnouncer::start(7777, Duration::from_secs(1), None);
+        assert!(!announcer.reannounce(&hash), "nothing is tracked yet");
+        announcer.track(runtime);
+        let started = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(started.contains("event=started"));
+        // The tracker asked for 900 s; asking again does not wait for it.
+        assert!(
+            requests.recv_timeout(Duration::from_millis(500)).is_err(),
+            "no announce before it is due"
+        );
+        assert!(announcer.reannounce(&hash));
+        let again = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!again.contains("event="), "a regular announce: {again}");
+        assert!(!announcer.reannounce(&[9; 20]));
+        announcer.clear();
+        if let Some(thread) = announcer.stop() {
+            thread.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

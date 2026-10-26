@@ -473,6 +473,8 @@ button.rename:active { transform: scale(0.9); background: var(--surface-2); }
 .name-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .name-text .label { font-size: 12px; color: var(--muted); }
 .name-text .faint { font-size: 12px; color: var(--faint); }
+button.reannounce { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+button.reannounce .icon { width: 16px; height: 16px; }
 .trackers { margin: 0; padding: 0; list-style: none; }
 .trackers li { padding: 7px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .trackers li:last-child { border-bottom: none; }

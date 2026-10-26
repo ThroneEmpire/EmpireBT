@@ -1692,6 +1692,9 @@ fn fetch_magnet_metadata(
     // Starts due announces and takes in their results and peers; returns
     // whether new peers arrived.
     let mut poll_trackers = |peers: &mut Vec<SocketAddr>| {
+        if progress.take_reannounce() {
+            announcer.reannounce_now();
+        }
         announcer.start_due(&hashes, request);
         let collected = announcer.collect();
         if let Some(best) = &collected.best {

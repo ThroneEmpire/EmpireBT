@@ -850,6 +850,7 @@ impl App {
                     KeyCode::Char('p') => Command::Pause(hash),
                     KeyCode::Char(' ') => Command::Toggle(hash),
                     KeyCode::Char('v') => Command::Recheck(hash),
+                    KeyCode::Char('A') => Command::Reannounce(hash),
                     KeyCode::Char('x') | KeyCode::Delete => {
                         self.mode = Mode::ConfirmRemove {
                             torrent: hash,
