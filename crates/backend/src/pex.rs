@@ -23,6 +23,8 @@ pub(crate) const PREFERS_ENCRYPTION: u8 = 0x01;
 pub(crate) const SEED: u8 = 0x02;
 /// The peer supports uTP.
 pub(crate) const SUPPORTS_UTP: u8 = 0x04;
+/// Supports the hole-punch extension (BEP 55).
+pub(crate) const SUPPORTS_HOLEPUNCH: u8 = 0x08;
 /// We connected to the peer, so it accepts incoming connections.
 pub(crate) const REACHABLE: u8 = 0x10;
 

@@ -86,6 +86,11 @@ struct Peer {
     obfuscated: bool,
     /// It stopped sending blocks we asked for.
     snubbed: bool,
+    /// It supports the hole-punch extension (BEP 55).
+    holepunch: bool,
+    /// `ut_holepunch` messages for it, from relaying for another peer;
+    /// its connection sends them on its next tick.
+    holepunch_outbox: Vec<crate::holepunch::Message>,
     /// The client it named in its extension handshake.
     client: Option<String>,
     /// Pieces it has, of how many.
@@ -190,6 +195,10 @@ impl PeerInfo {
         flags
     }
 }
+
+/// Hole-punch messages queued for one peer at most, so a peer asking for
+/// introductions over and over cannot pile them up.
+const MAX_HOLEPUNCH_QUEUED: usize = 16;
 
 /// Where an address came from, as [`PeerInfo::sources`] has it.
 pub const SOURCE_TRACKER: u8 = 1;
@@ -306,6 +315,8 @@ impl Swarm {
                 encrypted: false,
                 obfuscated: false,
                 snubbed: false,
+                holepunch: false,
+                holepunch_outbox: Vec::new(),
                 client: None,
                 pieces: None,
                 choking_us: true,
@@ -428,6 +439,72 @@ impl Swarm {
             (peer.outgoing, peer.utp, peer.encrypted, peer.obfuscated) =
                 (outgoing, utp, encrypted, obfuscated);
         }
+    }
+
+    /// Records that a peer supports the hole-punch extension.
+    pub fn set_holepunch(&self, key: PeerKey) {
+        if let Some(peer) = self.lock().peers.get_mut(&key) {
+            peer.holepunch = true;
+        }
+    }
+
+    /// Introduces the peer `from` to the one at `target` (BEP 55): both
+    /// get a `connect` naming the other, sent on their connections' next
+    /// ticks. Fails with the BEP's error code when `target` is not a peer
+    /// of this torrent that supports it, or is `from` itself; a local peer
+    /// and a public one are not introduced at all, as libtorrent does not.
+    pub fn introduce(&self, from: PeerKey, target: SocketAddr) -> Result<(), u32> {
+        use crate::holepunch::{Kind, Message};
+        let mut inner = self.lock();
+        let reachable = |peer: &Peer| {
+            // uTP runs on the listen port, so its address is the one to
+            // punch to; over TCP the peer's listen address, when known.
+            if peer.utp {
+                peer.address
+            } else {
+                peer.pex.map_or(peer.address, |(address, _)| address)
+            }
+        };
+        let Some(asker) = inner.peers.get(&from).map(reachable) else {
+            return Err(crate::holepunch::NOT_CONNECTED);
+        };
+        let Some((key, peer)) = inner.peers.iter().find(|(_, peer)| {
+            !peer.evicted
+                && (peer.address == target
+                    || peer.pex.is_some_and(|(address, _)| address == target))
+        }) else {
+            return Err(crate::holepunch::NOT_CONNECTED);
+        };
+        let (key, supported) = (*key, peer.holepunch);
+        if key == from {
+            return Err(crate::holepunch::NO_SELF);
+        }
+        if !supported {
+            return Err(crate::holepunch::NO_SUPPORT);
+        }
+        if crate::dht_id::is_local(target.ip()) != crate::dht_id::is_local(asker.ip()) {
+            return Ok(());
+        }
+        let mut send = |to: PeerKey, about: SocketAddr| {
+            if let Some(peer) = inner.peers.get_mut(&to)
+                && peer.holepunch_outbox.len() < MAX_HOLEPUNCH_QUEUED
+            {
+                peer.holepunch_outbox
+                    .push(Message::new(Kind::Connect, about, 0));
+            }
+        };
+        send(from, target);
+        send(key, asker);
+        Ok(())
+    }
+
+    /// Takes the hole-punch messages waiting for a peer.
+    pub fn take_holepunch(&self, key: PeerKey) -> Vec<crate::holepunch::Message> {
+        self.lock()
+            .peers
+            .get_mut(&key)
+            .map(|peer| std::mem::take(&mut peer.holepunch_outbox))
+            .unwrap_or_default()
     }
 
     /// Records whether a peer stopped sending the blocks we asked for.
@@ -895,6 +972,40 @@ mod tests {
             "K"
         );
         assert!(downloading.flags().contains(&('H', "Peer from DHT")));
+    }
+
+    #[test]
+    fn introduces_only_peers_that_support_it() {
+        use crate::holepunch::{Kind, NO_SELF, NO_SUPPORT, NOT_CONNECTED};
+        let swarm = Swarm::new(4);
+        let now = Instant::now();
+        let public = |last: u8| SocketAddr::from(([203, 0, 113, last], 6881));
+        let asker = swarm.join(public(1), now).unwrap();
+        let target = swarm.join(public(2), now).unwrap();
+        let plain = swarm.join(public(3), now).unwrap();
+        let local = swarm
+            .join(SocketAddr::from(([192, 168, 1, 4], 6881)), now)
+            .unwrap();
+        for key in [asker, target, local] {
+            swarm.set_holepunch(key);
+        }
+        // Over TCP, the asker is introduced by its listen address.
+        swarm.set_pex(asker, public(11), 0);
+        assert_eq!(swarm.introduce(asker, public(2)), Ok(()));
+        let sent = swarm.take_holepunch(asker);
+        assert_eq!((sent[0].kind, sent[0].address), (Kind::Connect, public(2)));
+        assert_eq!(swarm.take_holepunch(target)[0].address, public(11));
+        assert!(swarm.take_holepunch(asker).is_empty(), "taken once");
+        assert_eq!(swarm.introduce(asker, public(3)), Err(NO_SUPPORT));
+        assert_eq!(swarm.introduce(asker, public(9)), Err(NOT_CONNECTED));
+        assert_eq!(swarm.introduce(asker, public(11)), Err(NO_SELF));
+        // A public peer is not introduced to a local one.
+        assert_eq!(
+            swarm.introduce(asker, SocketAddr::from(([192, 168, 1, 4], 6881))),
+            Ok(())
+        );
+        assert!(swarm.take_holepunch(local).is_empty());
+        let _ = plain;
     }
 
     #[test]

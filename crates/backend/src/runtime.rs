@@ -774,6 +774,107 @@ mod tests {
     /// A runtime seeding `size` bytes in 16 KiB pieces, served on a local
     /// port until the returned flag is set.
     #[test]
+    fn introduces_two_peers_that_ask_for_it() {
+        use crate::holepunch::{Kind, Message};
+        use std::io::Write;
+        let limits = Arc::new(crate::Limits::unlimited());
+        let (info, _, shutdown, server, root) = serving("holepunch", 64 * 1024, limits);
+        let storage = crate::Storage::new(&root).unwrap();
+        let seeder = Seeder::new(info.clone(), storage, [3; 20], Duration::from_secs(5)).unwrap();
+        let runtime = Arc::new(Runtime::new(vec![seeder], 8).unwrap());
+        let listener = runtime.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let serving = {
+            let (runtime, stop) = (Arc::clone(&runtime), Arc::clone(&stop));
+            thread::spawn(move || runtime.serve_until(&listener, &stop))
+        };
+        // Two peers that offer `ut_holepunch` as id 4, as libtorrent does.
+        let join = |last: u8| {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut id = *b"-qB4650-00000000000x";
+            id[19] = last;
+            let handshake = Handshake::new(*info.info_hash(), id).with_extensions();
+            stream.write_all(&handshake.encode()).unwrap();
+            let mut reply = [0; 68];
+            std::io::Read::read_exact(&mut stream, &mut reply).unwrap();
+            let offer = b"d1:md12:ut_holepunchi4eee".to_vec();
+            stream
+                .write_all(
+                    &PeerMessage::Extended {
+                        id: 0,
+                        payload: offer,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            // Wanting data keeps the connection from closing as idle.
+            stream
+                .write_all(&PeerMessage::Interested.encode().unwrap())
+                .unwrap();
+            stream
+        };
+        let next_holepunch = |stream: &mut TcpStream| loop {
+            if let PeerMessage::Extended { id: 4, payload } = read_message(stream).unwrap() {
+                break Message::decode(&payload).unwrap();
+            }
+        };
+        let (mut initiator, mut target) = (join(b'1'), join(b'2'));
+        let target_address = target.local_addr().unwrap();
+        // Wait until the runtime has both handshakes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while runtime.peers(info.info_hash()).unwrap().len() < 2 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(100));
+        let ask = |stream: &mut TcpStream, about: SocketAddr| {
+            let rendezvous = Message::new(Kind::Rendezvous, about, 0);
+            stream
+                .write_all(
+                    &PeerMessage::Extended {
+                        id: crate::holepunch::UT_HOLEPUNCH,
+                        payload: rendezvous.encode()[..8].to_vec(),
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+        };
+        ask(&mut initiator, target_address);
+        let to_initiator = next_holepunch(&mut initiator);
+        assert_eq!(to_initiator.kind, Kind::Connect);
+        assert_eq!(to_initiator.address, target_address);
+        let to_target = next_holepunch(&mut target);
+        assert_eq!(to_target.kind, Kind::Connect);
+        assert_eq!(to_target.address, initiator.local_addr().unwrap());
+        // Asking for a peer the relay does not know, or for itself.
+        let stranger: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        ask(&mut initiator, stranger);
+        let failed = next_holepunch(&mut initiator);
+        assert_eq!(
+            (failed.kind, failed.address, failed.error),
+            (Kind::Failed, stranger, crate::holepunch::NOT_CONNECTED)
+        );
+        let itself = initiator.local_addr().unwrap();
+        ask(&mut initiator, itself);
+        assert_eq!(
+            next_holepunch(&mut initiator).error,
+            crate::holepunch::NO_SELF
+        );
+        drop((initiator, target));
+        stop.store(true, Ordering::Release);
+        serving.join().unwrap().unwrap();
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn shows_an_encrypted_peer_as_qbittorrent_would() {
         let limits = Arc::new(crate::Limits::unlimited());
         let (info, _, shutdown, server, root) = serving("peer-flags", 64 * 1024, limits);

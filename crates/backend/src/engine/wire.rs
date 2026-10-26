@@ -194,6 +194,7 @@ impl PeerWire {
                 your_ip: Some(self.link.address.ip()),
                 listen_port: torrent.swarm.listen_port(),
                 client_version: crate::identity::identifies(&torrent.peer_id),
+                holepunch: !self.private,
             };
             out.push(Action::Send(crate::metadata::extension_handshake_with(
                 &offer,
@@ -222,6 +223,14 @@ impl PeerWire {
         let key = self.link.key;
         if torrent.swarm.is_evicted(key) {
             return Ok(Flow::Finished);
+        }
+        // Introductions made for other peers (BEP 55), first: a connection
+        // about to close as idle still delivers them.
+        if let Some(id) = self.remote.holepunch_id {
+            for message in torrent.swarm.take_holepunch(key) {
+                let payload = message.encode();
+                self.send(out, PeerMessage::Extended { id, payload }, now);
+            }
         }
 
         // Announce every verified piece, even to peers that have it, as
@@ -494,6 +503,15 @@ impl PeerWire {
                 if self.remote.pex_id.is_some() && !self.private && self.pex.next.is_none() {
                     self.pex.next = Some(now);
                 }
+                // Others learn through peer exchange that it can be
+                // introduced (BEP 55).
+                if self.remote.holepunch_id.is_some() && !self.private {
+                    torrent.swarm.set_holepunch(key);
+                    self.pex_flags |= crate::pex::SUPPORTS_HOLEPUNCH;
+                    torrent
+                        .swarm
+                        .update_pex_flags(key, crate::pex::SUPPORTS_HOLEPUNCH, 0);
+                }
             }
             PeerMessage::Extended {
                 id: crate::metadata::UT_METADATA,
@@ -506,6 +524,27 @@ impl PeerWire {
                     &mut self.remote,
                 )?;
                 out.extend(replies.into_iter().map(Action::Send));
+            }
+            // A peer that did not offer the extension gets no answer: we
+            // could not send one (BEP 55).
+            PeerMessage::Extended {
+                id: crate::holepunch::UT_HOLEPUNCH,
+                payload,
+            } if !self.private => {
+                use crate::holepunch::{Kind, Message};
+                if let (Some(id), Some(message)) =
+                    (self.remote.holepunch_id, Message::decode(&payload))
+                    && message.kind == Kind::Rendezvous
+                    && let Err(error) = torrent.swarm.introduce(key, message.address)
+                {
+                    let failed = Message::new(Kind::Failed, message.address, error);
+                    out.push(Action::Send(PeerMessage::Extended {
+                        id,
+                        payload: failed.encode(),
+                    }));
+                }
+                // We relay but do not punch holes ourselves: `connect`
+                // and `failed` are ignored, as the BEP allows.
             }
             PeerMessage::Extended {
                 id: crate::pex::UT_PEX,

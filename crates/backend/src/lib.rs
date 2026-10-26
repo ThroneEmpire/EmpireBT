@@ -11,6 +11,7 @@ mod discovery;
 mod engine;
 mod error;
 mod fast;
+mod holepunch;
 mod http;
 mod identity;
 mod limits;

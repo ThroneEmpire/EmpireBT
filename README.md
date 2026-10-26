@@ -260,6 +260,11 @@ connections it already has.
 
 ### Finding peers
 
+- **Introductions for peers behind NATs (BEP 55).** Two peers EmpireBT is
+  connected to can ask it to introduce them, so they can connect to each
+  other through their NATs over uTP; it relays for libtorrent clients
+  (qBittorrent and others) but does not punch holes itself yet. Never for
+  private torrents.
 - **Seeds connect out.** A seeding torrent connects to the downloaders
   trackers and the DHT return, as libtorrent's seeds do, so it serves
   them even when they cannot reach it (behind a NAT, or a VPN without a

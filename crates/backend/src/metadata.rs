@@ -42,12 +42,20 @@ pub(crate) struct ExtensionOffer {
     pub listen_port: Option<u16>,
     /// Name the client and its version (`v`); not in anonymous mode.
     pub client_version: bool,
+    /// Offer to relay hole punches (BEP 55; never for private torrents).
+    pub holepunch: bool,
 }
 
 pub(crate) fn extension_handshake_with(offer: &ExtensionOffer) -> PeerMessage {
     let mut extensions = vec![(&b"ut_metadata"[..], Value::Int(UT_METADATA.into()))];
     if offer.pex {
         extensions.push((b"ut_pex", Value::Int(crate::pex::UT_PEX.into())));
+    }
+    if offer.holepunch {
+        extensions.push((
+            b"ut_holepunch",
+            Value::Int(crate::holepunch::UT_HOLEPUNCH.into()),
+        ));
     }
     let mut entries = vec![
         (
@@ -94,6 +102,8 @@ pub(crate) struct RemoteMetadata {
     pub(crate) size: Option<usize>,
     /// The id for its `ut_pex` messages, if it exchanges peers.
     pub(crate) pex_id: Option<u8>,
+    /// The id for its `ut_holepunch` messages (BEP 55), if it has them.
+    pub(crate) holepunch_id: Option<u8>,
     /// The port it listens on (`p`).
     pub(crate) listen_port: Option<u16>,
     /// Our address as it sees us (`yourip`).
@@ -119,6 +129,11 @@ pub(crate) fn parse_extension_handshake(
     let pex_id = handshake
         .get(b"m")
         .and_then(|map| map.get_int(b"ut_pex"))
+        .and_then(|id| u8::try_from(id).ok())
+        .filter(|id| *id != 0);
+    let holepunch_id = handshake
+        .get(b"m")
+        .and_then(|map| map.get_int(b"ut_holepunch"))
         .and_then(|id| u8::try_from(id).ok())
         .filter(|id| *id != 0);
     let listen_port = handshake
@@ -149,6 +164,7 @@ pub(crate) fn parse_extension_handshake(
         message_id,
         size,
         pex_id,
+        holepunch_id,
         listen_port,
         your_ip,
         reqq,
