@@ -212,6 +212,8 @@ struct Inner {
     own_id: Mutex<NodeId>,
     /// Our external address, as other nodes report it.
     external: Mutex<crate::dht_id::ExternalIp>,
+    /// Addresses ignored for flooding us.
+    blocker: Mutex<Blocker>,
     table: Mutex<RoutingTable>,
     pending: Mutex<HashMap<[u8; 2], Pending>>,
     next_transaction: AtomicU16,
@@ -605,6 +607,7 @@ impl Inner {
             v6,
             own_id: Mutex::new(own_id),
             external: Mutex::new(crate::dht_id::ExternalIp::default()),
+            blocker: Mutex::new(Blocker::default()),
             table: Mutex::new(table),
             pending: Mutex::new(HashMap::new()),
             next_transaction: AtomicU16::new(u16::from_be_bytes([random_bytes::<1>()[0], 0])),
@@ -687,6 +690,14 @@ impl Inner {
                 // Each node takes its own family only.
                 let from = crate::net::canonical(from);
                 if from.is_ipv6() != self.v6 {
+                    return;
+                }
+                // Before any work: a flood costs us as little as possible.
+                if !self
+                    .blocker
+                    .lock()
+                    .is_ok_and(|mut blocker| blocker.allows(from.ip(), Instant::now()))
+                {
                     return;
                 }
                 let Ok(message) = bencode::decode(bytes) else {
@@ -1208,6 +1219,66 @@ impl Inner {
     }
 }
 
+/// Messages one address may send within [`BLOCK_WINDOW`] before it is
+/// ignored: libtorrent's `dht_block_ratelimit` of 5 a second.
+const BLOCK_RATE: u32 = 5 * 10;
+const BLOCK_WINDOW: Duration = Duration::from_secs(10);
+/// How long an address that sent too much is ignored
+/// (libtorrent's `dht_block_timeout`).
+const BLOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Addresses watched at once; the quietest make room for new ones.
+const BLOCK_WATCHED: usize = 20;
+
+/// Ignores addresses that flood us with messages, as libtorrent's
+/// `dos_blocker` does, so nobody can use us to waste their bandwidth or,
+/// faking the source address, make us send replies at a victim.
+#[derive(Debug, Default)]
+struct Blocker {
+    /// Each watched address, its messages this window, and when the
+    /// window (or its block) ends.
+    watched: Vec<(IpAddr, u32, Instant)>,
+}
+
+impl Blocker {
+    /// Whether to take a message from `from` now. This computer's own
+    /// nodes, several of which share the loopback address, are never
+    /// blocked.
+    fn allows(&mut self, from: IpAddr, now: Instant) -> bool {
+        if from.is_loopback() {
+            return true;
+        }
+        if let Some(entry) = self.watched.iter_mut().find(|(ip, _, _)| *ip == from) {
+            let (_, count, until) = entry;
+            *count = count.saturating_add(1);
+            if *count >= BLOCK_RATE {
+                if now < *until {
+                    // Too many within the window: blocked from now on.
+                    if *count == BLOCK_RATE {
+                        *until = now + BLOCK_TIMEOUT;
+                        tracing::debug!(target: "dht", "ignoring {from} for flooding us");
+                    }
+                    return false;
+                }
+                // Spread over longer than the window, or the block ended.
+                *count = 0;
+                *until = now + BLOCK_WINDOW;
+            }
+            return true;
+        }
+        let entry = (from, 1, now + BLOCK_WINDOW);
+        if self.watched.len() < BLOCK_WATCHED {
+            self.watched.push(entry);
+        } else if let Some(quietest) = self
+            .watched
+            .iter_mut()
+            .min_by_key(|(_, count, until)| (*count, *until))
+        {
+            *quietest = entry;
+        }
+        true
+    }
+}
+
 /// Saved state headers, for the IPv4 and the IPv6 node.
 const STATE_V4: &[u8; 6] = b"EBDHT1";
 const STATE_V6: &[u8; 6] = b"EBDHT6";
@@ -1528,6 +1599,85 @@ mod tests {
         assert!(joined >= 20, "only {joined} nodes after 30 s");
         let external = external.expect("no node said where it sees us");
         assert!(crate::dht_id::verify_node_id(&id, external));
+    }
+
+    #[test]
+    fn ignores_an_address_that_floods_it_as_libtorrent_does() {
+        let mut blocker = Blocker::default();
+        let start = Instant::now();
+        let flooder: IpAddr = "198.51.100.1".parse().unwrap();
+        let calm: IpAddr = "198.51.100.2".parse().unwrap();
+        // 49 messages within 10 s pass; the 50th, and all after, do not.
+        for _ in 1..BLOCK_RATE {
+            assert!(blocker.allows(flooder, start));
+        }
+        assert!(!blocker.allows(flooder, start));
+        assert!(!blocker.allows(flooder, start + Duration::from_secs(60)));
+        assert!(blocker.allows(calm, start), "others are not affected");
+        // Five minutes on, it is heard again.
+        assert!(blocker.allows(flooder, start + BLOCK_TIMEOUT + Duration::from_secs(1)));
+        // A steady 4 a second never trips it.
+        let mut blocker = Blocker::default();
+        for tick in 0..400 {
+            let at = start + Duration::from_millis(250 * tick);
+            assert!(blocker.allows(calm, at), "message {tick}");
+        }
+        // Many addresses: the quietest give way, and floods are still seen.
+        let mut blocker = Blocker::default();
+        for last in 0..100u8 {
+            blocker.allows(IpAddr::from([203, 0, 113, last]), start);
+        }
+        assert!(blocker.watched.len() <= BLOCK_WATCHED);
+        for _ in 1..BLOCK_RATE {
+            blocker.allows(flooder, start);
+        }
+        assert!(!blocker.allows(flooder, start));
+    }
+
+    #[test]
+    fn drops_messages_from_a_flooding_node_before_answering() {
+        // The flood has to come from an address other than loopback, which
+        // is never blocked; this host's own address on its network will do.
+        // Connecting a UDP socket sends nothing; it only picks the address
+        // packets would leave from.
+        let own = UdpSocket::bind("0.0.0.0:0")
+            .and_then(|probe| probe.connect("192.0.2.1:9").map(|()| probe))
+            .and_then(|probe| probe.local_addr())
+            .map(|address| address.ip())
+            .ok()
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+        let Some(own) = own else {
+            eprintln!("skipped: no non-loopback IPv4 address");
+            return;
+        };
+        let node = local_node(Vec::new());
+        let client = UdpSocket::bind((own, 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let ping = Value::dict([
+            (b"t", Value::bytes(*b"aa")),
+            (b"y", Value::bytes(*b"q")),
+            (b"q", Value::bytes(*b"ping")),
+            (b"a", Value::dict([(b"id", Value::bytes([1; 20]))])),
+        ])
+        .encode();
+        let target = (own, port_of(&node));
+        for _ in 0..BLOCK_RATE {
+            client.send_to(&ping, target).unwrap();
+        }
+        let mut buffer = [0; 512];
+        let mut answered = 0;
+        while client.recv(&mut buffer).is_ok() {
+            answered += 1;
+        }
+        assert_eq!(answered, BLOCK_RATE - 1, "the 50th within 10 s is dropped");
+        client.send_to(&ping, target).unwrap();
+        assert!(
+            client.recv(&mut buffer).is_err(),
+            "and so is everything after"
+        );
+        node.stop();
     }
 
     #[test]

@@ -287,7 +287,11 @@ connections it already has.
   but the node ID is new every start. Once other nodes agree on our
   external address, the ID is derived from it (BEP 42, as libtorrent
   does), and our replies tell other nodes theirs. Private torrents (BEP
-  27) stay off the DHT.
+  27) stay off the DHT. It only finds and announces peers: it stores
+  nothing but peer addresses (from their own IPs, limited and expiring),
+  not BEP 44's arbitrary data, and ignores an address that sends more
+  than 5 messages a second for 5 minutes, as libtorrent does, so it
+  cannot be used to flood anyone.
 - **Local peer discovery (BEP 14).** It announces on every network
   interface, so a VPN doesn't hide the LAN, and shares UDP port 6771 with
   other clients on the machine.
