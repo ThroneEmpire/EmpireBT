@@ -53,7 +53,8 @@ async function api(path, { method = "GET", body, raw } = {}) {
     headers["Content-Type"] = "application/json";
     payload = JSON.stringify(body);
   }
-  const response = await fetch(path, {
+  // Relative to the page, so a reverse proxy may serve it at any path.
+  const response = await fetch(path.replace(/^\//, ""), {
     method,
     headers,
     body: payload,
@@ -225,7 +226,7 @@ $("#logout-button").addEventListener("click", async () => {
 // first update on every connection is a full one.
 function follow() {
   if (ui.events) ui.events.close();
-  ui.events = new EventSource("/api/events");
+  ui.events = new EventSource("api/events");
   ui.events.addEventListener("update", (event) => apply(JSON.parse(event.data)));
   ui.events.addEventListener("error", async () => {
     try {

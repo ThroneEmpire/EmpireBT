@@ -141,6 +141,18 @@ torrents.example.com {
 }
 ```
 
+Or under a path of an existing site, with the path stripped before it
+reaches EmpireBT (the web UI asks for everything by relative paths):
+
+```
+example.com {
+    redir /torrents /torrents/
+    handle_path /torrents/* {
+        reverse_proxy empirebt:8080
+    }
+}
+```
+
 ## VPN
 
 `docker-compose.vpn.yml` runs EmpireBT through

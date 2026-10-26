@@ -177,7 +177,7 @@ fn refuses_everything_to_strangers() {
     assert_eq!(page.status, 200);
     assert!(
         page.body
-            .contains("<script type=\"module\" src=\"/app.js\">")
+            .contains("<script type=\"module\" src=\"app.js\">")
     );
     let csp = page.header("content-security-policy").unwrap();
     assert!(csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"));
@@ -228,6 +228,15 @@ fn refuses_everything_to_strangers() {
         );
     }
     assert_eq!(send(running.port, "GET", "/nothing", &[], b"").status, 404);
+
+    // The page asks for everything by relative paths, so a reverse proxy can
+    // serve it under a prefix such as /torrents/.
+    let page = send(running.port, "GET", "/", &[], b"").body;
+    let script = send(running.port, "GET", "/app.js", &[], b"").body;
+    for absolute in ["href=\"/", "src=\"/"] {
+        assert!(!page.contains(absolute), "the page has {absolute}");
+    }
+    assert!(!script.contains("EventSource(\"/"), "live updates by an absolute path");
 }
 
 #[test]

@@ -11,9 +11,11 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="EmpireBT">
   <title>EmpireBT</title>
-  <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/style.css">
-  <script type="module" src="/app.js"></script>
+  <!-- Relative, so the web UI works behind a reverse proxy at any path,
+       such as https://example.com/torrents/. -->
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
 </head>
 <body>
   <!-- Icons, drawn with the current text color. -->
@@ -39,7 +41,7 @@
 
   <main id="login" class="login" hidden>
     <form id="login-form" class="login-card">
-      <img src="/icon.svg" alt="" width="52" height="52" class="login-logo">
+      <img src="icon.svg" alt="" width="52" height="52" class="login-logo">
       <h1>EmpireBT</h1>
       <p class="muted login-sub">Sign in to continue</p>
       <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password" required autofocus>
@@ -51,7 +53,7 @@
 
   <div id="app" class="app" hidden>
     <header class="top">
-      <div class="brand"><img src="/icon.svg" alt="" width="26" height="26"> <span>EmpireBT</span></div>
+      <div class="brand"><img src="icon.svg" alt="" width="26" height="26"> <span>EmpireBT</span></div>
       <div class="rates">
         <span class="rate down" title="Download speed"><svg class="icon"><use href="#i-down"/></svg><span id="rate-down">0 B/s</span></span>
         <span class="rate up" title="Upload speed"><svg class="icon"><use href="#i-up"/></svg><span id="rate-up">0 B/s</span></span>
