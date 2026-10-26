@@ -60,7 +60,7 @@ for the right password.
 | `403` | Missing `X-EmpireBT`, a cross-site request, a locked setting, or a save folder outside the allowed ones |
 | `404` | No such torrent or endpoint |
 | `413` | Body too large |
-| `421` | Unknown host name (add it to `web.allowed_hosts`) |
+| `421` | Host name not in `web.allowed_hosts`, when that lists names |
 | `429` | Too many failed sign-ins |
 | `503` | Too many live-update streams open |
 

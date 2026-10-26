@@ -51,8 +51,8 @@ By default the web UI listens on `127.0.0.1:8080`, this computer only. To
 reach it from other devices set `web.address` (for example `0.0.0.0`):
 EmpireBT then serves **HTTPS only**, with your certificate
 (`web.tls_cert`, `web.tls_key`) or a generated one whose SHA-256
-fingerprint it prints so you can check it in the browser. Host names other
-than `localhost` and IP addresses must be listed in `web.allowed_hosts`.
+fingerprint it prints so you can check it in the browser. Any host name
+reaches it, unless you list names in `web.allowed_hosts`.
 
 What protects it:
 
@@ -62,8 +62,10 @@ What protects it:
   five-minute wait.
 - Session cookies are `HttpOnly` and `SameSite=Strict` (and `Secure` over
   HTTPS). Changes need a custom header and a matching `Origin`, so other
-  websites cannot act through your browser; unknown host names are refused,
-  which stops DNS rebinding.
+  websites cannot act through your browser. A site pointing its own name
+  at you (DNS rebinding) gets no further than the sign-in page, since your
+  session belongs to the name you signed in on. To refuse other names
+  entirely, list yours in `web.allowed_hosts`.
 - A strict Content Security Policy (no inline scripts), no framing, and
   data inserted as text only.
 - A browser session cannot reach the file system: torrents are added by
@@ -80,7 +82,7 @@ What protects it:
 | `web.port` | `8080` | Port |
 | `web.https` | `auto` | `auto` serves HTTPS on any address but loopback; `off` serves plain HTTP, only for use behind a reverse proxy that adds HTTPS (see [DOCKER.md](DOCKER.md#behind-a-reverse-proxy)) |
 | `web.tls_cert`, `web.tls_key` | empty | Your PEM certificate and key; empty makes one when needed |
-| `web.allowed_hosts` | empty | Extra host names (comma-separated) besides `localhost` and IP addresses |
+| `web.allowed_hosts` | empty | Optional: only these host names (comma-separated), besides `localhost` and IP addresses, reach the web UI; empty allows any, as qBittorrent's default does |
 
 None of these can be changed from the web UI itself. Change them with
 `empirebt config set`, in the dashboard (`c`), or in `config.toml`, then

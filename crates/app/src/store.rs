@@ -90,8 +90,9 @@ pub const WEB_SETTINGS: &[Setting] = &[
     Setting {
         key: "web.allowed_hosts",
         kind: SettingKind::Text,
-        description: "Extra host names the web UI answers to, comma-separated (for example \
-                      nas.local). Requests for other names are refused.",
+        description: "Optional: only these host names (comma-separated, for example \
+                      torrents.example.com), besides localhost and IP addresses, may reach \
+                      the web UI. Empty: any name works, as with qBittorrent's default.",
         needs_restart: true,
     },
 ];

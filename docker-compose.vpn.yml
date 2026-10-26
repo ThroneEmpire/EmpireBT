@@ -63,6 +63,5 @@ services:
       # Take peers on the port the VPN forwards, following it when it
       # changes. Until the file exists, EmpireBT uses 6881.
       EMPIREBT_NETWORK_PORT_FILE: "/forwarded/port"
-      EMPIREBT_WEB_ALLOWED_HOSTS: ""
       EMPIREBT_WEB_HTTPS: "auto"
     stop_grace_period: 30s

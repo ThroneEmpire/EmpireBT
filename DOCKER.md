@@ -36,9 +36,8 @@ Open the link. The web UI uses HTTPS with a certificate EmpireBT made for
 itself, so your browser warns you once. You can check that the fingerprint
 it shows matches the one in the logs, then continue.
 
-From another device, use the computer's IP address, for example
-`https://192.168.1.20:8080`. To use a name like `https://nas:8080`, add it
-to `EMPIREBT_WEB_ALLOWED_HOSTS` (see [Settings](#settings)).
+From another device, use the computer's IP address or its name, for
+example `https://192.168.1.20:8080` or `https://nas:8080`.
 
 **Create `data` and `downloads` before the first start.** If Docker creates
 them, they belong to root and EmpireBT can't write to them; the log then
@@ -98,7 +97,7 @@ Commonly set:
 
 | Variable | Example | Meaning |
 | --- | --- | --- |
-| `EMPIREBT_WEB_ALLOWED_HOSTS` | `nas,nas.local` | Names you reach the web UI by (IP addresses and `localhost` always work) |
+| `EMPIREBT_WEB_ALLOWED_HOSTS` | `torrents.example.com` | Optional: only these names (and IP addresses, `localhost`) reach the web UI; empty allows any |
 | `EMPIREBT_WEB_HTTPS` | `auto` or `off` | `off` only behind a reverse proxy (see below) |
 | `EMPIREBT_WEB_PASSWORD` | | Sets the web UI password on every start, instead of the generated one |
 | `EMPIREBT_WEB_PASSWORD_FILE` | `/run/secrets/empirebt_password` | The same, read from a file (a Docker secret) |
@@ -128,9 +127,9 @@ HTTPS to the proxy. Signing in is still required.
 
 - **Don't publish port 8080 to the internet with HTTPS off.** Passwords
   would cross the network in plain text. Only the proxy should reach it.
-- **The proxy must pass the original `Host` header,** and that name must be
-  in `EMPIREBT_WEB_ALLOWED_HOSTS`. Caddy and Traefik pass it by default;
-  nginx needs `proxy_set_header Host $host;`.
+- **Any domain works;** there is nothing to list. Proxies that pass the
+  original `Host` (Caddy and Traefik do by default) and ones that send
+  `X-Forwarded-Host` instead both work.
 - **Disable buffering for live updates,** which use Server-Sent Events. In
   nginx that's `proxy_buffering off;` for `/api/events`.
 
@@ -141,8 +140,6 @@ torrents.example.com {
     reverse_proxy empirebt:8080
 }
 ```
-
-with `EMPIREBT_WEB_ALLOWED_HOSTS: "torrents.example.com"`.
 
 ## VPN
 

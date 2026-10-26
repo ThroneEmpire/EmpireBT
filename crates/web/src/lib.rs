@@ -128,8 +128,12 @@ impl Web {
         let port = listener
             .local_addr()
             .map_or(settings.port, |local| local.port());
-        let mut hosts = vec!["localhost".to_owned()];
-        hosts.extend(settings.allowed_hosts.iter().cloned());
+        // Any name, unless names were listed.
+        let hosts = (!settings.allowed_hosts.is_empty()).then(|| {
+            let mut hosts = vec!["localhost".to_owned()];
+            hosts.extend(settings.allowed_hosts.iter().cloned());
+            hosts
+        });
         let (stop, stopped) = watch::channel(false);
         let state = Arc::new(api::WebState::new(
             engine,

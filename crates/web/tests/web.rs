@@ -204,10 +204,18 @@ fn refuses_everything_to_strangers() {
     assert_eq!(add.status, 401);
     assert!(running.engine.snapshot().torrents.is_empty());
 
-    // Another site's name pointed at us (DNS rebinding) is refused, even
-    // for the public page; names we were told about and addresses work.
+    // With web.allowed_hosts set, other names are refused, the page with
+    // the reason in words rather than a blank page; names we were told
+    // about and addresses work.
     let rebound = send(running.port, "GET", "/", &[("Host", "evil.example")], b"");
     assert_eq!(rebound.status, 421);
+    assert!(
+        rebound
+            .body
+            .contains("evil.example is not in web.allowed_hosts"),
+        "{}",
+        rebound.body
+    );
     assert!(
         rebound.header("content-security-policy").is_some(),
         "headers on errors too"
@@ -335,6 +343,33 @@ fn refuses_writes_from_other_sites() {
     );
     assert_eq!(foreign.status, 403);
     assert!(running.engine.snapshot().torrents.is_empty());
+    // Behind a proxy that does not pass Host on, the browser's name comes
+    // as X-Forwarded-Host, and its own requests still work; a forged one
+    // naming another site does not.
+    let proxied = |forwarded: &str| {
+        send(
+            running.port,
+            "POST",
+            "/api/torrents",
+            &[
+                ("Cookie", &cookie),
+                ("X-EmpireBT", "1"),
+                ("Origin", "https://nas.local"),
+                ("X-Forwarded-Host", forwarded),
+                ("Content-Type", "application/json"),
+            ],
+            body.as_bytes(),
+        )
+    };
+    assert_eq!(proxied("evil.example").status, 403);
+    assert_eq!(proxied("nas.local").status, 200);
+    browser(
+        &running,
+        &cookie,
+        "DELETE",
+        &format!("/api/torrents/{HASH}"),
+        "",
+    );
     assert_eq!(
         browser(&running, &cookie, "POST", "/api/torrents", &body).status,
         200
@@ -662,6 +697,17 @@ fn api_tokens_work_for_scripts_until_revoked() {
     let web = Web::start(running.engine.clone(), &running.store, settings).unwrap();
     running.port = web.url().rsplit(':').next().unwrap().parse().unwrap();
     running.web = Some(web);
+
+    // Without web.allowed_hosts, any name reaches the page, such as a
+    // reverse proxy's domain.
+    let page = send(
+        running.port,
+        "GET",
+        "/",
+        &[("Host", "torrents.example.com")],
+        b"",
+    );
+    assert_eq!(page.status, 200);
 
     let bearer = format!("Bearer {token}");
     // No cookie and no CSRF header: browsers never send this on their own.

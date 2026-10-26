@@ -1,9 +1,12 @@
 //! The web UI's HTTP interface: its JSON API, live updates, and the checks
 //! every request passes.
 //!
-//! Every request: its `Host` must be one we answer to (so other sites
-//! cannot reach us through DNS rebinding), and every response carries
-//! strict security headers. API requests other than signing in need a
+//! Every request: when `web.allowed_hosts` lists names, its `Host` must be
+//! one of them, an address, or `localhost`; and every response carries
+//! strict security headers. The list is optional: another site pointing
+//! its name at us (DNS rebinding) gets no further than the sign-in page,
+//! because session cookies belong to the name the user signed in on, and
+//! signing in is slowed for guessers. API requests other than signing in need a
 //! session cookie or an API token. Requests that change something and come
 //! with a cookie must also carry the `X-EmpireBT` header, which pages on
 //! other sites cannot add without our consent, and an `Origin` (when sent)
@@ -61,9 +64,10 @@ pub(crate) struct WebState {
     pub links: LoginLinks,
     pub guard: Guard,
     pub verifying: tokio::sync::Semaphore,
-    /// Host names (without port) requests may be addressed to, besides IP
-    /// addresses, lowercase.
-    pub hosts: Vec<String>,
+    /// Host names (without port, lowercase) requests may be addressed to,
+    /// besides IP addresses, when `web.allowed_hosts` lists any; `None`
+    /// allows every name.
+    pub hosts: Option<Vec<String>>,
     pub tls: bool,
     pub stop: watch::Receiver<bool>,
     pub streams: AtomicUsize,
@@ -73,7 +77,7 @@ impl WebState {
     pub fn new(
         engine: Handle,
         auth: AuthFile,
-        hosts: Vec<String>,
+        hosts: Option<Vec<String>>,
         tls: bool,
         stop: watch::Receiver<bool>,
     ) -> Self {
@@ -156,16 +160,29 @@ fn check(state: &WebState, request: &Request) -> Result<(), Response> {
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    // DNS rebinding needs a host name the attacker controls; an address
-    // cannot be one, so addresses are always fine.
+    // Addresses are always fine: no other site can own one.
     let name = host_name(host);
-    if name.parse::<std::net::IpAddr>().is_err() && !state.hosts.contains(&name) {
-        return Err(error(
-            StatusCode::MISDIRECTED_REQUEST,
-            "this host name is not one EmpireBT answers to; add it to web.allowed_hosts",
-        ));
-    }
     let path = request.uri().path();
+    if let Some(hosts) = &state.hosts
+        && name.parse::<std::net::IpAddr>().is_err()
+        && !hosts.contains(&name)
+    {
+        let message = format!(
+            "{name} is not in web.allowed_hosts, so EmpireBT does not answer to it. Add it \
+             there (EMPIREBT_WEB_ALLOWED_HOSTS in Docker), or empty the setting to allow \
+             any name."
+        );
+        // A person opening the page reads the reason, not a blank page.
+        if !path.starts_with("/api/") {
+            return Err((
+                StatusCode::MISDIRECTED_REQUEST,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                message,
+            )
+                .into_response());
+        }
+        return Err(error(StatusCode::MISDIRECTED_REQUEST, &message));
+    }
     let credential = credential(state, headers);
     let public = !path.starts_with("/api/") || path == "/api/login";
     if !public && credential == Credential::None {
@@ -181,7 +198,17 @@ fn check(state: &WebState, request: &Request) -> Result<(), Response> {
         if let Some(origin) = headers.get(header::ORIGIN) {
             let origin = origin.to_str().unwrap_or("");
             let origin_host = origin.split_once("://").map_or("", |(_, rest)| rest);
-            if !origin_host.eq_ignore_ascii_case(host) {
+            // Behind a reverse proxy that does not pass `Host` on, the name
+            // the browser used arrives as `X-Forwarded-Host`. Cross-site
+            // pages cannot send that, or `X-EmpireBT`, without our consent.
+            let forwarded = headers
+                .get("x-forwarded-host")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(str::trim);
+            if !origin_host.eq_ignore_ascii_case(host)
+                && !forwarded.is_some_and(|forwarded| origin_host.eq_ignore_ascii_case(forwarded))
+            {
                 return Err(error(StatusCode::FORBIDDEN, "cross-site request refused"));
             }
         }

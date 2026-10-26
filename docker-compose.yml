@@ -24,8 +24,8 @@ services:
       - ./downloads:/downloads  # downloaded files
     environment:
       # Any setting can be set as EMPIREBT_<SECTION>_<NAME>; see DOCKER.md.
-      # Host names you reach the web UI by, besides localhost and IP addresses:
-      EMPIREBT_WEB_ALLOWED_HOSTS: ""
+      # Optional: only these host names may reach the web UI (empty: any):
+      # EMPIREBT_WEB_ALLOWED_HOSTS: "torrents.example.com"
       # The web UI is HTTPS with a generated certificate (your browser asks
       # you to accept it once). Behind a reverse proxy that adds HTTPS,
       # set this to "off":
