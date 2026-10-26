@@ -175,6 +175,8 @@ pub struct TorrentView {
     pub peers: Option<usize>,
     /// Seeders and leechers reported by trackers.
     pub swarm: (Option<u64>, Option<u64>),
+    /// How many finished downloading it, from tracker scrapes.
+    pub completed: Option<u64>,
     /// Tracker announce state while seeding.
     pub announce: Option<AnnounceStatus>,
     pub error: Option<String>,

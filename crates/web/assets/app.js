@@ -786,8 +786,10 @@ function renderDetail(force) {
 
 function renderOverview(body, torrent) {
   const details = ui.details;
+  const completed = torrent.completed !== null && torrent.completed !== undefined
+    ? `, ${torrent.completed} completed` : "";
   const swarm = torrent.seeders !== null || torrent.leechers !== null
-    ? ` · swarm ${torrent.seeders ?? "?"} seeders, ${torrent.leechers ?? "?"} leechers` : "";
+    ? ` · swarm ${torrent.seeders ?? "?"} seeders, ${torrent.leechers ?? "?"} leechers${completed}` : "";
   const pieces = details && details.pieces
     ? `${details.verifiedPieces ?? "?"} / ${details.pieces} pieces` : "";
   const values = [

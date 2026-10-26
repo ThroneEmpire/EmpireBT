@@ -195,6 +195,7 @@ Each torrent:
   "peers": 38,
   "seeders": 1200,
   "leechers": 85,
+  "completed": 48210,
   "category": "ISOs",
   "tags": ["linux"],
   "error": null,
@@ -211,7 +212,8 @@ Each torrent:
 - **`size`** is `null` for a magnet link whose metadata hasn't arrived;
   `magnet` is then `true`.
 - **`seeders` and `leechers`** are the swarm size reported by trackers,
-  `null` when unknown.
+  from announces or, for paused torrents, scrapes; `null` when unknown.
+  **`completed`** is how many have finished downloading it, from scrapes.
 - **`savePath`** is the folder its files are in.
 
 ## Live updates

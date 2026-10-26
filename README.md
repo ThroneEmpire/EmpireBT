@@ -274,6 +274,10 @@ connections it already has.
   tracker, moving to the next if it fails (BEP 12, as qBittorrent does by
   default). A dead tracker never delays the others, and an unreachable
   tracker host is skipped for every torrent for a while.
+- **Swarm sizes for every torrent.** Trackers are scraped every 30
+  minutes (BEP 48 over HTTP, BEP 15 over UDP), many torrents per request,
+  so paused torrents and unresolved magnet links show their seeders and
+  leechers too, along with how many have completed the torrent.
 - **Honest counts for private trackers.** Trackers hear what this session
   uploaded and downloaded: data already on disk is never counted as
   downloaded, a finished download's uploads are not reported again once it

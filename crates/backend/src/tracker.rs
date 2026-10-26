@@ -724,6 +724,241 @@ fn http_announce_at(
     Ok(TrackerResponse::from_bencode(&response.body)?)
 }
 
+/// A torrent's swarm as a tracker counts it, from a scrape (BEP 48, and
+/// BEP 15 over UDP).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScrapeStats {
+    /// Peers with the whole torrent (`complete`).
+    pub seeders: u64,
+    /// Peers still downloading (`incomplete`).
+    pub leechers: u64,
+    /// Peers that ever finished it (`downloaded`).
+    pub downloaded: u64,
+}
+
+/// Torrents asked about in one scrape; trackers limit how many they
+/// answer, and the request URL grows with each.
+pub const MAX_SCRAPE_HASHES: usize = 32;
+
+/// The scrape URL BEP 48 derives from an announce URL: `announce` at the
+/// start of the last path segment becomes `scrape`, the rest (a `.php`, a
+/// passkey query) kept. `None` when the tracker cannot be scraped.
+pub fn scrape_url(announce: &str) -> Option<String> {
+    let (before_query, query) = match announce.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (announce, None),
+    };
+    let slash = before_query.rfind('/')?;
+    // Not the `//` after the scheme.
+    if before_query[..slash].ends_with(':') || before_query[..slash].ends_with('/') {
+        return None;
+    }
+    let last = &before_query[slash + 1..];
+    let rest = last.strip_prefix("announce")?;
+    let mut url = format!("{}/scrape{rest}", &before_query[..slash]);
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+    Some(url)
+}
+
+impl Tracker {
+    /// Whether this tracker can be scraped: any UDP tracker, an HTTP one
+    /// whose announce URL has a scrape URL.
+    pub fn supports_scrape(&self) -> bool {
+        self.url.starts_with("udp://")
+            || (is_http_url(&self.url) && scrape_url(&self.url).is_some())
+    }
+
+    /// Asks the tracker for the swarm counts of up to
+    /// [`MAX_SCRAPE_HASHES`] torrents at once, saying it is `user_agent`
+    /// over HTTP; returns the counts of those it knows.
+    pub fn scrape(
+        &self,
+        info_hashes: &[[u8; 20]],
+        user_agent: &str,
+        timeout: Duration,
+    ) -> Result<HashMap<[u8; 20], ScrapeStats>, crate::BackendError> {
+        let info_hashes = &info_hashes[..info_hashes.len().min(MAX_SCRAPE_HASHES)];
+        self.binding.check()?;
+        if let Some(wait) = health::retry_in(self.url()) {
+            return Err(tracker_error(format!(
+                "tracker was unreachable; retrying in {}s",
+                wait.as_secs().max(1)
+            )));
+        }
+        let result = if self.url.starts_with("udp://") {
+            scrape_udp(self, info_hashes, timeout)
+        } else {
+            scrape_http(self, info_hashes, user_agent, timeout)
+        };
+        match result {
+            Ok(stats) => {
+                health::record(self.url(), true);
+                Ok(stats)
+            }
+            Err(failure) => {
+                health::record(self.url(), !failure.unreachable);
+                Err(failure.error)
+            }
+        }
+    }
+}
+
+fn scrape_http(
+    tracker: &Tracker,
+    info_hashes: &[[u8; 20]],
+    user_agent: &str,
+    timeout: Duration,
+) -> Result<HashMap<[u8; 20], ScrapeStats>, Failure> {
+    let scrape =
+        scrape_url(tracker.url()).ok_or_else(|| tracker_error("this tracker cannot be scraped"))?;
+    let url = crate::http::Url::parse(&scrape, "scrape")
+        .map_err(|message| tracker_error(format!("tracker {message}")))?;
+    let separator = if url.path.contains('?') { '&' } else { '?' };
+    let hashes: Vec<String> = info_hashes
+        .iter()
+        .map(|hash| format!("info_hash={}", percent_encode(hash)))
+        .collect();
+    let target = format!("{}{separator}{}", url.path, hashes.join("&"));
+    let mut last = None;
+    for address in family_addresses(tracker, &format!("{}:{}", url.host, url.port))? {
+        let response = match crate::http::request_at(
+            address,
+            &url,
+            &target,
+            user_agent,
+            timeout,
+            MAX_HTTP_RESPONSE,
+            &tracker.binding,
+        ) {
+            Ok(response) => response,
+            Err(crate::http::Error::Unreachable(message)) => {
+                last = Some(unreachable(message));
+                continue;
+            }
+            Err(crate::http::Error::Invalid(message)) => return Err(tracker_error(message).into()),
+        };
+        if response.status != 200 {
+            return Err(tracker_error(format!(
+                "tracker returned HTTP status {}",
+                response.status_text
+            ))
+            .into());
+        }
+        return parse_scrape(&response.body).map_err(Failure::from);
+    }
+    Err(last.unwrap_or_else(|| unreachable("tracker could not be reached")))
+}
+
+/// A BEP 48 scrape response: `files`, each torrent's hash to its counts.
+fn parse_scrape(body: &[u8]) -> Result<HashMap<[u8; 20], ScrapeStats>, crate::BackendError> {
+    let response = crate::bencode::decode(body)?;
+    if let Some(reason) = response.get_bytes(b"failure reason") {
+        return Err(tracker_error(format!(
+            "tracker refused the scrape: {}",
+            String::from_utf8_lossy(reason)
+        )));
+    }
+    let Some(crate::bencode::Value::Dict(files)) = response.get(b"files") else {
+        return Err(tracker_error("scrape response has no files"));
+    };
+    let count = |file: &crate::bencode::Value, key: &[u8]| {
+        file.get_int(key)
+            .and_then(|count| u64::try_from(count).ok())
+            .unwrap_or(0)
+    };
+    Ok(files
+        .iter()
+        .filter_map(|(hash, file)| {
+            let hash = <[u8; 20]>::try_from(hash.as_slice()).ok()?;
+            Some((
+                hash,
+                ScrapeStats {
+                    seeders: count(file, b"complete"),
+                    leechers: count(file, b"incomplete"),
+                    downloaded: count(file, b"downloaded"),
+                },
+            ))
+        })
+        .collect())
+}
+
+/// A BEP 15 scrape: connect, then action 2 with the hashes; the answer
+/// lists seeders, completed and leechers for each, in the order asked.
+fn scrape_udp(
+    tracker: &Tracker,
+    info_hashes: &[[u8; 20]],
+    timeout: Duration,
+) -> Result<HashMap<[u8; 20], ScrapeStats>, Failure> {
+    let (host, port) = parse_udp_url(tracker.url())?;
+    let mut last = None;
+    for address in family_addresses(tracker, &format!("{host}:{port}"))? {
+        match scrape_udp_at(tracker, address, info_hashes, timeout) {
+            Ok(stats) => return Ok(stats),
+            Err(failure) if failure.unreachable => last = Some(failure),
+            Err(failure) => return Err(failure),
+        }
+    }
+    Err(last.unwrap_or_else(|| unreachable("tracker could not be reached")))
+}
+
+fn scrape_udp_at(
+    tracker: &Tracker,
+    address: SocketAddr,
+    info_hashes: &[[u8; 20]],
+    timeout: Duration,
+) -> Result<HashMap<[u8; 20], ScrapeStats>, Failure> {
+    let socket = tracker
+        .binding
+        .udp_for(address)
+        .map_err(|error| unreachable(error.to_string()))?;
+    socket
+        .connect(address)
+        .map_err(|error| unreachable(error.to_string()))?;
+    let attempt_timeout = (timeout / UDP_ATTEMPTS).max(Duration::from_secs(1));
+    socket
+        .set_read_timeout(Some(attempt_timeout))
+        .map_err(|error| tracker_error(error.to_string()))?;
+    let transaction = transaction_id();
+    let mut connect = Vec::with_capacity(16);
+    connect.extend(0x41727101980_u64.to_be_bytes());
+    connect.extend(0_u32.to_be_bytes());
+    connect.extend(transaction.to_be_bytes());
+    let response = udp_exchange(&socket, &connect, 0, transaction, 16)?;
+    let transaction = transaction_id().wrapping_add(1);
+    let mut scrape = response[8..16].to_vec();
+    scrape.extend(2_u32.to_be_bytes());
+    scrape.extend(transaction.to_be_bytes());
+    for hash in info_hashes {
+        scrape.extend(hash);
+    }
+    let response = udp_exchange(&socket, &scrape, 2, transaction, 8)?;
+    Ok(info_hashes
+        .iter()
+        .zip(response[8..].as_chunks::<12>().0)
+        .map(|(hash, counts)| {
+            let read = |at: usize| {
+                u64::from(u32::from_be_bytes([
+                    counts[at],
+                    counts[at + 1],
+                    counts[at + 2],
+                    counts[at + 3],
+                ]))
+            };
+            (
+                *hash,
+                ScrapeStats {
+                    seeders: read(0),
+                    downloaded: read(4),
+                    leechers: read(8),
+                },
+            )
+        })
+        .collect())
+}
+
 fn tracker_error(message: impl Into<String>) -> crate::BackendError {
     crate::BackendError::Tracker(message.into())
 }
@@ -1031,6 +1266,146 @@ mod tests {
     }
 
     #[test]
+    fn derives_scrape_urls_as_bep_48_says() {
+        let examples = [
+            (
+                "http://example.com/announce",
+                Some("http://example.com/scrape"),
+            ),
+            (
+                "http://example.com/x/announce",
+                Some("http://example.com/x/scrape"),
+            ),
+            (
+                "http://example.com/announce.php",
+                Some("http://example.com/scrape.php"),
+            ),
+            ("http://example.com/a", None),
+            (
+                "http://example.com/announce?x2%0644",
+                Some("http://example.com/scrape?x2%0644"),
+            ),
+            (
+                "http://example.com/announce?x=2/4",
+                Some("http://example.com/scrape?x=2/4"),
+            ),
+            ("http://example.com/x%064announce", None),
+            ("http://example.com", None),
+            // A private tracker's passkey stays.
+            (
+                "https://tracker.example/abc123/announce",
+                Some("https://tracker.example/abc123/scrape"),
+            ),
+        ];
+        for (announce, scrape) in examples {
+            assert_eq!(scrape_url(announce).as_deref(), scrape, "{announce}");
+        }
+        assert!(
+            Tracker::new("udp://tracker.example:6969")
+                .unwrap()
+                .supports_scrape()
+        );
+        assert!(
+            !Tracker::new("http://example.com/a")
+                .unwrap()
+                .supports_scrape()
+        );
+    }
+
+    #[test]
+    fn scrapes_http_trackers_for_several_torrents_at_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/announce?passkey=k",
+            listener.local_addr().unwrap()
+        );
+        let (sender, asked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let size = stream.read(&mut request).unwrap();
+            let _ = sender.send(String::from_utf8_lossy(&request[..size]).into_owned());
+            let mut body = b"d5:filesd20:".to_vec();
+            body.extend([1; 20]);
+            body.extend(b"d8:completei5e10:downloadedi50e10:incompletei7ee20:");
+            body.extend([2; 20]);
+            body.extend(b"d8:completei0e10:downloadedi1e10:incompletei2eeee");
+            let _ = stream.write_all(&[b"HTTP/1.0 200 OK\r\n\r\n".as_slice(), &body].concat());
+        });
+        let tracker = Tracker::new(url).unwrap();
+        let stats = tracker
+            .scrape(
+                &[[1; 20], [2; 20], [3; 20]],
+                crate::USER_AGENT,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let request = asked.recv().unwrap();
+        assert!(
+            request.starts_with("GET /scrape?passkey=k&info_hash=%01%01"),
+            "{request}"
+        );
+        assert_eq!(request.matches("info_hash=").count(), 3);
+        assert_eq!(
+            stats[&[1; 20]],
+            ScrapeStats {
+                seeders: 5,
+                leechers: 7,
+                downloaded: 50
+            }
+        );
+        assert_eq!(stats[&[2; 20]].leechers, 2);
+        assert!(!stats.contains_key(&[3; 20]), "one it does not know");
+    }
+
+    #[test]
+    fn scrapes_udp_trackers_as_bep_15_says() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let url = format!("udp://{}", socket.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut buffer = [0; 1024];
+            // Connect.
+            let (length, from) = socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(length, 16);
+            let mut reply = 0_u32.to_be_bytes().to_vec();
+            reply.extend(&buffer[12..16]);
+            reply.extend(42_u64.to_be_bytes());
+            socket.send_to(&reply, from).unwrap();
+            // Scrape: connection id, action 2, transaction, two hashes.
+            let (length, from) = socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(length, 16 + 2 * 20);
+            assert_eq!(&buffer[..8], &42_u64.to_be_bytes());
+            assert_eq!(&buffer[8..12], &2_u32.to_be_bytes());
+            let mut reply = 2_u32.to_be_bytes().to_vec();
+            reply.extend(&buffer[12..16]);
+            for (seeders, completed, leechers) in [(9_u32, 90_u32, 4_u32), (1, 2, 3)] {
+                reply.extend(seeders.to_be_bytes());
+                reply.extend(completed.to_be_bytes());
+                reply.extend(leechers.to_be_bytes());
+            }
+            socket.send_to(&reply, from).unwrap();
+        });
+        let stats = Tracker::new(url)
+            .unwrap()
+            .scrape(
+                &[[1; 20], [2; 20]],
+                crate::USER_AGENT,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(
+            stats[&[1; 20]],
+            ScrapeStats {
+                seeders: 9,
+                leechers: 4,
+                downloaded: 90
+            }
+        );
+        assert_eq!(stats[&[2; 20]].downloaded, 2);
+    }
+
+    #[test]
     fn deduplicates_tracker_urls() {
         let client = TrackerClient::from_urls(vec![
             "http://tracker.example/a".to_owned(),
@@ -1207,6 +1582,7 @@ d8:intervali60e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
         assert_eq!(response.peers(), &["127.0.0.1:6881".parse().unwrap()]);
     }
 }
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

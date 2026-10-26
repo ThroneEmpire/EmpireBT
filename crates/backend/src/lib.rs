@@ -70,7 +70,10 @@ pub use session::DownloadSession;
 pub use storage::{Deleted, Renames, Storage, delete_files};
 pub use swarm::PeerInfo;
 pub use torrent::{ContentLayout, Torrent, TorrentFileName};
-pub use tracker::{AnnounceEvent, AnnounceRequest, Tracker, TrackerClient, TrackerResponse};
+pub use tracker::{
+    AnnounceEvent, AnnounceRequest, MAX_SCRAPE_HASHES, ScrapeStats, Tracker, TrackerClient,
+    TrackerResponse, scrape_url,
+};
 pub use transfer::TransferState;
 pub use utp::{UtpMode, UtpSocket, UtpStream};
 pub use v2::verify_hashes_response;

@@ -37,6 +37,19 @@ const VERIFY_BUDGET: Duration = Duration::from_millis(40);
 const SEED_RETRY: Duration = Duration::from_secs(10);
 /// How long one request may take when downloading a `.torrent` from a URL.
 const TORRENT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often every torrent's trackers are scraped for swarm counts, as
+/// libtorrent's `auto_scrape_interval`.
+const SCRAPE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// The first scrape waits for the first announces.
+const FIRST_SCRAPE: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(60)
+};
+/// Scrape requests in flight at once.
+const SCRAPE_WORKERS: usize = 8;
+const SCRAPE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How often `network.port_file` is checked for a new port.
 const PORT_FILE_POLL: Duration = Duration::from_secs(5);
 
@@ -468,6 +481,14 @@ struct Settings {
     binding: empirebt_backend::Binding,
 }
 
+/// Torrents scraped in one request: the tracker, the User-Agent, and each
+/// torrent with the hash the tracker knows it by.
+type ScrapeBatch = (String, &'static str, Vec<ScrapedAs>);
+
+/// A torrent, and the hash its tracker knows it by (a v2 torrent's is its
+/// truncated v2 hash).
+type ScrapedAs = (InfoHash, [u8; 20]);
+
 /// A removed torrent's files, deleted once `job` (its transfer, if it had
 /// one) has stopped.
 struct Deletion {
@@ -698,6 +719,11 @@ struct Engine {
     labels: Labels,
     geoip: crate::geoip::GeoIp,
     last_port_check: Instant,
+    /// Swarm counts from the latest tracker scrapes.
+    scrapes: HashMap<InfoHash, empirebt_backend::ScrapeStats>,
+    next_scrape: Instant,
+    /// The scrape round running in the background, if one is.
+    scraping: Option<JoinHandle<Vec<(InfoHash, empirebt_backend::ScrapeStats)>>>,
     /// The last problem reported with `network.port_file`, so it is
     /// reported once.
     port_file_problem: Option<String>,
@@ -786,6 +812,9 @@ impl Engine {
             labels: Labels::default(),
             geoip: crate::geoip::GeoIp::default(),
             last_port_check: Instant::now(),
+            scrapes: HashMap::new(),
+            next_scrape: Instant::now() + FIRST_SCRAPE,
+            scraping: None,
             port_file_problem: None,
             restart_after_rebind: Vec::new(),
             logged_seeding: None,
@@ -1145,6 +1174,12 @@ impl Engine {
             }
             _ => (None, None),
         };
+        // Announces are fresher; scrapes cover the rest, paused ones too.
+        let scraped = self.scrapes.get(&hash);
+        let swarm = (
+            swarm.0.or(scraped.map(|stats| stats.seeders)),
+            swarm.1.or(scraped.map(|stats| stats.leechers)),
+        );
         let error = activity.and_then(|activity| {
             activity.error.clone().or_else(|| {
                 activity
@@ -1179,6 +1214,7 @@ impl Engine {
                 .then(|| progress.map(TransferProgress::active_peers))
                 .flatten(),
             swarm,
+            completed: scraped.map(|stats| stats.downloaded),
             announce: announce.filter(|_| seeding),
             error,
             category: self
@@ -1225,6 +1261,7 @@ impl Engine {
             );
         }
         self.restart_rebound_downloads();
+        self.scrape_trackers();
         if self.last_port_check.elapsed() >= PORT_FILE_POLL {
             self.last_port_check = Instant::now();
             self.follow_port_file();
@@ -1785,6 +1822,101 @@ impl Engine {
         Ok(Reply::Done)
     }
 
+    /// Takes in a finished scrape round, and starts the next when due:
+    /// every torrent with trackers, through the first of them that can be
+    /// scraped, many torrents per request (BEP 48, BEP 15), in the
+    /// background.
+    fn scrape_trackers(&mut self) {
+        if self.scraping.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(round) = self.scraping.take()
+            && let Ok(results) = round.join()
+        {
+            self.scrapes.extend(results);
+        }
+        if self.scraping.is_some() || Instant::now() < self.next_scrape {
+            return;
+        }
+        self.next_scrape = Instant::now() + SCRAPE_INTERVAL;
+        // Torrents by the tracker that answers for them and the
+        // User-Agent to say: anonymous mode hides it for public ones.
+        let mut groups: HashMap<(String, &'static str), Vec<ScrapedAs>> = HashMap::new();
+        for torrent in self.client.torrents() {
+            let Some(hash) = torrent.info_hash().copied() else {
+                continue;
+            };
+            let (urls, scraped_as, private): (Vec<String>, [u8; 20], bool) =
+                match (torrent.info(), torrent.magnet()) {
+                    (Some(info), _) => (
+                        info.tracker_tiers().iter().flatten().cloned().collect(),
+                        info.swarm_hashes()[0],
+                        info.is_private(),
+                    ),
+                    (None, Some(link)) => (link.trackers().to_vec(), hash, false),
+                    (None, None) => continue,
+                };
+            let Some(url) = urls.into_iter().find(|url| {
+                empirebt_backend::Tracker::new(url.as_str())
+                    .is_ok_and(|tracker| tracker.supports_scrape())
+            }) else {
+                continue;
+            };
+            let user_agent = if self.settings.anonymous && !private {
+                empirebt_backend::ANONYMOUS_USER_AGENT
+            } else {
+                empirebt_backend::USER_AGENT
+            };
+            groups
+                .entry((url, user_agent))
+                .or_default()
+                .push((hash, scraped_as));
+        }
+        if groups.is_empty() {
+            return;
+        }
+        let batches: Vec<ScrapeBatch> = groups
+            .into_iter()
+            .flat_map(|((url, user_agent), torrents)| {
+                torrents
+                    .chunks(empirebt_backend::MAX_SCRAPE_HASHES)
+                    .map(|chunk| (url.clone(), user_agent, chunk.to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let binding = self.settings.binding.clone();
+        self.scraping = Some(std::thread::spawn(move || {
+            let results = Mutex::new(Vec::new());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..SCRAPE_WORKERS.min(batches.len()) {
+                    scope.spawn(|| {
+                        while let Some((url, user_agent, torrents)) =
+                            batches.get(next.fetch_add(1, Ordering::Relaxed))
+                        {
+                            let Ok(client) =
+                                empirebt_backend::TrackerClient::from_urls([url.clone()])
+                            else {
+                                continue;
+                            };
+                            let client = client.with_binding(&binding);
+                            let hashes: Vec<[u8; 20]> =
+                                torrents.iter().map(|(_, scraped_as)| *scraped_as).collect();
+                            let Ok(stats) =
+                                client.trackers()[0].scrape(&hashes, user_agent, SCRAPE_TIMEOUT)
+                            else {
+                                continue;
+                            };
+                            let found = torrents.iter().filter_map(|(hash, scraped_as)| {
+                                stats.get(scraped_as).map(|stats| (*hash, *stats))
+                            });
+                            lock(&results).extend(found);
+                        }
+                    });
+                }
+            });
+            results.into_inner().unwrap_or_default()
+        }));
+    }
+
     /// Removes a torrent; with `delete_files`, its files are deleted once
     /// its transfer has stopped writing (see
     /// [`Engine::delete_removed_files`]).
@@ -1801,6 +1933,7 @@ impl Engine {
             job.cancel();
         }
         self.verify_queue.retain(|queued| *queued != hash);
+        self.scrapes.remove(&hash);
         let Ok(torrent) = self.client.remove_torrent(index) else {
             return;
         };
@@ -2748,6 +2881,49 @@ mod tests {
                 .any(|notice| notice.text == "test-4 is not running; start it to announce it")
         );
         assert!(handle.call(Command::Reannounce([0; 20])).is_err());
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scrapes_trackers_for_paused_torrents_too() {
+        use std::io::{Read, Write};
+        let (handle, root) = engine("scrape");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let announce = format!("http://{}/announce", listener.local_addr().unwrap());
+        let mut torrent = format!("d8:announce{}:{announce}4:infod6:lengthi5e4:name9:hello.txt12:piece lengthi16384e6:pieces20:", announce.len()).into_bytes();
+        torrent.extend([7; 20]);
+        torrent.extend(b"ee");
+        let hash = *TorrentInfo::from_bytes(&torrent).unwrap().info_hash();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0; 2048];
+                let size = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..size]).into_owned();
+                if !request.starts_with("GET /scrape?") {
+                    continue;
+                }
+                let mut body = b"d5:filesd20:".to_vec();
+                body.extend(hash);
+                body.extend(b"d8:completei12e10:downloadedi345e10:incompletei6eeee");
+                let _ = stream.write_all(&[b"HTTP/1.0 200 OK\r\n\r\n".as_slice(), &body].concat());
+            }
+        });
+        let mut request = AddRequest::new(AddSource::Torrent(torrent));
+        request.start = Some(false);
+        handle.call(Command::AddWith(request)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let view = loop {
+            let snapshot = handle.snapshot();
+            let view = snapshot.torrent(&hash).unwrap().clone();
+            if view.completed.is_some() || Instant::now() > deadline {
+                break view;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(view.status, Status::Paused);
+        assert_eq!(view.swarm, (Some(12), Some(6)));
+        assert_eq!(view.completed, Some(345));
         handle.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

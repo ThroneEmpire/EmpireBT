@@ -857,10 +857,13 @@ fn draw_peers(frame: &mut Frame, app: &App, area: Rect) {
 
 fn peer_summary(row: &RowView) -> String {
     let connected = row.peers.map(|peers| format!("{peers} connected"));
+    let completed = row
+        .completed
+        .map_or(String::new(), |count| format!(", {count} completed"));
     let swarm = match row.swarm {
         (None, None) => None,
         (seeders, leechers) => Some(format!(
-            "swarm {} seeders, {} leechers",
+            "swarm {} seeders, {} leechers{completed}",
             seeders.map_or("?".to_owned(), |count| count.to_string()),
             leechers.map_or("?".to_owned(), |count| count.to_string()),
         )),
