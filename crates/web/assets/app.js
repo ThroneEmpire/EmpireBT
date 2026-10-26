@@ -1419,6 +1419,7 @@ function settingsDialog() {
     appearanceSection(),
     element("h3", { class: "settings-heading", text: "EmpireBT" }),
     ...rows,
+    aboutSection(),
   ])],
     [cancelButton(), element("button", { class: "primary", text: "Save changes", attrs: { type: "submit" } })]);
   form.classList.add("wide");
@@ -1431,6 +1432,22 @@ function settingsDialog() {
       }
     }
   }));
+}
+
+// Who made EmpireBT and under which license (the GPL's "Appropriate Legal
+// Notices"): versions others make must keep showing it.
+function aboutSection() {
+  const about = ui.lists.about;
+  if (!about) return null;
+  return element("div", { class: "about" }, [
+    element("h3", { class: "settings-heading", text: "About" }),
+    element("p", { text: `EmpireBT ${about.version} · ${about.copyright}` }),
+    element("p", { class: "muted", text: about.license }),
+    element("p", { class: "muted" }, [
+      element("span", { text: "Source: " }),
+      element("a", { text: about.source.replace(/^https:\/\//, ""), attrs: { href: about.source, target: "_blank", rel: "noopener noreferrer" } }),
+    ]),
+  ]);
 }
 
 // ----- appearance ----------------------------------------------------------------------

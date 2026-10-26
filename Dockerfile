@@ -23,6 +23,10 @@ RUN mkdir -p /out/data /out/downloads && chmod 0777 /out/data /out/downloads
 
 # ---- run ---------------------------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot
+LABEL org.opencontainers.image.title="EmpireBT" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      org.opencontainers.image.authors="ThroneEmpire" \
+      org.opencontainers.image.source="https://github.com/ThroneEmpire/EmpireBT"
 
 COPY --from=build /out/ /
 

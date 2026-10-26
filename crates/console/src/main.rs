@@ -27,6 +27,15 @@ const PASSWORD_FILE_VARIABLE: &str = "EMPIREBT_WEB_PASSWORD_FILE";
 #[command(
     name = "empirebt",
     version,
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\nCopyright (C) 2026 ThroneEmpire\n",
+        "License GPL-3.0-or-later: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.\n",
+        "This is free software: you are free to change and redistribute it.\n",
+        "There is NO WARRANTY, to the extent permitted by law.\n",
+        "Source: ",
+        env!("CARGO_PKG_REPOSITORY")
+    ),
     about = "A BitTorrent client for the terminal",
     long_about = "A BitTorrent client for the terminal.\n\nRun without a command to open the \
                   interactive dashboard. Your torrent list is saved between runs."

@@ -509,6 +509,12 @@ fn lists_json(snapshot: &Snapshot) -> serde_json::Value {
         })
         .collect();
     json!({
+        "about": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "copyright": empirebt_app::COPYRIGHT,
+            "license": empirebt_app::LICENSE_NOTICE,
+            "source": empirebt_app::SOURCE,
+        },
         "categories": snapshot.categories,
         "tags": snapshot.tags,
         "settings": settings,

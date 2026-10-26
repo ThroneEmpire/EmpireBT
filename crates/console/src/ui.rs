@@ -1720,6 +1720,23 @@ fn draw_help(frame: &mut Frame, app: &App) {
             Span::raw(web.url.clone()),
         ]));
     }
+    // Who made it and its license (the GPL's "Appropriate Legal Notices").
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("EmpireBT {}  ", env!("CARGO_PKG_VERSION")),
+            Style::new().bold(),
+        ),
+        Span::raw(empirebt_app::COPYRIGHT),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "Free software under the GPL, version 3 or later; no warranty.",
+        Style::new().fg(MUTED),
+    )));
+    lines.push(Line::from(Span::styled(
+        empirebt_app::SOURCE.trim_start_matches("https://"),
+        Style::new().fg(MUTED),
+    )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Press any key to close",

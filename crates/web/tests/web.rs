@@ -236,7 +236,10 @@ fn refuses_everything_to_strangers() {
     for absolute in ["href=\"/", "src=\"/"] {
         assert!(!page.contains(absolute), "the page has {absolute}");
     }
-    assert!(!script.contains("EventSource(\"/"), "live updates by an absolute path");
+    assert!(
+        !script.contains("EventSource(\"/"),
+        "live updates by an absolute path"
+    );
 }
 
 #[test]
@@ -619,6 +622,15 @@ fn a_signed_in_browser_drives_the_engine() {
     );
 
     let state = browser(&running, &cookie, "GET", "/api/state", "").json();
+    // Who made it and its license, for the About section.
+    assert_eq!(
+        state["lists"]["about"]["copyright"],
+        "Copyright (C) 2026 ThroneEmpire"
+    );
+    assert_eq!(
+        state["lists"]["about"]["source"],
+        "https://github.com/ThroneEmpire/EmpireBT"
+    );
     let torrents = state["torrents"].as_array().unwrap();
     assert_eq!(torrents.len(), 2);
     let ours = torrents

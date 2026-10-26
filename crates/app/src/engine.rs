@@ -293,6 +293,14 @@ impl Handle {
         let on_off = |on: bool| if on { "on" } else { "off" };
         tracing::info!(
             target: "engine",
+            "EmpireBT {}, {}; {} Source: {}",
+            env!("CARGO_PKG_VERSION"),
+            crate::COPYRIGHT,
+            crate::LICENSE_NOTICE,
+            crate::SOURCE
+        );
+        tracing::info!(
+            target: "engine",
             "EmpireBT {} starting: data in {}, downloads to {}, peers on port {}{}; DHT {}, uTP {}, \
              local discovery {}; {} torrents",
             env!("CARGO_PKG_VERSION"),

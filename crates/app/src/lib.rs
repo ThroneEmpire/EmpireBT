@@ -18,6 +18,15 @@ pub mod store;
 pub use empirebt_backend::ContentLayout;
 pub use engine::{AddRequest, AddSource, Command, Failure, Handle, Reply};
 pub use geoip::ATTRIBUTION as GEOIP_ATTRIBUTION;
+
+/// The program's copyright notice, shown in its interfaces (the GPL's
+/// "Appropriate Legal Notices"): versions others make must keep it.
+pub const COPYRIGHT: &str = "Copyright (C) 2026 ThroneEmpire";
+/// Its license, and that it comes with no warranty.
+pub const LICENSE_NOTICE: &str = "Free software under the GNU General Public License, version 3 or \
+                                   later, with no warranty.";
+/// Where its source is.
+pub const SOURCE: &str = env!("CARGO_PKG_REPOSITORY");
 pub use labels::{MAX_NAME, clean_name};
 pub use snapshot::{
     DhtState, FileView, Level, Network, Notice, PeerView, RateMeter, SeedStatus, SettingView,

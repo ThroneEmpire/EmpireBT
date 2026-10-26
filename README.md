@@ -445,3 +445,17 @@ See [TESTING.md](TESTING.md) for how testing works, and
 - **Tested on Linux.** macOS and Windows builds are not regularly tested.
 
 The detailed roadmap is in [CHECKLIST.md](CHECKLIST.md).
+
+## License
+
+Copyright (C) 2026 ThroneEmpire
+
+EmpireBT is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version. It is distributed in the hope that it will be useful,
+but without any warranty; see [LICENSE](LICENSE) for the full terms.
+
+The country database it downloads is DB-IP's IP to Country Lite, under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); the web UI and
+dashboard credit it.

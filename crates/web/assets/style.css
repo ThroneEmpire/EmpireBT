@@ -586,6 +586,8 @@ input[type="file"]::file-selector-button {
 .custom-color input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; border: none; padding: 0; }
 .appearance .note { font-size: 12px; color: var(--faint); }
 .settings-heading { padding-top: 16px; }
+.about p { margin: 4px 0; }
+.about a { color: var(--accent); text-decoration: underline; }
 
 /* Switches for on/off settings. */
 .setting input[type="checkbox"],
