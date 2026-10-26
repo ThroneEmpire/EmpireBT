@@ -131,6 +131,19 @@ impl RoutingTable {
         nodes
     }
 
+    /// Rebuilds the table around a new own ID, keeping every node.
+    fn rekey(&mut self, own_id: NodeId) {
+        let nodes: Vec<Node> = self.buckets.drain(..).flatten().collect();
+        *self = Self::new(own_id);
+        for node in nodes {
+            if let Some(index) = self.bucket_index(&node.id)
+                && self.buckets[index].len() < BUCKET_SIZE
+            {
+                self.buckets[index].push(node);
+            }
+        }
+    }
+
     fn len(&self) -> usize {
         self.buckets.iter().map(Vec::len).sum()
     }
@@ -194,7 +207,11 @@ struct Inner {
     socket: UdpSocket,
     /// Whether this is the IPv6 node.
     v6: bool,
-    own_id: NodeId,
+    /// Random until our external address is known, then derived from it
+    /// (BEP 42); see [`crate::dht_id`].
+    own_id: Mutex<NodeId>,
+    /// Our external address, as other nodes report it.
+    external: Mutex<crate::dht_id::ExternalIp>,
     table: Mutex<RoutingTable>,
     pending: Mutex<HashMap<[u8; 2], Pending>>,
     next_transaction: AtomicU16,
@@ -586,7 +603,8 @@ impl Inner {
         Self {
             socket,
             v6,
-            own_id,
+            own_id: Mutex::new(own_id),
+            external: Mutex::new(crate::dht_id::ExternalIp::default()),
             table: Mutex::new(table),
             pending: Mutex::new(HashMap::new()),
             next_transaction: AtomicU16::new(u16::from_be_bytes([random_bytes::<1>()[0], 0])),
@@ -604,6 +622,48 @@ impl Inner {
             utp: std::sync::OnceLock::new(),
             anonymous: AtomicBool::new(false),
         }
+    }
+
+    fn own_id(&self) -> NodeId {
+        *self
+            .own_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Takes in the address a node says it sees us at (BEP 42 `ip`). Once
+    /// enough nodes agree on a new one, our ID moves to one derived from
+    /// it, as libtorrent's does.
+    fn note_external(&self, compact: &[u8], voter: SocketAddr) {
+        let Some(ip) =
+            parse_compact_peer(compact).map(|address| crate::net::canonical(address).ip())
+        else {
+            return;
+        };
+        let changed = self
+            .external
+            .lock()
+            .ok()
+            .and_then(|mut external| external.vote(ip, voter.ip()));
+        let Some(ip) = changed else {
+            return;
+        };
+        if crate::dht_id::verify_node_id(&self.own_id(), ip) {
+            return;
+        }
+        let [r] = random_bytes::<1>();
+        let id = crate::dht_id::secure_node_id(ip, r, random_bytes());
+        if let Ok(mut table) = self.table.lock() {
+            table.rekey(id);
+        }
+        *self
+            .own_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = id;
+        tracing::debug!(
+            target: "dht",
+            "external address is now {ip}; new node ID (BEP 42)"
+        );
     }
 
     /// The key nodes are exchanged under: `nodes`, or `nodes6` (BEP 32).
@@ -663,6 +723,9 @@ impl Inner {
             Err(_) => None,
         };
         let Some(pending) = pending else { return };
+        if let Some(compact) = message.get_bytes(b"ip") {
+            self.note_external(compact, from);
+        }
         if let Some(id) = message
             .get(b"r")
             .and_then(|response| response.get_bytes(b"id"))
@@ -690,7 +753,7 @@ impl Inner {
             table.insert(sender_id, from);
         }
         let arguments = arguments.expect("arguments checked above");
-        let own_id = Value::bytes(self.own_id);
+        let own_id = Value::bytes(self.own_id());
         let response = match message.get_bytes(b"q") {
             Some(b"ping") => Some(Value::dict([(b"id", own_id)])),
             Some(b"find_node") => arguments
@@ -741,13 +804,18 @@ impl Inner {
                 .then(|| Value::dict([(b"id", own_id)])),
             _ => None,
         };
+        // Every response says where we see the asker (BEP 42), so it can
+        // learn its external address.
+        let seen = Value::bytes(compact_peer(&from));
         let reply = match response {
             Some(response) => Value::dict([
+                (b"ip", seen),
                 (b"t", Value::bytes(transaction)),
                 (b"y", Value::bytes(*b"r")),
                 (b"r", response),
             ]),
             None => Value::dict([
+                (b"ip", seen),
                 (b"t", Value::bytes(transaction)),
                 (b"y", Value::bytes(*b"e")),
                 (
@@ -853,7 +921,7 @@ impl Inner {
             .into_iter()
             .map(|(key, value)| (key.to_vec(), value))
             .collect();
-        arguments.insert(b"id".to_vec(), Value::bytes(self.own_id));
+        arguments.insert(b"id".to_vec(), Value::bytes(self.own_id()));
         let mut message = Value::dict([
             (b"t", Value::bytes(transaction)),
             (b"y", Value::bytes(*b"q")),
@@ -954,6 +1022,7 @@ impl Inner {
     }
 
     fn iterate(&self, target: &NodeId, method: &[u8]) -> Lookup {
+        let own_id = self.own_id();
         let mut candidates: HashMap<SocketAddr, NodeId> = self
             .table
             .lock()
@@ -1024,7 +1093,7 @@ impl Inner {
                 }
                 if let Some(nodes) = response.get_bytes(self.nodes_key()) {
                     for (id, address) in parse_compact_nodes(nodes, self.v6) {
-                        if id != self.own_id {
+                        if id != own_id {
                             candidates.entry(address).or_insert(id);
                         }
                     }
@@ -1093,7 +1162,7 @@ impl Inner {
             if last_refresh.is_none_or(|at| at.elapsed() >= interval) {
                 // Looking up our own id fills the buckets nearest to us;
                 // random ids spread entries across the rest.
-                self.iterate(&self.own_id, b"find_node");
+                self.iterate(&self.own_id(), b"find_node");
                 self.iterate(&random_bytes(), b"find_node");
                 if filling {
                     self.iterate(&random_bytes(), b"find_node");
@@ -1127,7 +1196,7 @@ impl Inner {
             return;
         };
         let mut bytes = if self.v6 { STATE_V6 } else { STATE_V4 }.to_vec();
-        bytes.extend(self.own_id);
+        bytes.extend(self.own_id());
         for node in table.all().filter(|node| node.failures < MAX_FAILURES) {
             bytes.extend(node.id);
             bytes.extend(compact_peer(&node.address));
@@ -1423,6 +1492,12 @@ mod tests {
         let length = client.recv(&mut buffer).unwrap();
         let reply = bencode::decode(&buffer[..length]).unwrap();
         assert_eq!(reply.get_bytes(b"y"), Some(&b"e"[..]));
+        // Even an error says where we saw the asker (BEP 42).
+        let asker = client.local_addr().unwrap();
+        assert_eq!(
+            reply.get_bytes(b"ip"),
+            Some(compact_peer(&asker).as_slice())
+        );
         assert!(
             node.families[0]
                 .store
@@ -1445,8 +1520,39 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
         }
         let joined = node.node_count();
+        // Nodes told us our address, and our ID follows it (BEP 42).
+        let inner = &node.families[0];
+        let external = inner.external.lock().unwrap().current();
+        let id = inner.own_id();
         node.stop();
         assert!(joined >= 20, "only {joined} nodes after 30 s");
+        let external = external.expect("no node said where it sees us");
+        assert!(crate::dht_id::verify_node_id(&id, external));
+    }
+
+    #[test]
+    fn moves_to_an_id_from_its_external_address_once_nodes_agree() {
+        let node = local_node(Vec::new());
+        let inner = &node.families[0];
+        inner
+            .table
+            .lock()
+            .unwrap()
+            .insert([9; 20], "198.51.100.50:6881".parse().unwrap());
+        let ours: IpAddr = "203.0.113.5".parse().unwrap();
+        let said = compact_peer(&SocketAddr::new(ours, 6881));
+        let before = inner.own_id();
+        inner.note_external(&said, "198.51.100.1:6881".parse().unwrap());
+        assert_eq!(inner.own_id(), before, "one node's word is not enough");
+        inner.note_external(&said, "198.51.100.2:6881".parse().unwrap());
+        let after = inner.own_id();
+        assert_ne!(after, before);
+        assert!(crate::dht_id::verify_node_id(&after, ours));
+        assert_eq!(inner.table.lock().unwrap().len(), 1, "known nodes stay");
+        // Saying the same again keeps the ID.
+        inner.note_external(&said, "198.51.100.3:6881".parse().unwrap());
+        assert_eq!(inner.own_id(), after);
+        node.stop();
     }
 
     #[test]
@@ -1460,7 +1566,7 @@ mod tests {
         let start = || {
             let node =
                 Dht::start_on(&crate::Binding::any(), 0, Vec::new(), Some(path.clone())).unwrap();
-            let id = node.families[0].own_id;
+            let id = node.families[0].own_id();
             let known = node.node_count();
             node.stop();
             (id, known)

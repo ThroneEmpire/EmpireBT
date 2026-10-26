@@ -6,6 +6,7 @@ mod client;
 mod config;
 mod config_file;
 mod dht;
+mod dht_id;
 mod discovery;
 mod engine;
 mod error;

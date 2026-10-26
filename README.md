@@ -279,8 +279,10 @@ connections it already has.
 - **The mainline DHT** (BEP 5, and BEP 32 for IPv6). Lookups are fast at
   first, then slow gradually to every 15 minutes for a torrent that finds
   no new peers, without ever stopping. Known nodes are saved between runs,
-  but the node ID is new every start. Private torrents (BEP 27) stay off
-  the DHT.
+  but the node ID is new every start. Once other nodes agree on our
+  external address, the ID is derived from it (BEP 42, as libtorrent
+  does), and our replies tell other nodes theirs. Private torrents (BEP
+  27) stay off the DHT.
 - **Local peer discovery (BEP 14).** It announces on every network
   interface, so a VPN doesn't hide the LAN, and shares UDP port 6771 with
   other clients on the machine.
@@ -295,7 +297,9 @@ VPN is what hides it (see `network.interface`). EmpireBT also avoids
 making itself easy to follow:
 - **A new DHT node ID every start,** and new peer IDs and DHT node ID
   whenever the chosen network interface comes back after being down (a
-  VPN reconnecting, often at a new address) or the port changes. A node
+  VPN reconnecting, often at a new address) or the port changes. The DHT
+  node ID also changes whenever other nodes agree our address changed
+  (BEP 42 ties it to the address; its random part is new each time). A node
   ID kept across addresses would let anyone watching the DHT follow you
   from one VPN address to the next.
 - **Anonymous mode** (`network.anonymous`), like qBittorrent's but
