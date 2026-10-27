@@ -5,6 +5,11 @@
 # Two stages: Rust builds the binary on Debian; the image you run is
 # distroless (glibc, CA certificates, a non-root user, and our binary;
 # no shell or package manager).
+#
+# The release workflow builds the binaries natively for each architecture
+# first and passes --build-arg BINARIES=prebuilt, so making the arm64
+# image needs no emulated compiling.
+ARG BINARIES=build
 
 # ---- build -------------------------------------------------------------------
 FROM rust:1-bookworm AS build
@@ -21,6 +26,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # the container runs as (see `user:` in docker-compose.yml).
 RUN mkdir -p /out/data /out/downloads && chmod 0777 /out/data /out/downloads
 
+# ---- prebuilt: binaries from the release workflow, in dist/<arch>/ ----------
+FROM busybox:1.37 AS prebuilt
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/empirebt /out/usr/local/bin/empirebt
+RUN chmod 0755 /out/usr/local/bin/empirebt \
+ && mkdir -p /out/data /out/downloads && chmod 0777 /out/data /out/downloads
+
+FROM ${BINARIES} AS binaries
+
 # ---- run ---------------------------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot
 LABEL org.opencontainers.image.title="EmpireBT" \
@@ -28,7 +42,7 @@ LABEL org.opencontainers.image.title="EmpireBT" \
       org.opencontainers.image.authors="ThroneEmpire" \
       org.opencontainers.image.source="https://github.com/ThroneEmpire/EmpireBT"
 
-COPY --from=build /out/ /
+COPY --from=binaries /out/ /
 
 ENV HOME=/data \
     EMPIREBT_DATA_DIR=/data \

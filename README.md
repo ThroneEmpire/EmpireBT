@@ -448,6 +448,24 @@ See [TESTING.md](TESTING.md) for how testing works, and
 
 The detailed roadmap is in [CHECKLIST.md](CHECKLIST.md).
 
+## Releasing
+
+1. Set the new version in `Cargo.toml`, under `[workspace.package]`.
+2. Run `cargo build`, which updates `Cargo.lock`, and commit and push both.
+3. On GitHub: **Actions → Release → Run workflow**.
+
+The workflow releases the version `Cargo.toml` names: it runs the tests,
+builds Linux binaries for x86-64 and ARM, pushes the Docker image to
+`ghcr.io/throneempire/empirebt` (tagged with the version and `latest`), and
+publishes the GitHub release with notes, binaries, and checksums. It stops
+before doing anything if that version is already released or `Cargo.lock`
+was not updated, and nothing is released if a test fails.
+
+Versions follow semantic versioning: before 1.0, the last number for fixes
+(`0.1.1`), the middle one for new features or changed behavior (`0.2.0`).
+A version with a suffix (`0.2.0-beta.1`) is published as a pre-release and
+does not move `latest`.
+
 ## License
 
 Copyright (C) 2026 ThroneEmpire

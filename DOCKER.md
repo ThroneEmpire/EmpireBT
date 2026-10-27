@@ -12,7 +12,10 @@ The image is about 33 MB.
 
 ## Quick start
 
-From the project folder:
+Released images are ready to use, for x86-64 and ARM:
+`ghcr.io/throneempire/empirebt:latest` (or a version, such as `:0.2.0`).
+To use one, change `build: .` in `docker-compose.yml` to that `image:`.
+To build it yourself instead, from the project folder:
 
 ```bash
 mkdir -p data downloads

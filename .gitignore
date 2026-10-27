@@ -14,3 +14,6 @@
 .idea/
 *.swp
 .DS_Store
+
+# Release binaries for the Docker image (the release workflow makes them)
+dist/

@@ -1,0 +1,202 @@
+# Makes a release of the version in Cargo.toml, only when started by hand:
+# set `version` under [workspace.package] in Cargo.toml (and commit
+# Cargo.lock, which any `cargo build` updates), push, then Actions → Release
+# → Run workflow.
+#
+# 1. Reads the version, and stops if it is already released or Cargo.lock
+#    was not updated.
+# 2. Runs the tests; a failure stops everything.
+# 3. Builds Linux binaries natively for x86-64 and ARM, inside Debian 12, so
+#    they run there and on anything newer (Ubuntu 22.04 and on).
+# 4. Builds the Docker image for both from those binaries and pushes it to
+#    ghcr.io/<owner>/empirebt, tagged with the version (and `latest`).
+# 5. Creates the GitHub release: tag, notes, binaries, and checksums.
+
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+# One release at a time.
+concurrency: release
+
+jobs:
+  prepare:
+    name: Read the version
+    runs-on: ubuntu-24.04
+    container: rust:1-bookworm
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read and check the version
+        id: version
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Run the release from main (it ran from $GITHUB_REF)."
+            exit 1
+          fi
+          # The one version, under [workspace.package]; every crate inherits it.
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "Cargo.toml says $version"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Cargo.toml's version '$version' is not like 0.2.0 or 0.2.0-beta.1."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "::error::v$version is already released. Raise the version in Cargo.toml first."
+            exit 1
+          fi
+          # Builds use --locked, which fails if Cargo.lock still has the old
+          # version: say so now rather than halfway through.
+          if ! cargo metadata --locked --format-version 1 >/dev/null 2>&1; then
+            echo "::error::Cargo.lock does not match Cargo.toml. Run cargo build, then commit Cargo.lock."
+            exit 1
+          fi
+          case "$version" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          {
+            echo "version=$version"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    needs: prepare
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    # On the machine itself, not in a container: some tests need IPv6,
+    # which Docker containers usually lack.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: cargo test --workspace --locked
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: [prepare, test]
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            name: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            name: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # Debian 12's glibc, as in the distroless image.
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - run: cargo build --release --locked -p empirebt-console
+      - name: Package
+        run: |
+          package="empirebt-$VERSION-linux-${{ matrix.name }}"
+          mkdir -p "$package" binary
+          cp target/release/empirebt LICENSE README.md "$package/"
+          tar czf "$package.tar.gz" "$package"
+          cp target/release/empirebt binary/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.arch }}
+          path: empirebt-*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: binary/empirebt
+
+  docker:
+    name: Docker image
+    needs: [prepare, build]
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-amd64
+          path: dist/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-arm64
+          path: dist/arm64
+      - name: Name the image
+        id: image
+        run: |
+          # Registry names are lowercase.
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          image="ghcr.io/$owner/empirebt"
+          tags="$image:$VERSION"
+          if [ "${{ needs.prepare.outputs.prerelease }}" = "false" ]; then
+            tags="$tags,$image:latest"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: BINARIES=prebuilt
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          labels: org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+
+  release:
+    name: GitHub release
+    needs: [prepare, build, docker]
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha256sum empirebt-*.tar.gz > SHA256SUMS
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          prerelease=""
+          if [ "${{ needs.prepare.outputs.prerelease }}" = "true" ]; then
+            prerelease="--prerelease"
+          fi
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ needs.prepare.outputs.sha }}" \
+            --title "EmpireBT $VERSION" \
+            --generate-notes \
+            --notes "Docker: \`docker pull ghcr.io/$owner/empirebt:$VERSION\`" \
+            $prerelease \
+            empirebt-*.tar.gz SHA256SUMS
