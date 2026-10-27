@@ -31,6 +31,9 @@ pub struct ConnectOptions {
     encryption: crate::Encryption,
     utp: Option<Arc<crate::UtpSocket>>,
     prefer_utp: bool,
+    /// Never fall back to TCP, as when punching a hole through a NAT
+    /// (BEP 55), which only uTP can do.
+    utp_only: bool,
     /// Overrides [`CONNECT_TIMEOUT`] when set.
     dial_timeout: Option<Duration>,
     /// The network interface TCP connections leave from.
@@ -57,6 +60,12 @@ impl ConnectOptions {
     /// Tries uTP before TCP, as libtorrent does by default.
     pub fn prefer_utp(mut self, prefer: bool) -> Self {
         self.prefer_utp = prefer;
+        self
+    }
+
+    /// Connects over uTP only, without trying TCP.
+    pub fn only_utp(mut self) -> Self {
+        self.utp_only = true;
         self
     }
 
@@ -230,10 +239,16 @@ impl PeerConnection {
                 }
             }
         };
-        let order: &[bool] = match (&options.utp, options.prefer_utp) {
-            (None, _) => &[false],
-            (Some(_), true) => &[true, false],
-            (Some(_), false) => &[false, true],
+        let order: &[bool] = match (&options.utp, options.prefer_utp, options.utp_only) {
+            (None, _, true) => {
+                return Err(crate::BackendError::Io(
+                    "uTP is off, and this connection may use nothing else".to_owned(),
+                ));
+            }
+            (None, _, false) => &[false],
+            (Some(_), _, true) => &[true],
+            (Some(_), true, false) => &[true, false],
+            (Some(_), false, false) => &[false, true],
         };
         let mut failure = None;
         for &over_utp in order {

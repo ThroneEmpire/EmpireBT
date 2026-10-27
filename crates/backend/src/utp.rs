@@ -1684,6 +1684,110 @@ mod tests {
         }
     }
 
+    /// A NAT in front of `inside`, as port-restricted ones behave: what
+    /// `inside` sends goes out from the NAT's public address, and packets
+    /// to that address get in only from addresses `inside` has sent to.
+    /// Returns the address `inside` sends through, the public address, and
+    /// how many packets it dropped.
+    fn port_restricted_nat(
+        inside: SocketAddr,
+    ) -> (SocketAddr, SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let private = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let public = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addresses = (private.local_addr().unwrap(), public.local_addr().unwrap());
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opened = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        {
+            // Outgoing: inside -> (to whom it names) through the public side.
+            let (private, public, opened) = (
+                private.try_clone().unwrap(),
+                public.try_clone().unwrap(),
+                Arc::clone(&opened),
+            );
+            std::thread::spawn(move || {
+                let mut buffer = [0; 2048];
+                // The destination rides in the first 6 bytes (IPv4 only).
+                while let Ok((length, _)) = private.recv_from(&mut buffer) {
+                    let to = SocketAddr::from((
+                        [buffer[0], buffer[1], buffer[2], buffer[3]],
+                        u16::from_be_bytes([buffer[4], buffer[5]]),
+                    ));
+                    lock(&opened).insert(to);
+                    let _ = public.send_to(&buffer[6..length], to);
+                }
+            });
+        }
+        {
+            let dropped = Arc::clone(&dropped);
+            std::thread::spawn(move || {
+                let mut buffer = [0; 2048];
+                while let Ok((length, from)) = public.recv_from(&mut buffer) {
+                    if lock(&opened).contains(&from) {
+                        let _ = private.send_to(&buffer[..length], inside);
+                    } else {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+        (addresses.0, addresses.1, dropped)
+    }
+
+    #[test]
+    fn connects_through_a_nat_when_both_sides_dial_at_once() {
+        // A is reachable; B is behind a NAT, so A's first SYN is dropped
+        // until B, told to by an introducer (BEP 55), dials A too.
+        let a = UtpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (through, public, dropped) = port_restricted_nat(b.local_addr().unwrap());
+        let _a_listener = a.listen(Arc::new(|| {}));
+        let a_address = a.local_addr().unwrap();
+        // B speaks uTP through the NAT: a uTP socket of its own whose
+        // datagrams are wrapped with their destination for the NAT. To keep
+        // this test about uTP, B is a second UtpSocket bridged by a thread.
+        let b_utp = UtpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let _b_listener = b_utp.listen(Arc::new(|| {}));
+        let b_utp_address = b_utp.local_addr().unwrap();
+        {
+            // b_utp's packets to "A" go to the bridge (b), which sends them
+            // into the NAT naming A; the NAT's packets for B reach b, and the
+            // bridge passes them to b_utp.
+            let b = b.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let mut buffer = [0; 2048];
+                while let Ok((length, from)) = b.recv_from(&mut buffer) {
+                    if from == b_utp_address {
+                        let mut wrapped = vec![127, 0, 0, 1];
+                        wrapped.extend(a_address.port().to_be_bytes());
+                        wrapped.extend(&buffer[..length]);
+                        let _ = b.send_to(&wrapped, through);
+                    } else {
+                        let _ = b.send_to(&buffer[..length], b_utp_address);
+                    }
+                }
+            });
+        }
+        let b_bridge = b.local_addr().unwrap();
+        // A dials B's public address first: dropped by the NAT.
+        let dialing = std::thread::spawn({
+            let a = a.clone();
+            move || UtpStream::connect(&a, public, Duration::from_secs(10))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            dropped.load(Ordering::Relaxed) >= 1,
+            "the NAT dropped A's first SYN"
+        );
+        // Then B dials A, through the NAT, opening it for A.
+        let from_b = UtpStream::connect(&b_utp, b_bridge, Duration::from_secs(10));
+        assert!(from_b.is_ok(), "B reached A: {from_b:?}");
+        let from_a = dialing.join().unwrap();
+        assert!(
+            from_a.is_ok(),
+            "A's retried SYN got through the opened NAT: {from_a:?}"
+        );
+    }
+
     #[test]
     fn connecting_to_a_port_without_a_listener_is_refused() {
         let server = UtpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();

@@ -357,7 +357,7 @@ as needed; folders left empty are removed.
   or interested but choked by us, `K` and `?` unchoked without interest,
   `O` optimistic unchoke, `S` snubbed, `I` incoming, `H`/`X`/`L` found
   through the DHT, peer exchange or local discovery, `E` encrypted, `e`
-  encrypted handshake only, `P` uTP. **`flagsDescription`** explains each,
+  encrypted handshake only, `P` uTP, `h` reached by hole punching. **`flagsDescription`** explains each,
   one per line, in qBittorrent's words.
 
 If you show countries, credit DB-IP with `attribution`; its free database

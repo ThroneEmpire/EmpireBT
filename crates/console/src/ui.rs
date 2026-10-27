@@ -1678,6 +1678,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
                 ("I", "it connected to us"),
                 ("H X L", "from the DHT / peer exchange / LAN"),
                 ("E e P", "encrypted / encrypted handshake / uTP"),
+                ("h", "reached by punching through a NAT"),
             ],
         ),
         (

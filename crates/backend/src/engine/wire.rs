@@ -534,17 +534,31 @@ impl PeerWire {
                 use crate::holepunch::{Kind, Message};
                 if let (Some(id), Some(message)) =
                     (self.remote.holepunch_id, Message::decode(&payload))
-                    && message.kind == Kind::Rendezvous
-                    && let Err(error) = torrent.swarm.introduce(key, message.address)
                 {
-                    let failed = Message::new(Kind::Failed, message.address, error);
-                    out.push(Action::Send(PeerMessage::Extended {
-                        id,
-                        payload: failed.encode(),
-                    }));
+                    match message.kind {
+                        Kind::Rendezvous => {
+                            if let Err(error) = torrent.swarm.introduce(key, message.address) {
+                                let failed = Message::new(Kind::Failed, message.address, error);
+                                out.push(Action::Send(PeerMessage::Extended {
+                                    id,
+                                    payload: failed.encode(),
+                                }));
+                            }
+                        }
+                        // The peer it names is connecting to us right now:
+                        // connect to it too, over uTP, punching through our
+                        // NAT. A local address only from a local peer, as
+                        // libtorrent has it.
+                        Kind::Connect => {
+                            let local = crate::dht_id::is_local;
+                            if !local(message.address.ip()) || local(self.link.address.ip()) {
+                                torrent.swarm.queue_holepunch_dial(message.address);
+                            }
+                        }
+                        // It could not introduce us: nothing else to try.
+                        Kind::Failed => {}
+                    }
                 }
-                // We relay but do not punch holes ourselves: `connect`
-                // and `failed` are ignored, as the BEP allows.
             }
             PeerMessage::Extended {
                 id: crate::pex::UT_PEX,

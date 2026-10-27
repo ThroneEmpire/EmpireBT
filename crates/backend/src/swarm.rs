@@ -88,6 +88,8 @@ struct Peer {
     snubbed: bool,
     /// It supports the hole-punch extension (BEP 55).
     holepunch: bool,
+    /// We reached it by punching a hole through a NAT (BEP 55).
+    holepunched: bool,
     /// `ut_holepunch` messages for it, from relaying for another peer;
     /// its connection sends them on its next tick.
     holepunch_outbox: Vec<crate::holepunch::Message>,
@@ -125,6 +127,8 @@ pub struct PeerInfo {
     /// Where we heard of its address (`SOURCE_*` flags; none for peers
     /// that connected to us).
     pub sources: u8,
+    /// We reached it by punching a hole through a NAT (BEP 55).
+    pub holepunched: bool,
     /// Its share of the torrent, once it said which pieces it has.
     pub progress: Option<f64>,
     /// Bytes per second from and to it, measured over at least a second.
@@ -192,6 +196,9 @@ impl PeerInfo {
         if self.utp {
             flags.push(('P', "μTP"));
         }
+        if self.holepunched {
+            flags.push(('h', "Peer is using NAT hole punching"));
+        }
         flags
     }
 }
@@ -240,6 +247,12 @@ struct Inner {
     from_source: HashMap<SocketAddr, usize>,
     /// Where each known address came from (`SOURCE_*` flags).
     sources: HashMap<SocketAddr, u8>,
+    /// Addresses peer exchange said can be hole-punched (BEP 55), and the
+    /// connection that said so, to ask for an introduction if dialing
+    /// them fails. Taken once per address, so nobody is asked twice.
+    introducers: HashMap<SocketAddr, SocketAddr>,
+    /// Addresses an introducer told us to connect to now, over uTP.
+    holepunch_dials: Vec<SocketAddr>,
     /// Who reported seeing us at each address (BEP 10 `yourip`).
     votes: HashMap<IpAddr, HashSet<IpAddr>>,
     listen_port: Option<u16>,
@@ -271,6 +284,8 @@ impl Swarm {
                 random: seed,
                 known: HashSet::new(),
                 sources: HashMap::new(),
+                introducers: HashMap::new(),
+                holepunch_dials: Vec::new(),
                 discovered: VecDeque::new(),
                 exchanged: Vec::new(),
                 from_source: HashMap::new(),
@@ -316,6 +331,7 @@ impl Swarm {
                 obfuscated: false,
                 snubbed: false,
                 holepunch: false,
+                holepunched: false,
                 holepunch_outbox: Vec::new(),
                 client: None,
                 pieces: None,
@@ -570,6 +586,7 @@ impl Swarm {
                     handshake_encrypted: peer.obfuscated,
                     optimistic: optimistic == Some(*key),
                     snubbed: peer.snubbed,
+                    holepunched: peer.holepunched,
                     sources: if peer.outgoing {
                         sources.get(&peer.address).copied().unwrap_or(0)
                     } else {
@@ -603,7 +620,60 @@ impl Swarm {
 
     /// A connection to `address` failed before it sent anything.
     pub fn connect_failed(&self, address: SocketAddr) {
-        self.lock().history.entry(address).or_default().failures += 1;
+        let mut inner = self.lock();
+        inner.history.entry(address).or_default().failures += 1;
+        // Perhaps it is behind a NAT: the peer that told us of it can
+        // introduce us, so both sides connect at once (BEP 55), as
+        // libtorrent asks after a failed connection.
+        let Some(introducer) = inner.introducers.remove(&address) else {
+            return;
+        };
+        if let Some(peer) = inner
+            .peers
+            .values_mut()
+            .find(|peer| peer.address == introducer && peer.holepunch && !peer.evicted)
+            && peer.holepunch_outbox.len() < MAX_HOLEPUNCH_QUEUED
+        {
+            peer.holepunch_outbox.push(crate::holepunch::Message::new(
+                crate::holepunch::Kind::Rendezvous,
+                address,
+                0,
+            ));
+        }
+    }
+
+    /// Asks for a uTP connection to `address` now, as an introducer said
+    /// (BEP 55): the peer there is connecting to us at the same moment.
+    /// Peers already connected, banned ones, and a full queue are skipped.
+    pub fn queue_holepunch_dial(&self, address: SocketAddr) {
+        let connected = self.is_connected_to(address);
+        let mut inner = self.lock();
+        if connected
+            || inner.banned.contains(&identity(address))
+            || inner.holepunch_dials.contains(&address)
+            || inner.holepunch_dials.len() >= MAX_HOLEPUNCH_QUEUED
+        {
+            return;
+        }
+        inner.holepunch_dials.push(address);
+    }
+
+    /// Takes the addresses to punch a hole to.
+    pub fn take_holepunch_dials(&self) -> Vec<SocketAddr> {
+        std::mem::take(&mut self.lock().holepunch_dials)
+    }
+
+    /// Records that the connection to `address` came through a punched
+    /// hole.
+    pub fn mark_holepunched(&self, address: SocketAddr) {
+        if let Some(peer) = self
+            .lock()
+            .peers
+            .values_mut()
+            .find(|peer| peer.address == address && !peer.evicted)
+        {
+            peer.holepunched = true;
+        }
     }
 
     /// Announces a verified piece to every connection.
@@ -740,7 +810,17 @@ impl Swarm {
     pub fn discover(&self, source: SocketAddr, contacts: &[(SocketAddr, u8)]) -> usize {
         let mut inner = self.lock();
         let us = inner.external_ip().zip(inner.listen_port);
+        let introducer = source;
         let source = identity(source);
+        // Who can introduce us to the contacts that can be hole-punched.
+        for (address, flags) in contacts {
+            if flags & crate::pex::SUPPORTS_HOLEPUNCH != 0
+                && (inner.introducers.len() < MAX_DISCOVERED
+                    || inner.introducers.contains_key(address))
+            {
+                inner.introducers.insert(*address, introducer);
+            }
+        }
         let mut ips = HashSet::new();
         let mut added = 0;
         for (address, _) in contacts {
@@ -908,6 +988,7 @@ mod tests {
             optimistic: false,
             snubbed: false,
             sources: 0,
+            holepunched: false,
             progress: None,
             down_rate: 0.0,
             up_rate: 0.0,
@@ -1006,6 +1087,61 @@ mod tests {
         );
         assert!(swarm.take_holepunch(local).is_empty());
         let _ = plain;
+    }
+
+    #[test]
+    fn asks_the_peer_that_named_an_unreachable_one_to_introduce_us() {
+        use crate::holepunch::Kind;
+        use crate::pex::SUPPORTS_HOLEPUNCH;
+        let swarm = Swarm::new(4);
+        let now = Instant::now();
+        let public = |last: u8| SocketAddr::from(([203, 0, 113, last], 6881));
+        let introducer = swarm.join(public(1), now).unwrap();
+        swarm.set_holepunch(introducer);
+        let silent = swarm.join(public(2), now).unwrap();
+        // Peer exchange from each: one contact that can be hole-punched,
+        // one that cannot.
+        swarm.discover(
+            public(1),
+            &[(public(10), SUPPORTS_HOLEPUNCH), (public(11), 0)],
+        );
+        swarm.discover(public(2), &[(public(12), SUPPORTS_HOLEPUNCH)]);
+        swarm.connect_failed(public(10));
+        let asked = swarm.take_holepunch(introducer);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            (asked[0].kind, asked[0].address),
+            (Kind::Rendezvous, public(10))
+        );
+        // Once only, and only for contacts flagged by a peer that can relay.
+        swarm.connect_failed(public(10));
+        swarm.connect_failed(public(11));
+        swarm.connect_failed(public(12));
+        assert!(swarm.take_holepunch(introducer).is_empty());
+        assert!(
+            swarm.take_holepunch(silent).is_empty(),
+            "it never offered BEP 55"
+        );
+
+        // Told to connect: queued once, not for peers already connected.
+        swarm.queue_holepunch_dial(public(20));
+        swarm.queue_holepunch_dial(public(20));
+        swarm.queue_holepunch_dial(public(1));
+        assert_eq!(swarm.take_holepunch_dials(), [public(20)]);
+        assert!(swarm.take_holepunch_dials().is_empty());
+        // A punched connection shows qBittorrent's `h`.
+        let punched = swarm.join(public(20), now).unwrap();
+        swarm.describe(punched, true, true, false, false);
+        swarm.mark_holepunched(public(20));
+        let peer = swarm
+            .peers()
+            .into_iter()
+            .find(|peer| peer.address == public(20))
+            .unwrap();
+        assert!(
+            peer.flags()
+                .contains(&('h', "Peer is using NAT hole punching"))
+        );
     }
 
     #[test]

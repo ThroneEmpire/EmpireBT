@@ -2,10 +2,15 @@
 //! two others that cannot reach each other (both behind a NAT) introduces
 //! them, and they connect to each other over uTP at the same moment.
 //!
-//! EmpireBT is a relay: asked by one peer to introduce it to another it is
-//! connected to, it sends both a `connect` naming the other, as libtorrent
-//! does. It does not punch holes itself yet; `connect` messages sent to it
-//! are ignored, which the BEP allows.
+//! EmpireBT plays every part, as libtorrent does:
+//! - relay: asked by one peer to introduce it to another it is connected
+//!   to, it sends both a `connect` naming the other;
+//! - initiator: when connecting to a peer that peer exchange said can be
+//!   hole-punched fails, it asks the peer that told it of that one for an
+//!   introduction ([`crate::swarm::Swarm::connect_failed`]);
+//! - either side of an introduction: on `connect`, it dials the named peer
+//!   over uTP at once, while that peer dials it, so both NATs open
+//!   (the runtime's hole-punch dialer).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 

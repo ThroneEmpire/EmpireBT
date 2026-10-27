@@ -326,22 +326,71 @@ impl Runtime {
         shutdown: &AtomicBool,
     ) -> Result<(), crate::BackendError> {
         self.stopped.store(false, Ordering::Release);
-        let result = crate::reactor::serve(
-            &self.routes,
-            listeners,
-            crate::reactor::Settings {
-                max_connections: self.max_connections,
-                handshake_timeout: self.handshake_timeout,
-                encryption: self.encryption,
-                utp: self.utp.as_deref(),
-                limits: Arc::clone(&self.limits),
-            },
-            shutdown,
-            &self.connections,
-            &self.control,
-        );
+        let served = AtomicBool::new(false);
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| self.punch_holes(shutdown, &served));
+            let result = crate::reactor::serve(
+                &self.routes,
+                listeners,
+                crate::reactor::Settings {
+                    max_connections: self.max_connections,
+                    handshake_timeout: self.handshake_timeout,
+                    encryption: self.encryption,
+                    utp: self.utp.as_deref(),
+                    limits: Arc::clone(&self.limits),
+                },
+                shutdown,
+                &self.connections,
+                &self.control,
+            );
+            served.store(true, Ordering::Release);
+            result
+        });
         self.stopped.store(true, Ordering::Release);
         result
+    }
+
+    /// While serving, dials the peers introducers name (BEP 55) over uTP,
+    /// at once: each is dialing us at the same moment, so the packets
+    /// both send open both NATs.
+    fn punch_holes(&self, shutdown: &AtomicBool, served: &AtomicBool) {
+        std::thread::scope(|scope| {
+            while !shutdown.load(Ordering::Acquire) && !served.load(Ordering::Acquire) {
+                std::thread::sleep(HOLEPUNCH_POLL);
+                let Some(utp) = &self.utp else {
+                    continue;
+                };
+                let torrents: Vec<Arc<ActiveTorrent>> =
+                    self.routes.read().by_key.values().cloned().collect();
+                for torrent in torrents {
+                    for address in torrent.swarm.take_holepunch_dials() {
+                        let pending = self.dialing.load(Ordering::Acquire);
+                        if pending >= MAX_DIALS
+                            || !self.limits.has_room(pending)
+                            || torrent.swarm.is_connected_to(address)
+                        {
+                            continue;
+                        }
+                        self.dialing.fetch_add(1, Ordering::AcqRel);
+                        let options = crate::ConnectOptions::new()
+                            .with_binding(self.binding.clone())
+                            .with_encryption(self.encryption)
+                            .with_utp(Some(Arc::clone(utp)))
+                            .only_utp();
+                        let torrent = Arc::clone(&torrent);
+                        scope.spawn(move || {
+                            if self
+                                .connect(address, &torrent, &options, torrent.timeout)
+                                .is_ok()
+                            {
+                                torrent.swarm.mark_holepunched(address);
+                            }
+                            self.dialing.fetch_sub(1, Ordering::AcqRel);
+                        });
+                    }
+                }
+            }
+        });
     }
 
     /// Whether the event loop is running and can adopt connections.
@@ -486,6 +535,8 @@ impl Runtime {
 
 /// Background connections [`Runtime::dial`] makes at once at most.
 const MAX_DIALS: usize = 8;
+/// How often hole-punch requests (BEP 55) are looked for.
+const HOLEPUNCH_POLL: Duration = Duration::from_millis(50);
 
 impl Routes {
     fn read(&self) -> std::sync::RwLockReadGuard<'_, RouteTable> {
@@ -867,6 +918,78 @@ mod tests {
             crate::holepunch::NO_SELF
         );
         drop((initiator, target));
+        stop.store(true, Ordering::Release);
+        serving.join().unwrap().unwrap();
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dials_over_utp_the_peer_an_introducer_names() {
+        use crate::holepunch::{Kind, Message};
+        use std::io::Write;
+        let limits = Arc::new(crate::Limits::unlimited());
+        let (info, _, shutdown, server, root) = serving("punch", 64 * 1024, limits);
+        let storage = crate::Storage::new(&root).unwrap();
+        // A short timeout: the dial waits for a handshake the target never
+        // sends, and stopping waits for the dial.
+        let seeder = Seeder::new(info.clone(), storage, [3; 20], Duration::from_secs(1)).unwrap();
+        let utp = crate::UtpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let runtime = Arc::new(
+            Runtime::new(vec![seeder], 8)
+                .unwrap()
+                .with_utp(Some(Arc::clone(&utp))),
+        );
+        let listener = runtime.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let serving = {
+            let (runtime, stop) = (Arc::clone(&runtime), Arc::clone(&stop));
+            thread::spawn(move || runtime.serve_until(&listener, &stop))
+        };
+        // The peer to be introduced: reachable over uTP only.
+        let target = crate::UtpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (sender, dialed) = std::sync::mpsc::channel();
+        let target_listener = target.listen(Arc::new(move || {
+            let _ = sender.send(());
+        }));
+        // The introducer: a peer connected to us that offers `ut_holepunch`.
+        let mut introducer = TcpStream::connect(address).unwrap();
+        introducer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let handshake =
+            Handshake::new(*info.info_hash(), *b"-qB4650-000000000009").with_extensions();
+        introducer.write_all(&handshake.encode()).unwrap();
+        let mut reply = [0; 68];
+        std::io::Read::read_exact(&mut introducer, &mut reply).unwrap();
+        for message in [
+            PeerMessage::Extended {
+                id: 0,
+                payload: b"d1:md12:ut_holepunchi4eee".to_vec(),
+            },
+            PeerMessage::Interested,
+        ] {
+            introducer.write_all(&message.encode().unwrap()).unwrap();
+        }
+        thread::sleep(Duration::from_millis(100));
+        let connect = Message::new(Kind::Connect, target.local_addr().unwrap(), 0);
+        introducer
+            .write_all(
+                &PeerMessage::Extended {
+                    id: crate::holepunch::UT_HOLEPUNCH,
+                    payload: connect.encode(),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        dialed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the runtime dialed the named peer over uTP");
+        assert!(target_listener.accept().is_some());
+        drop(introducer);
         stop.store(true, Ordering::Release);
         serving.join().unwrap().unwrap();
         shutdown.store(true, Ordering::Release);
