@@ -291,7 +291,8 @@ This checklist tracks backend, console, and web UI work.
 - [x] Support BEP 15 UDP tracker protocol
 - [ ] Map the listen port on the router (UPnP IGD and NAT-PMP/PCP), so peers behind NAT can reach us without manual forwarding
 - [ ] Support BEP 19 web seeds
-- [ ] Support BEP 23 tracker exchange
+- [x] BEP 23 (trackers return compact peer lists): announces ask `compact=1` and read compact replies (IPv4 and IPv6). This line once said "tracker exchange", which is BEP 28
+- Decided (2026-10-27): no tracker exchange (BEP 28, `lt_tex`). libtorrent deprecated and then removed it (its ChangeLog: "removed support for lt_trackers"), so qBittorrent and most peers do not speak it; the DHT and peer exchange already find peers without trackers; and tracker URLs from peers would all need checking
 - [x] Support BEP 29 uTP transport, `network.utp = enabled | preferred | disabled`
   - [x] Packets, selective ACK, wrapping sequence numbers, handshake numbering as libutp/libtorrent
   - [x] RTT/timeouts, fast retransmit (3 dup acks / 3 later SACKed), paced resend after timeouts

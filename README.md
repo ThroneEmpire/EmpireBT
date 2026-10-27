@@ -439,7 +439,8 @@ See [TESTING.md](TESTING.md) for how testing works, and
 - **No per-torrent rules yet:** no seed ratio or seeding time limits, and
   no per-torrent speed limits. Peers on the local network count against
   the speed limits.
-- **No web seeds (BEP 19) or tracker exchange (BEP 23).**
+- **No web seeds (BEP 19).** Nor tracker exchange (BEP 28), which
+  libtorrent, and so qBittorrent, removed long ago.
 - **Hybrid connections aren't upgraded from v1 to v2** mid-handshake. That
   upgrade is an optional part of BEP 52; peers connect with either hash
   instead.
