@@ -11,7 +11,7 @@ name = "empirebt_web"
 path = "src/lib.rs"
 
 [dependencies]
-argon2 = "0.5"
+argon2 = "0.6"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
 empirebt-app = { path = "../app" }
 empirebt-backend = { path = "../backend" }

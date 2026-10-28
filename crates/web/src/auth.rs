@@ -100,22 +100,23 @@ impl AuthFile {
 
 /// An Argon2id hash of `password`, with a random salt.
 pub(crate) fn hash_password(password: &str) -> Result<String, String> {
-    use argon2::password_hash::{PasswordHasher, SaltString};
-    let salt = SaltString::encode_b64(&random_bytes::<16>()).map_err(|error| error.to_string())?;
-    argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|error| error.to_string())
+    use argon2::password_hash::{PasswordHasher, phc::PasswordHash};
+    PasswordHasher::<PasswordHash>::hash_password_with_salt(
+        &argon2::Argon2::default(),
+        password.as_bytes(),
+        &random_bytes::<16>(),
+    )
+    .map(|hash| hash.to_string())
+    .map_err(|error| error.to_string())
 }
 
-/// Whether `password` matches an Argon2 hash. Deliberately slow.
+/// Whether `password` matches an Argon2 hash, in the PHC string form
+/// `hash_password` makes (and earlier versions made). Deliberately slow.
 pub(crate) fn verify_password(hash: &str, password: &str) -> bool {
-    use argon2::password_hash::{PasswordHash, PasswordVerifier};
-    PasswordHash::new(hash).is_ok_and(|hash| {
-        argon2::Argon2::default()
-            .verify_password(password.as_bytes(), &hash)
-            .is_ok()
-    })
+    use argon2::password_hash::PasswordVerifier;
+    argon2::Argon2::default()
+        .verify_password(password.as_bytes(), hash)
+        .is_ok()
 }
 
 /// A random 256-bit token, as 64 hex digits.
@@ -303,6 +304,22 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passwords_saved_by_older_versions_still_work() {
+        // Made by EmpireBT with argon2 0.5, before the move to 0.6: people's
+        // saved web UI passwords must keep working after an update.
+        let old = "$argon2id$v=19$m=19456,t=2,p=1$54QHr4uX7R1BqbVs6Al/ZA$\
+                   ZxI89aL4n+4alv4TqbZN0czUPrrIHxfPeTY0BgWNnJo";
+        assert!(verify_password(old, "correct horse battery staple"));
+        assert!(!verify_password(old, "correct horse battery stable"));
+        assert!(!verify_password("not a hash", "correct horse battery staple"));
+        // New hashes have the same form, and their own salt each time.
+        let new = hash_password("correct horse battery staple").unwrap();
+        assert!(new.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "{new}");
+        assert!(verify_password(&new, "correct horse battery staple"));
+        assert_ne!(new, hash_password("correct horse battery staple").unwrap());
+    }
 
     #[test]
     fn hashes_and_checks_passwords() {

@@ -15,9 +15,9 @@ if-addrs = { version = "0.15.0", features = ["link-local"] }
 mio = { version = "1", features = ["os-poll", "net"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 socket2 = { version = "0.6.5", features = ["all"] }
-toml_edit = "0.22"
+toml_edit = "0.25"
 webpki-roots = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }

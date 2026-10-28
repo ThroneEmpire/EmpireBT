@@ -432,6 +432,13 @@ cargo test -p empirebt-interop
 See [TESTING.md](TESTING.md) for how testing works, and
 [interop/README.md](interop/README.md) for the interop suite.
 
+To update the Rust dependencies, then build, lint, and test everything:
+
+```bash
+scripts/update-dependencies.sh          # within the versions Cargo.toml allows
+scripts/update-dependencies.sh --major  # new major versions too (needs cargo-edit)
+```
+
 ## Limitations
 
 - **No automatic port forwarding (UPnP or NAT-PMP).** Behind a router,
