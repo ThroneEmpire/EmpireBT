@@ -26,6 +26,10 @@ const NOTICES_KEPT: usize = 20;
 /// How long quitting waits for transfers to stop and for best-effort
 /// `stopped` announces to reach trackers.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// How long a port change waits on the spot for the old sockets to close,
+/// so it usually shows when the command returns; past that, the engine
+/// finishes it in the background and keeps answering meanwhile.
+const REBIND_WAIT: Duration = Duration::from_millis(250);
 /// Data files unused this long are closed.
 const IDLE_FILE_CLOSE: Duration = Duration::from_secs(5 * 60);
 /// Local-data checks running at once. More would make spinning disks seek.
@@ -35,6 +39,13 @@ const VERIFY_BUDGET: Duration = Duration::from_millis(40);
 /// A seeding runtime that failed to start (port taken, network interface
 /// down) is tried again this often.
 const SEED_RETRY: Duration = Duration::from_secs(10);
+/// How often seeds that could not join the runtime (files missing or
+/// unreadable, as on a drive that is not mounted yet) are tried again.
+const LEFT_OUT_RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(60)
+};
 /// How long one request may take when downloading a `.torrent` from a URL.
 const TORRENT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20);
 /// How often every torrent's trackers are scraped for swarm counts, as
@@ -52,6 +63,12 @@ const SCRAPE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How often `network.port_file` is checked for a new port.
 const PORT_FILE_POLL: Duration = Duration::from_secs(5);
+/// How soon a session save that failed (a full disk, say) is tried again.
+const SAVE_RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(30)
+};
 
 /// Something an interface asks the engine to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +464,14 @@ fn start_networking(
 fn run(mut engine: Engine, inbox: &mpsc::Receiver<Message>, published: &Published) {
     let mut next_tick = Instant::now();
     loop {
+        // Due ticks come first, so a steady stream of commands (a script
+        // polling the API, several open web pages) never holds back
+        // background work.
+        if Instant::now() >= next_tick {
+            engine.tick();
+            publish(&mut engine, published);
+            next_tick = Instant::now() + TICK;
+        }
         let wait = next_tick.saturating_duration_since(Instant::now());
         match inbox.recv_timeout(wait) {
             Ok(Message::Command(command, reply)) => {
@@ -461,11 +486,7 @@ fn run(mut engine: Engine, inbox: &mpsc::Receiver<Message>, published: &Publishe
                 let _ = done.send(());
                 return;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                engine.tick();
-                publish(&mut engine, published);
-                next_tick = Instant::now() + TICK;
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 engine.shutdown();
                 return;
@@ -558,6 +579,10 @@ struct SeedService {
     last_start: Option<Instant>,
     /// Torrent states changed, so the runtime's torrents need syncing.
     resync: bool,
+    /// When the runtime's torrents were last synced.
+    last_sync: Instant,
+    /// Seeds that could not join the runtime, and why.
+    left_out: HashMap<InfoHash, String>,
     announcer: SeedAnnouncer,
     tracking: bool,
 }
@@ -573,6 +598,8 @@ impl SeedService {
             started: false,
             last_start: None,
             resync: true,
+            last_sync: Instant::now(),
+            left_out: HashMap::new(),
             announcer: SeedAnnouncer::start_on(
                 settings.binding.clone(),
                 port,
@@ -617,8 +644,9 @@ impl SeedService {
     }
 
     /// Starts the runtime once, gives it to the client when it is live,
-    /// and syncs its torrents after state changes.
-    fn tick(&mut self, client: &mut Client, settings: &Settings) {
+    /// and syncs its torrents after state changes, and now and then while
+    /// some could not join. Returns the seeds newly left out, with why.
+    fn tick(&mut self, client: &mut Client, settings: &Settings) -> Vec<(InfoHash, String)> {
         let failed = matches!(self.status(), SeedStatus::Failed(_))
             && self.thread.as_ref().is_some_and(JoinHandle::is_finished);
         let retry = failed
@@ -632,7 +660,7 @@ impl SeedService {
             self.start(client, settings);
         }
         let Some(runtime) = self.live() else {
-            return;
+            return Vec::new();
         };
         if client.runtime().is_none() {
             client.set_runtime(Some(Arc::clone(&runtime)));
@@ -641,12 +669,22 @@ impl SeedService {
             self.tracking = true;
             self.announcer.track(Arc::clone(&runtime));
         }
-        if std::mem::take(&mut self.resync)
-            && let Err(error) = client.sync_runtime(settings.peer_id, settings.peer_timeout)
-            && let Ok(mut status) = self.status.lock()
-        {
-            *status = SeedStatus::Failed(error.to_string());
+        let retry = !self.left_out.is_empty() && self.last_sync.elapsed() >= LEFT_OUT_RETRY;
+        if !std::mem::take(&mut self.resync) && !retry {
+            return Vec::new();
         }
+        self.last_sync = Instant::now();
+        let left_out: HashMap<InfoHash, String> = client
+            .sync_runtime(settings.peer_id, settings.peer_timeout)
+            .into_iter()
+            .collect();
+        let new = left_out
+            .iter()
+            .filter(|(hash, reason)| self.left_out.get(*hash) != Some(*reason))
+            .map(|(hash, reason)| (*hash, reason.clone()))
+            .collect();
+        self.left_out = left_out;
+        new
     }
 
     fn start(&mut self, client: &Client, settings: &Settings) {
@@ -721,6 +759,10 @@ struct Engine {
     overridden: Vec<&'static str>,
     last_sample: Instant,
     session_dirty: bool,
+    /// After a failed save: when to try again, and what went wrong, so it
+    /// is reported once.
+    save_retry_at: Instant,
+    save_problem: Option<String>,
     notices: VecDeque<Notice>,
     next_notice: u64,
     generation: u64,
@@ -735,15 +777,37 @@ struct Engine {
     /// The last problem reported with `network.port_file`, so it is
     /// reported once.
     port_file_problem: Option<String>,
-    /// Downloads stopped to move to a new port, started again once the
-    /// new runtime is live.
-    restart_after_rebind: Vec<InfoHash>,
+    /// A move to a new port waiting for the old sockets to close.
+    rebinding: Option<Rebind>,
+    /// Downloads stopped to move to a new port, or started while moving,
+    /// started once the new runtime is live.
+    restart_after_rebind: Vec<Restart>,
     /// What the log last said about seeding and the network interface, so
     /// it speaks only when they change.
     logged_seeding: Option<String>,
     logged_interface_up: Option<bool>,
     /// The chosen network interface came back after being down.
     interface_returned: bool,
+}
+
+/// A move of every network service to `port`, begun by [`Engine::rebind`]:
+/// waits for the old services to stop, for at most `deadline`.
+struct Rebind {
+    port: u16,
+    notice: String,
+    services: Vec<JoinHandle<()>>,
+    deadline: Instant,
+}
+
+/// A download to start once a move to a new port is done.
+struct Restart {
+    hash: InfoHash,
+    /// Its transfer stopped for the move; the new one starts once this has
+    /// stopped writing.
+    old: Option<TransferHandle>,
+    /// Started by the user during the move (the others restart only if
+    /// still downloading).
+    requested: bool,
 }
 
 /// A `.torrent` URL being downloaded: the URL, where the torrent goes, and
@@ -814,6 +878,8 @@ impl Engine {
             overridden,
             last_sample: Instant::now(),
             session_dirty: false,
+            save_retry_at: Instant::now(),
+            save_problem: None,
             notices: VecDeque::new(),
             next_notice: 0,
             generation: 0,
@@ -824,6 +890,7 @@ impl Engine {
             next_scrape: Instant::now() + FIRST_SCRAPE,
             scraping: None,
             port_file_problem: None,
+            rebinding: None,
             restart_after_rebind: Vec::new(),
             logged_seeding: None,
             logged_interface_up: None,
@@ -1128,6 +1195,8 @@ impl Engine {
             TransferState::Seeding | TransferState::Complete
         );
 
+        // A seed whose files the runtime could not serve.
+        let left_out = self.seeding.left_out.get(&hash).filter(|_| job.is_none());
         let status = match (job, progress) {
             _ if activity.is_some_and(|activity| activity.pausing) => Status::Pausing,
             (Some(TransferKind::Verify), _) => Status::Checking,
@@ -1148,7 +1217,9 @@ impl Engine {
             },
             (Some(TransferKind::Download), None) => Status::Downloading,
             (None, _) if activity.is_some_and(|activity| activity.queued_verify) => Status::Queued,
+            (None, _) if self.waiting_for_rebind(&hash) => Status::Waiting,
             (None, _) if activity.is_some_and(|activity| activity.error.is_some()) => Status::Error,
+            (None, _) if seeding && left_out.is_some() => Status::Error,
             (None, _) if seeding => Status::Seeding,
             (None, _) => Status::Paused,
         };
@@ -1188,14 +1259,16 @@ impl Engine {
             swarm.0.or(scraped.map(|stats| stats.seeders)),
             swarm.1.or(scraped.map(|stats| stats.leechers)),
         );
-        let error = activity.and_then(|activity| {
-            activity.error.clone().or_else(|| {
-                activity
-                    .job
-                    .as_ref()
-                    .and_then(|job| job.progress().last_error())
+        let error = activity
+            .and_then(|activity| {
+                activity.error.clone().or_else(|| {
+                    activity
+                        .job
+                        .as_ref()
+                        .and_then(|job| job.progress().last_error())
+                })
             })
-        });
+            .or_else(|| left_out.filter(|_| seeding).cloned());
         let trackers = match (info, torrent.magnet()) {
             (Some(info), _) => info.tracker_urls(),
             (None, Some(link)) => link.trackers(),
@@ -1255,7 +1328,13 @@ impl Engine {
             self.collect_finished();
             self.start_next_verify();
         }
-        self.seeding.tick(&mut self.client, &self.settings);
+        self.finish_rebind();
+        if self.rebinding.is_none() {
+            for (hash, reason) in self.seeding.tick(&mut self.client, &self.settings) {
+                let name = self.name(&hash);
+                self.notify(Level::Error, format!("{name} is not seeding: {reason}"));
+            }
+        }
         self.delete_removed_files(false);
         self.log_changes();
         if std::mem::take(&mut self.interface_returned) {
@@ -1292,7 +1371,7 @@ impl Engine {
                 self.session_dirty = true;
             }
         }
-        if self.session_dirty {
+        if self.session_dirty && Instant::now() >= self.save_retry_at {
             self.save();
         }
     }
@@ -1306,11 +1385,19 @@ impl Engine {
             .activity
             .values_mut()
             .filter_map(|activity| activity.job.take())
+            .chain(
+                std::mem::take(&mut self.restart_after_rebind)
+                    .into_iter()
+                    .filter_map(|restart| restart.old),
+            )
             .collect();
         jobs.iter()
             .chain(&detached)
             .for_each(TransferHandle::cancel);
-        let services = self.seeding.stop();
+        let mut services = self.seeding.stop();
+        if let Some(rebind) = self.rebinding.take() {
+            services.extend(rebind.services);
+        }
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         while Instant::now() < deadline
             && (jobs
@@ -1429,7 +1516,11 @@ impl Engine {
     /// they announce the new port; seeds rejoin the new runtime, and its
     /// announcer tells trackers and the DHT at once.
     fn change_port(&mut self, port: u16) {
-        if port == self.client.config().listen_port() {
+        let current = self
+            .rebinding
+            .as_ref()
+            .map_or(self.client.config().listen_port(), |rebind| rebind.port);
+        if port == current {
             return;
         }
         self.rebind(port, format!("Now taking peers on port {port}"));
@@ -1437,9 +1528,16 @@ impl Engine {
 
     /// Starts every network service again on `port`, as
     /// [`Engine::change_port`] describes, with new peer IDs and a new DHT
-    /// node ID; `notice` says why.
+    /// node ID; `notice` says why. The old services are stopped here; the
+    /// new ones start once those have closed their sockets, usually at
+    /// once, else in a later tick ([`Engine::finish_rebind`]). A move
+    /// already under way just changes where it goes.
     fn rebind(&mut self, port: u16, notice: String) {
-        let mut jobs = Vec::new();
+        if let Some(rebind) = &mut self.rebinding {
+            rebind.port = port;
+            rebind.notice = notice;
+            return;
+        }
         for (hash, activity) in &mut self.activity {
             let networked = matches!(
                 activity.job_kind(),
@@ -1450,23 +1548,52 @@ impl Engine {
                 && let Some(job) = activity.job.take()
             {
                 job.cancel();
-                jobs.push(job);
-                self.restart_after_rebind.push(*hash);
+                self.restart_after_rebind.push(Restart {
+                    hash: *hash,
+                    old: Some(job),
+                    requested: false,
+                });
             }
         }
-        let services = self.seeding.stop();
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while Instant::now() < deadline
-            && (jobs.iter().any(|job| !job.is_finished())
-                || services.iter().any(|thread| !thread.is_finished()))
-        {
-            std::thread::sleep(Duration::from_millis(20));
+        self.rebinding = Some(Rebind {
+            port,
+            notice,
+            services: self.seeding.stop(),
+            deadline: Instant::now() + SHUTDOWN_GRACE,
+        });
+        let quick = Instant::now() + REBIND_WAIT;
+        while !self.rebind_ready() && Instant::now() < quick {
+            std::thread::sleep(Duration::from_millis(10));
         }
-        for job in &jobs {
-            self.client.checkpoint(job);
+        self.finish_rebind();
+    }
+
+    /// The old services and the transfers a move stopped have all stopped.
+    fn rebind_ready(&self) -> bool {
+        self.rebinding.as_ref().is_some_and(|rebind| {
+            rebind.services.iter().all(JoinHandle::is_finished)
+                && self
+                    .restart_after_rebind
+                    .iter()
+                    .filter_map(|restart| restart.old.as_ref())
+                    .all(TransferHandle::is_finished)
+        })
+    }
+
+    /// Finishes a move to a new port once the old services have stopped,
+    /// or have had [`SHUTDOWN_GRACE`] to: starts the DHT, uTP, local
+    /// discovery, and a new seeding runtime on it. Transfers still winding
+    /// down are waited for by [`Engine::restart_rebound_downloads`].
+    fn finish_rebind(&mut self) {
+        let Some(deadline) = self.rebinding.as_ref().map(|rebind| rebind.deadline) else {
+            return;
+        };
+        if !self.rebind_ready() && Instant::now() < deadline {
+            return;
         }
-        // Any still winding down finish on their own.
-        self.detached.extend(jobs);
+        let Some(Rebind { port, notice, .. }) = self.rebinding.take() else {
+            return;
+        };
         self.client.set_runtime(None);
         if let Some(lsd) = self.client.lsd() {
             lsd.stop();
@@ -1495,7 +1622,10 @@ impl Engine {
         );
         let config = self.client.config().clone();
         self.dht_state = start_networking(&mut self.client, &config, &self.settings, &self.store);
+        // Seeds already reported as left out are not reported again.
+        let left_out = std::mem::take(&mut self.seeding.left_out);
         self.seeding = SeedService::new(port, &self.settings, self.client.dht().cloned());
+        self.seeding.left_out = left_out;
         self.session_dirty = true;
         self.notify(Level::Info, notice);
     }
@@ -1537,23 +1667,46 @@ impl Engine {
     }
 
     /// Starts the downloads [`Engine::change_port`] stopped, once the new
-    /// runtime is live (or has failed), unless they were paused or removed
-    /// meanwhile.
+    /// runtime is live (or has failed) and each old transfer has stopped
+    /// writing, unless they were paused or removed meanwhile; and those
+    /// started during the move.
     fn restart_rebound_downloads(&mut self) {
         if self.restart_after_rebind.is_empty()
+            || self.rebinding.is_some()
             || (self.seeding.live().is_none()
                 && !matches!(self.seeding.status(), SeedStatus::Failed(_)))
         {
             return;
         }
-        for hash in std::mem::take(&mut self.restart_after_rebind) {
-            let downloading = self.client.torrent_index(&hash).is_some_and(|index| {
-                self.client.torrents()[index].state() == TransferState::Downloading
-            });
-            if downloading {
-                self.start(hash);
+        let (ready, waiting): (Vec<Restart>, Vec<Restart>) =
+            std::mem::take(&mut self.restart_after_rebind)
+                .into_iter()
+                .partition(|restart| restart.old.as_ref().is_none_or(TransferHandle::is_finished));
+        self.restart_after_rebind = waiting;
+        for restart in ready {
+            // Stopped writing, so its progress matches the files.
+            if let Some(old) = &restart.old {
+                self.client.checkpoint(old);
+                self.session_dirty = true;
+            }
+            if restart.requested || self.downloading(&restart.hash) {
+                self.start(restart.hash);
             }
         }
+    }
+
+    /// The torrent is set to download (a restart after a move waits for it).
+    fn downloading(&self, hash: &InfoHash) -> bool {
+        self.client.torrent_index(hash).is_some_and(|index| {
+            self.client.torrents()[index].state() == TransferState::Downloading
+        })
+    }
+
+    /// Waiting for a move to a new port before it starts.
+    fn waiting_for_rebind(&self, hash: &InfoHash) -> bool {
+        self.restart_after_rebind
+            .iter()
+            .any(|restart| restart.hash == *hash && (restart.requested || self.downloading(hash)))
     }
 
     /// Applies a changed connection or speed limit to the running client.
@@ -1710,6 +1863,7 @@ impl Engine {
             }
             Some(TransferKind::Verify) => {
                 activity.start_after_verify = true;
+                activity.pausing = false;
                 activity.job.as_ref().map(TransferHandle::cancel);
                 return;
             }
@@ -1728,6 +1882,22 @@ impl Engine {
         activity.queued_verify = false;
         activity.error = None;
         activity.down.idle();
+        if self.rebinding.is_some() {
+            // The old runtime is closing: start on the new one.
+            match self
+                .restart_after_rebind
+                .iter_mut()
+                .find(|restart| restart.hash == hash)
+            {
+                Some(restart) => restart.requested = true,
+                None => self.restart_after_rebind.push(Restart {
+                    hash,
+                    old: None,
+                    requested: true,
+                }),
+            }
+            return;
+        }
         let (peer_id, timeout) = (self.settings.peer_id, self.settings.peer_timeout);
         let spawned = if self.client.torrents()[index].info().is_some() {
             self.client.spawn_download(index, peer_id, timeout)
@@ -1752,13 +1922,18 @@ impl Engine {
             return;
         };
         let name = self.name(&hash);
+        for restart in &mut self.restart_after_rebind {
+            if restart.hash == hash {
+                restart.requested = false;
+            }
+        }
         let activity = self.activity.entry(hash).or_default();
         activity.start_after_verify = false;
         if let Some(job) = &activity.job {
+            // A cancelled check leaves the torrent as it was, so a seed
+            // being checked is paused once the check has stopped.
             job.cancel();
-            if job.kind() != TransferKind::Verify {
-                activity.pausing = true;
-            }
+            activity.pausing = true;
             return;
         }
         activity.queued_verify = false;
@@ -1933,16 +2108,24 @@ impl Engine {
             return;
         };
         let (root, paths) = self.client.file_paths(index);
-        let job = self
+        let mut job = self
             .activity
             .remove(&hash)
             .and_then(|activity| activity.job);
+        if let Some(position) = self
+            .restart_after_rebind
+            .iter()
+            .position(|restart| restart.hash == hash)
+        {
+            job = job.or(self.restart_after_rebind.remove(position).old);
+        }
         if let Some(job) = &job {
             job.cancel();
         }
         self.verify_queue.retain(|queued| *queued != hash);
         self.scrapes.remove(&hash);
         let Ok(torrent) = self.client.remove_torrent(index) else {
+            self.detached.extend(job);
             return;
         };
         if self.labels.forget(&hash) {
@@ -2120,7 +2303,7 @@ impl Engine {
             let Some(activity) = self.activity.get_mut(&hash) else {
                 continue;
             };
-            activity.pausing = false;
+            let was_pausing = std::mem::take(&mut activity.pausing);
             activity.down.idle();
             let mut start_next = std::mem::take(&mut activity.start_after_verify);
             let notice = match (kind, result) {
@@ -2160,6 +2343,8 @@ impl Engine {
             self.session_dirty = true;
             if start_next {
                 self.start(hash);
+            } else if kind == TransferKind::Verify && was_pausing {
+                self.pause(hash);
             }
         }
     }
@@ -2218,19 +2403,36 @@ impl Engine {
                 None => activity.up.idle(),
             }
         }
+        // A torrent removed this tick may still be in the runtime until
+        // it next syncs.
         for hash in uploaded.keys() {
-            self.activity.entry(*hash).or_default();
+            if self.client.torrent_index(hash).is_some() {
+                self.activity.entry(*hash).or_default();
+            }
         }
     }
 
     // ----- helpers ------------------------------------------------------------
 
+    /// Saves the session. A failure keeps it unsaved, to be tried again
+    /// a little later, and is reported once until a save works again.
     fn save(&mut self) {
         match self.store.save(&self.client) {
-            Ok(()) => self.session_dirty = false,
-            Err(error) => {
+            Ok(()) => {
                 self.session_dirty = false;
-                self.notify(Level::Error, error);
+                if self.save_problem.take().is_some() {
+                    self.notify(Level::Success, "Saved the session again");
+                }
+            }
+            Err(error) => {
+                self.save_retry_at = Instant::now() + SAVE_RETRY;
+                if self.save_problem.as_ref() != Some(&error) {
+                    self.notify(
+                        Level::Error,
+                        format!("{error}; trying again every {} s", SAVE_RETRY.as_secs()),
+                    );
+                    self.save_problem = Some(error);
+                }
             }
         }
     }
@@ -3040,6 +3242,221 @@ mod tests {
         assert_eq!(notice.level, Level::Error);
         assert!(notice.text.contains("labels.damaged"), "{}", notice.text);
         assert!(root.join("data/labels.damaged").exists());
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A single-file `.torrent` for `content`, named `name`, in pieces
+    /// of `piece_length`.
+    fn single_file(name: &str, content: &[u8], piece_length: usize) -> Vec<u8> {
+        use sha1::Digest;
+        let mut torrent = format!(
+            "d4:infod6:lengthi{}e4:name{}:{name}12:piece lengthi{piece_length}e6:pieces{}:",
+            content.len(),
+            name.len(),
+            content.len().div_ceil(piece_length) * 20
+        )
+        .into_bytes();
+        for piece in content.chunks(piece_length) {
+            torrent.extend(sha1::Sha1::digest(piece));
+        }
+        torrent.extend(b"ee");
+        torrent
+    }
+
+    /// Adds `torrent` saved in `folder` and starts it.
+    fn add_started(handle: &Handle, torrent: Vec<u8>, folder: PathBuf) -> InfoHash {
+        let mut request = AddRequest::new(AddSource::Torrent(torrent));
+        request.save_dir = Some(folder);
+        request.start = Some(true);
+        let Ok(Reply::Added(hash)) = handle.call(Command::AddWith(request)) else {
+            panic!("not added");
+        };
+        hash
+    }
+
+    fn seeds(snapshot: &Snapshot, count: usize) -> bool {
+        matches!(snapshot.network.seed_status, SeedStatus::Listening { torrents } if torrents == count)
+    }
+
+    /// A seed whose files cannot be read (here a folder on the way is a
+    /// file, as an unmounted drive or a lost permission would be) is shown
+    /// as an error, and seeds after it in the list still seed; once its
+    /// files are back, it seeds again by itself.
+    #[test]
+    fn one_unreadable_seed_does_not_stop_the_others() {
+        let (handle, root) = engine("left-out");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/a.txt"), b"first seed").unwrap();
+        std::fs::write(root.join("b/b.txt"), b"second seed").unwrap();
+        let first = add_started(
+            &handle,
+            single_file("a.txt", b"first seed", 16384),
+            root.join("a"),
+        );
+        let second = add_started(
+            &handle,
+            single_file("b.txt", b"second seed", 16384),
+            root.join("b"),
+        );
+        assert!(
+            wait_for(&handle, 20, |snapshot| seeds(snapshot, 2)),
+            "never seeded both"
+        );
+        handle.shutdown();
+
+        std::fs::remove_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a"), b"not a folder").unwrap();
+        let handle = start_in(&root);
+        assert!(
+            wait_for(&handle, 20, |snapshot| seeds(snapshot, 1)
+                && snapshot.torrent(&first).unwrap().status == Status::Error),
+            "the second seed did not seed: {:?}",
+            handle.snapshot().network.seed_status
+        );
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.torrent(&second).unwrap().status, Status::Seeding);
+        let error = snapshot.torrent(&first).unwrap().error.clone().unwrap();
+        assert!(error.contains("cannot read its files"), "{error}");
+        assert!(
+            snapshot
+                .notices
+                .iter()
+                .any(|notice| notice.text.starts_with("a.txt is not seeding"))
+        );
+
+        std::fs::remove_file(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/a.txt"), b"first seed").unwrap();
+        assert!(
+            wait_for(&handle, 20, |snapshot| seeds(snapshot, 2)
+                && snapshot.torrent(&first).unwrap().status == Status::Seeding),
+            "the first seed did not come back"
+        );
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Pausing a seed while it is being rechecked pauses it once the check
+    /// has stopped (a cancelled check leaves a torrent as it was).
+    #[test]
+    fn pausing_a_seed_during_a_recheck_pauses_it() {
+        let (handle, root) = engine("pause-check");
+        // Large enough that the check is still going when the pause comes.
+        let content = vec![0; 64 << 20];
+        let file = std::fs::File::create(root.join("big.bin")).unwrap();
+        file.set_len(content.len() as u64).unwrap();
+        let hash = add_started(
+            &handle,
+            single_file("big.bin", &content, 4 << 20),
+            root.clone(),
+        );
+        assert!(
+            wait_for(&handle, 60, |snapshot| snapshot
+                .torrent(&hash)
+                .unwrap()
+                .status
+                == Status::Seeding
+                && seeds(snapshot, 1)),
+            "never seeded"
+        );
+        handle.call(Command::Recheck(hash)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.snapshot().torrent(&hash).unwrap().status != Status::Checking {
+            assert!(Instant::now() < deadline, "the check never started");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        handle.call(Command::Pause(hash)).unwrap();
+        assert!(
+            wait_for(&handle, 20, |snapshot| snapshot
+                .torrent(&hash)
+                .unwrap()
+                .status
+                == Status::Paused
+                && seeds(snapshot, 0)),
+            "still {:?}",
+            handle.snapshot().torrent(&hash).unwrap().status
+        );
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            handle.snapshot().torrent(&hash).unwrap().status,
+            Status::Paused
+        );
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Commands arriving back to back from several interfaces never hold
+    /// back the engine's background work (here, a queued check).
+    #[test]
+    fn background_work_goes_on_under_a_stream_of_commands() {
+        let (handle, root) = engine("busy");
+        std::fs::write(root.join("busy.txt"), b"some data").unwrap();
+        let mut request = AddRequest::new(AddSource::Torrent(single_file(
+            "busy.txt",
+            b"some data",
+            16384,
+        )));
+        request.save_dir = Some(root.clone());
+        request.start = Some(false);
+        let Ok(Reply::Added(hash)) = handle.call(Command::AddWith(request)) else {
+            panic!("not added");
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let callers: Vec<_> = (0..32)
+            .map(|_| {
+                let (handle, stop) = (handle.clone(), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = handle.call(Command::Peers(hash));
+                    }
+                })
+            })
+            .collect();
+        let checked = wait_for(&handle, 10, |snapshot| {
+            snapshot.torrent(&hash).unwrap().fraction == Some(1.0)
+        });
+        stop.store(true, Ordering::Relaxed);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert!(checked, "the queued check never ran");
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A session save that fails (here its folder is a file) is reported
+    /// once and tried again until it works.
+    #[test]
+    fn tries_a_failed_session_save_again() {
+        let (handle, root) = engine("save-retry");
+        let session = root.join("data").join("session");
+        let _ = std::fs::remove_dir_all(&session);
+        std::fs::write(&session, b"in the way").unwrap();
+        let (link, hash) = magnet(3);
+        handle.call(Command::Add(link)).unwrap();
+        let failures = |snapshot: &Snapshot| {
+            snapshot
+                .notices
+                .iter()
+                .filter(|notice| notice.text.starts_with("cannot save session"))
+                .count()
+        };
+        assert!(wait_for(&handle, 10, |snapshot| failures(snapshot) == 1));
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(failures(&handle.snapshot()), 1, "reported once");
+
+        std::fs::remove_file(&session).unwrap();
+        assert!(wait_for(&handle, 10, |snapshot| {
+            snapshot
+                .notices
+                .iter()
+                .any(|notice| notice.text == "Saved the session again")
+        }));
+        handle.shutdown();
+        let handle = start_in(&root);
+        assert!(handle.snapshot().torrent(&hash).is_some(), "it was saved");
         handle.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

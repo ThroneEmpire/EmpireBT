@@ -603,10 +603,13 @@ impl Client {
                 continue;
             };
             let storage = self.storage_for(torrent);
+            // One whose files cannot be read is left out, not the whole
+            // runtime; [`Client::sync_runtime`] reports it and adds it
+            // once they can.
             if !matches!(
                 torrent.state(),
                 crate::TransferState::Seeding | crate::TransferState::Complete
-            ) || !storage.has_expected_files(&info)?
+            ) || !storage.has_expected_files(&info).unwrap_or(false)
             {
                 continue;
             }
@@ -657,9 +660,14 @@ impl Client {
     /// seeding torrents not yet in it join, and paused or removed ones
     /// leave. Downloads manage their own place in it. Connections of
     /// torrents that stay are untouched.
-    pub fn sync_runtime(&self, peer_id: [u8; 20], timeout: Duration) -> Result<(), BackendError> {
+    ///
+    /// Returns the seeding torrents that could not join, each with the
+    /// reason: files missing or of the wrong size, or unreadable. One such
+    /// torrent never keeps the others from joining or leaving.
+    pub fn sync_runtime(&self, peer_id: [u8; 20], timeout: Duration) -> Vec<([u8; 20], String)> {
+        let mut left_out = Vec::new();
         let Some(runtime) = &self.runtime else {
-            return Ok(());
+            return left_out;
         };
         let mut wanted = std::collections::HashSet::new();
         for torrent in &self.torrents {
@@ -678,18 +686,35 @@ impl Client {
                 continue;
             };
             wanted.insert(hash);
-            let storage = self.storage_for(torrent);
-            if runtime.contains(&hash) || !storage.has_expected_files(&info)? {
+            if runtime.contains(&hash) {
                 continue;
             }
+            let storage = self.storage_for(torrent);
+            match storage.has_expected_files(&info) {
+                Ok(true) => {}
+                Ok(false) => {
+                    left_out.push((
+                        hash,
+                        "its files are missing or changed size; recheck it".to_owned(),
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    left_out.push((hash, format!("cannot read its files: {error}")));
+                    continue;
+                }
+            }
             let peer_id = self.peer_id_for(Some(&info), peer_id);
-            match info.format() {
-                crate::TorrentFormat::V2 => runtime.add_v2_seeder(
-                    crate::V2Seeder::from_verified(info, storage, peer_id, timeout),
-                )?,
+            let added = match info.format() {
+                crate::TorrentFormat::V2 => runtime.add_v2_seeder(crate::V2Seeder::from_verified(
+                    info, storage, peer_id, timeout,
+                )),
                 crate::TorrentFormat::V1 | crate::TorrentFormat::Hybrid => runtime.add_seeder(
                     crate::Seeder::from_verified(info, storage, peer_id, timeout),
-                )?,
+                ),
+            };
+            if let Err(error) = added {
+                left_out.push((hash, format!("cannot seed it: {error}")));
             }
         }
         for hash in runtime.info_hashes() {
@@ -697,7 +722,7 @@ impl Client {
                 runtime.remove(&hash);
             }
         }
-        Ok(())
+        left_out
     }
 
     /// Starts a managed torrent by its index.
