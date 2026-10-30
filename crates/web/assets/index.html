@@ -112,7 +112,10 @@
     <section class="detail" id="detail" aria-label="Torrent details">
       <div class="detail-head">
         <button id="detail-back" class="back" aria-label="Back to the list"><svg class="icon"><use href="#i-back"/></svg><span>Torrents</span></button>
-        <h2 id="detail-title" class="detail-title"></h2>
+        <div class="detail-name">
+          <h2 id="detail-title" class="detail-title"></h2>
+          <button id="rename-torrent" class="rename" type="button" disabled title="Rename the torrent" aria-label="Rename the torrent"><svg class="icon"><use href="#i-rename"/></svg></button>
+        </div>
         <div class="selection-actions">
           <button data-action="start" disabled title="Start"><svg class="icon"><use href="#i-start"/></svg><span>Start</span></button>
           <button data-action="pause" disabled title="Pause"><svg class="icon"><use href="#i-pause"/></svg><span>Pause</span></button>

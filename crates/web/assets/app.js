@@ -625,6 +625,7 @@ function renderActions() {
   for (const button of document.querySelectorAll(".selection-actions button")) {
     button.disabled = !torrent;
   }
+  $("#rename-torrent").disabled = !torrent;
   setText($("#detail-title"), torrent ? torrent.name : "");
 }
 
@@ -851,16 +852,9 @@ function filesView() {
   const details = ui.details;
   if (!details) return [element("p", { class: "muted", text: "Loading…" })];
   const torrent = details.torrent;
-  const renamedShown = torrent.name !== details.originalName;
-  const nameRow = element("div", { class: "name-row" }, [
-    element("div", { class: "name-text" }, [
-      element("span", { class: "label", text: "Name" }),
-      element("span", { class: "value", text: torrent.name }),
-      renamedShown ? element("span", { class: "faint", text: `Its own name: ${details.originalName}` }) : null,
-    ]),
-    renameButton("Rename the torrent", () => renameTorrentDialog(torrent, details.originalName)),
-  ]);
-  if (torrent.magnet) return [nameRow, element("p", { class: "muted", text: "The file list arrives with the metadata." })];
+  // Only files and folders, as qBittorrent's Content tab: the torrent's own
+  // name, and its ✎, are in the header.
+  if (torrent.magnet) return [element("p", { class: "muted", text: "The file list arrives with the metadata." })];
   const rows = [];
   const walk = (folder, depth) => {
     for (const child of [...folder.folders.values()].sort(byName)) {
@@ -883,7 +877,7 @@ function filesView() {
     }
   };
   walk(fileTree(details.files), 0);
-  return [nameRow, element("table", { class: "files" }, [element("tbody", {}, rows)])];
+  return [element("table", { class: "files" }, [element("tbody", {}, rows)])];
 }
 
 function renameTorrentDialog(torrent, originalName) {
@@ -1101,6 +1095,14 @@ for (const button of document.querySelectorAll(".selection-actions button")) {
 }
 
 $("#add-button").addEventListener("click", addDialog);
+// The torrent's own name comes with its details; until they arrive, the
+// name shown stands in.
+$("#rename-torrent").addEventListener("click", () => {
+  const torrent = selectedTorrent();
+  if (!torrent) return;
+  const own = ui.details && ui.details.torrent.hash === torrent.hash ? ui.details.originalName : torrent.name;
+  renameTorrentDialog(torrent, own);
+});
 $("#settings-button").addEventListener("click", settingsDialog);
 
 // Dropping a .torrent file anywhere adds it.

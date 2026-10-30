@@ -538,6 +538,11 @@ fn a_signed_in_browser_drives_the_engine() {
     .json();
     assert_eq!(details["torrent"]["name"], "Holiday clip");
     assert_eq!(details["originalName"], "clip.mkv");
+    assert_eq!(
+        details["files"].as_array().map(Vec::len),
+        Some(1),
+        "a one-file torrent lists its file once"
+    );
     assert_eq!(details["files"][0]["path"], "clip/clip.mkv");
     assert_eq!(details["files"][0]["original"], "clip.mkv");
     // Removing it can delete its files too.

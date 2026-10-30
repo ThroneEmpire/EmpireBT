@@ -417,8 +417,10 @@ button.chip { padding: 6px 12px; font-size: 13px; }
 }
 .detail-head { display: flex; align-items: center; gap: 12px; padding: 12px 16px 8px; min-width: 0; }
 .detail-head .back { display: none; }
+.detail-name { flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; }
+.detail-name button.rename:disabled { visibility: hidden; }
 .detail-title {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   margin: 0;
   font-size: 15px;
@@ -469,10 +471,6 @@ button.rename { display: inline-grid; place-items: center; width: 34px; height: 
 button.rename .icon { width: 17px; height: 17px; }
 button.rename:active { transform: scale(0.9); background: var(--surface-2); }
 @media (hover: hover) { button.rename:hover { background: var(--surface-2); color: var(--text); } }
-.name-row { display: flex; align-items: center; gap: 8px; padding: 0 0 12px; margin-bottom: 4px; border-bottom: 1px solid var(--line); }
-.name-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.name-text .label { font-size: 12px; color: var(--muted); }
-.name-text .faint { font-size: 12px; color: var(--faint); }
 button.reannounce { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 10px; }
 button.reannounce .icon { width: 16px; height: 16px; }
 .trackers { margin: 0; padding: 0; list-style: none; }
@@ -791,9 +789,9 @@ input.switch:checked { background: var(--bad); }
   }
   .detail-head .back { display: inline-flex; background: none; color: var(--accent); padding: 6px 6px 6px 0; gap: 2px; font-size: 16px; font-weight: 500; }
   .detail-head .back .icon { width: 24px; height: 24px; }
+  .detail-name { flex: 1 0 100%; order: 2; align-items: flex-start; }
+  .detail-name button.rename { margin-top: 2px; }
   .detail-title {
-    flex: 1 0 100%;
-    order: 2;
     padding: 2px 6px 4px;
     font-size: 22px;
     font-weight: 700;
@@ -839,7 +837,6 @@ input.switch:checked { background: var(--bad); }
   .files td { padding: 10px 14px; }
   .files td.path { padding-left: calc(14px + var(--depth, 0) * 16px); }
   .files td.act { padding: 0 6px 0 0; }
-  .name-row { background: var(--surface); border-radius: var(--radius-big); padding: 10px 8px 10px 16px; margin-bottom: 14px; border-bottom: none; }
   .trackers li { padding: 10px 14px; }
 
   /* Peers as two-line entries: where, then what it is doing. */
