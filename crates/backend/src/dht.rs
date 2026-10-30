@@ -1650,7 +1650,10 @@ mod tests {
             eprintln!("skipped: no non-loopback IPv4 address");
             return;
         };
-        let node = local_node(Vec::new());
+        // Port 0: the system picks one nobody else holds. (A port found
+        // free and then bound can be taken meanwhile by another test's
+        // node, which would answer some of these pings itself.)
+        let node = Dht::start(0, Vec::new(), None).unwrap();
         let client = UdpSocket::bind((own, 0)).unwrap();
         client
             .set_read_timeout(Some(Duration::from_millis(300)))

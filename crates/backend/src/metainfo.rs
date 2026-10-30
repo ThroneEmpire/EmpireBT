@@ -129,6 +129,7 @@ impl TorrentInfo {
     ) -> Result<Self, crate::BackendError> {
         let name = name.into();
         validate_fields(&name, piece_length, &files)?;
+        validate_sizes(piece_length, &files, Some(pieces.len()), 0)?;
         let info_hash = v1_info_hash(&name, piece_length, &pieces, &files);
         Ok(Self {
             name,
@@ -239,6 +240,16 @@ impl TorrentInfo {
             return Err(invalid("torrent has no v1 files or v2 file tree"));
         };
         validate_fields(&name, piece_length, &files)?;
+        let v2_pieces = v2_files
+            .iter()
+            .map(|file| file.length.div_ceil(u64::from(piece_length.max(1))).max(1))
+            .fold(0_u64, u64::saturating_add);
+        validate_sizes(
+            piece_length,
+            &files,
+            v1_pieces.is_some().then_some(pieces.len()),
+            v2_pieces,
+        )?;
 
         let announce = find(root_dict, b"announce")
             .map(|value| text(value, "announce"))
@@ -732,6 +743,61 @@ fn validate_fields(
     Ok(())
 }
 
+/// Largest piece accepted: libtorrent's `max_piece_size`, just under
+/// 512 MiB. Each piece is held in memory while it is checked.
+const MAX_PIECE_LENGTH: u32 = 32_767 * 16_384;
+/// Largest file: libtorrent's `max_file_size`, about 16 TiB, the most a v2
+/// Merkle tree with 32-bit indices holds.
+const MAX_FILE_LENGTH: u64 = (i32::MAX as u64 / 2) * 16_384;
+/// Largest torrent: libtorrent's `max_file_offset`, 2^48 - 1 bytes (256 TiB).
+const MAX_TOTAL_LENGTH: u64 = (1 << 48) - 1;
+/// Most pieces: libtorrent's default `max_pieces`, which bounds the memory
+/// a torrent's piece lists take.
+const MAX_PIECES: u64 = 0x20_0000;
+
+/// The sizes a torrent declares, checked as libtorrent checks them, so a
+/// hostile or broken .torrent cannot overflow our arithmetic or make us
+/// allocate absurd piece lists. A v1 torrent (`v1_pieces`, its count of
+/// piece hashes) must have exactly one hash per piece of its size: more
+/// would read past the end, fewer would leave its end never downloaded.
+fn validate_sizes(
+    piece_length: u32,
+    files: &[TorrentFile],
+    v1_pieces: Option<usize>,
+    v2_pieces: u64,
+) -> Result<(), crate::BackendError> {
+    if piece_length > MAX_PIECE_LENGTH {
+        return Err(invalid("piece length is larger than 512 MiB"));
+    }
+    let mut total: u64 = 0;
+    for file in files {
+        if file.length > MAX_FILE_LENGTH {
+            return Err(invalid(format!(
+                "file {} is larger than 16 TiB",
+                file.path.display()
+            )));
+        }
+        total = total
+            .checked_add(file.length)
+            .filter(|total| *total <= MAX_TOTAL_LENGTH)
+            .ok_or_else(|| invalid("torrent is larger than 256 TiB"))?;
+    }
+    let pieces_needed = total.div_ceil(u64::from(piece_length));
+    if pieces_needed > MAX_PIECES || v2_pieces > MAX_PIECES {
+        return Err(invalid(format!(
+            "torrent has more than {MAX_PIECES} pieces"
+        )));
+    }
+    if let Some(hashes) = v1_pieces
+        && hashes as u64 != pieces_needed
+    {
+        return Err(invalid(format!(
+            "torrent has {hashes} piece hashes, but its size needs {pieces_needed}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_v2_piece_length(piece_length: u32) -> Result<(), crate::BackendError> {
     if piece_length < 16 * 1024 || !piece_length.is_power_of_two() {
         return Err(invalid(
@@ -997,9 +1063,76 @@ mod tests {
         ));
     }
 
+    /// A single-file v1 torrent of `length` bytes in pieces of
+    /// `piece_length`, listing `hashes` piece hashes.
+    fn sized(length: u64, piece_length: u64, hashes: usize) -> Vec<u8> {
+        let mut bytes = format!(
+            "d4:infod6:lengthi{length}e4:name4:test12:piece lengthi{piece_length}e6:pieces{}:",
+            hashes * 20
+        )
+        .into_bytes();
+        bytes.extend(std::iter::repeat_n(7, hashes * 20));
+        bytes.extend(b"ee");
+        bytes
+    }
+
+    #[test]
+    fn checks_declared_sizes_as_libtorrent_does() {
+        let error = |bytes: Vec<u8>| match TorrentInfo::from_bytes(&bytes) {
+            Err(crate::BackendError::InvalidMetainfo(message)) => message,
+            other => panic!("accepted: {other:?}"),
+        };
+        // Exactly one hash per piece: 40,000 bytes in 16 KiB pieces is 3.
+        assert!(TorrentInfo::from_bytes(&sized(40_000, 16_384, 3)).is_ok());
+        assert!(
+            error(sized(40_000, 16_384, 2)).contains("needs 3"),
+            "too few"
+        );
+        assert!(
+            error(sized(40_000, 16_384, 4)).contains("needs 3"),
+            "too many"
+        );
+        // Pieces of at most about 512 MiB.
+        assert!(error(sized(1 << 30, 1 << 30, 1)).contains("512 MiB"));
+        // Files of at most about 16 TiB, torrents of at most 256 TiB.
+        assert!(error(sized(1 << 45, 1 << 20, 0)).contains("16 TiB"));
+        // At most 2,097,152 pieces: 4 GiB in 1 KiB pieces would be 4 Mi.
+        assert!(error(sized(1 << 32, 1 << 10, 0)).contains("more than 2097152 pieces"));
+        // Built in code, the same rules.
+        let built = TorrentInfo::new(
+            "test",
+            16_384,
+            vec![[0; 20]; 2],
+            vec![TorrentFile::new("test", 40_000)],
+        );
+        assert!(built.is_err());
+    }
+
+    #[test]
+    fn refuses_torrents_larger_than_256_tib() {
+        // Twenty 15 TiB files: each allowed, together too large, and their
+        // lengths summed would not overflow quietly.
+        let mut files = String::new();
+        for index in 0..20 {
+            files.push_str(&format!(
+                "d6:lengthi{}e4:pathl1:{}ee",
+                15_u64 << 40,
+                (b'a' + index) as char
+            ));
+        }
+        let bytes =
+            format!("d4:infod5:filesl{files}e4:name4:test12:piece lengthi536854528e6:pieces0:ee");
+        match TorrentInfo::from_bytes(bytes.as_bytes()) {
+            Err(crate::BackendError::InvalidMetainfo(message)) => {
+                assert!(message.contains("256 TiB"), "{message}");
+            }
+            other => panic!("accepted: {other:?}"),
+        }
+    }
+
     #[test]
     fn keeps_tracker_tiers_and_lets_the_list_replace_announce() {
-        let bytes = b"d8:announce20:http://only.example/13:announce-listll12:http://a.ex/12:http://b.ex/el12:http://c.ex/12:http://a.ex/ee4:infod4:name3:foo6:lengthi4e6:pieces0:12:piece lengthi16384eee";
+        let bytes = b"d8:announce20:http://only.example/13:announce-listll12:http://a.ex/12:http://b.ex/el12:http://c.ex/12:http://a.ex/ee4:infod4:name3:foo6:lengthi4e6:pieces20:AAAAAAAAAAAAAAAAAAAA12:piece lengthi16384eee";
         let info = TorrentInfo::from_bytes(bytes).unwrap();
         assert_eq!(
             info.tracker_tiers(),
@@ -1012,7 +1145,7 @@ mod tests {
             info.tracker_urls(),
             ["http://a.ex/", "http://b.ex/", "http://c.ex/"]
         );
-        let bytes = b"d8:announce20:http://only.example/4:infod4:name3:foo6:lengthi4e6:pieces0:12:piece lengthi16384eee";
+        let bytes = b"d8:announce20:http://only.example/4:infod4:name3:foo6:lengthi4e6:pieces20:AAAAAAAAAAAAAAAAAAAA12:piece lengthi16384eee";
         let info = TorrentInfo::from_bytes(bytes).unwrap();
         assert_eq!(
             info.tracker_tiers(),
@@ -1022,7 +1155,7 @@ mod tests {
 
     #[test]
     fn parses_tracker_tiers_without_duplicates() {
-        let bytes = b"d13:announce-listll27:http://tracker.example/main29:http://tracker.example/backupee4:infod4:name3:foo6:lengthi4e6:pieces0:12:piece lengthi16384eee";
+        let bytes = b"d13:announce-listll27:http://tracker.example/main29:http://tracker.example/backupee4:infod4:name3:foo6:lengthi4e6:pieces20:AAAAAAAAAAAAAAAAAAAA12:piece lengthi16384eee";
 
         let info = TorrentInfo::from_bytes(bytes).expect("valid tracker metadata");
 

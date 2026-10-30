@@ -313,7 +313,10 @@ mod tests {
                    ZxI89aL4n+4alv4TqbZN0czUPrrIHxfPeTY0BgWNnJo";
         assert!(verify_password(old, "correct horse battery staple"));
         assert!(!verify_password(old, "correct horse battery stable"));
-        assert!(!verify_password("not a hash", "correct horse battery staple"));
+        assert!(!verify_password(
+            "not a hash",
+            "correct horse battery staple"
+        ));
         // New hashes have the same form, and their own salt each time.
         let new = hash_password("correct horse battery staple").unwrap();
         assert!(new.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "{new}");
