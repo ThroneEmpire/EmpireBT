@@ -12,7 +12,7 @@ resolver = "3"
 # see it in our peer ID (-EM0100-), extension handshake ("EmpireBT 0.1.0"),
 # DHT messages, and tracker requests. Bump it here, once, for a release.
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["ThroneEmpire"]

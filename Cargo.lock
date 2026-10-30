@@ -665,7 +665,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "empirebt-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "empirebt-backend",
  "flate2",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "empirebt-backend"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "if-addrs",
  "mio",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "empirebt-console"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "crossterm",
@@ -707,14 +707,14 @@ dependencies = [
 
 [[package]]
 name = "empirebt-interop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "empirebt-backend",
 ]
 
 [[package]]
 name = "empirebt-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "axum",
