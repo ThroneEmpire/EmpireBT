@@ -13,8 +13,8 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -41,11 +41,31 @@ const HEALTHY_NODES: usize = 64;
 const FILLING_REFRESH: Duration = Duration::from_secs(15);
 /// How long to wait for the remaining nodes once most have answered.
 const STRAGGLER_GRACE: Duration = Duration::from_millis(250);
+/// How often waits check whether the node is stopping.
+const SHUTDOWN_CHECK: Duration = Duration::from_millis(100);
 /// How long an address that ignored a query is skipped.
 const SILENT_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_SILENT: usize = 10_000;
 /// A node that missed this many queries in a row may be replaced.
 const MAX_FAILURES: u8 = 2;
+/// A node not heard from for this long is pinged, as libtorrent does, so
+/// nodes that went away make room for live ones.
+const STALE_AFTER: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(15 * 60)
+};
+/// How often stale nodes are pinged, and how many at a time.
+const PING_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(250)
+} else {
+    Duration::from_secs(60)
+};
+const PINGS_PER_ROUND: usize = 8;
+/// Lookups running at once, over every torrent (seeds announce at most 16
+/// at a time, so downloads always have room), so a start with many
+/// torrents does not burst thousands of queries.
+const MAX_LOOKUPS: usize = 32;
 
 /// Well-known public bootstrap nodes.
 pub const DEFAULT_BOOTSTRAP: [&str; 3] = [
@@ -82,18 +102,29 @@ impl RoutingTable {
         (zeros < 160).then_some(zeros)
     }
 
-    /// Records a node that just responded or queried us.
+    /// Records a node that just responded or queried us. One node per
+    /// IP address, as libtorrent's `restrict_routing_ips`: otherwise one
+    /// machine could fill the table under made-up ids and steer every
+    /// lookup. An address that comes back with a new id (it restarted, or
+    /// moved to a BEP 42 id) replaces its old entry. This computer's own
+    /// nodes, which share the loopback address, are exempt.
     fn insert(&mut self, id: NodeId, address: SocketAddr) {
         let Some(index) = self.bucket_index(&id) else {
             return;
         };
-        let bucket = &mut self.buckets[index];
-        if let Some(node) = bucket.iter_mut().find(|node| node.id == id) {
+        if let Some(node) = self.buckets[index].iter_mut().find(|node| node.id == id) {
             node.address = address;
             node.last_seen = Instant::now();
             node.failures = 0;
             return;
         }
+        for bucket in &mut self.buckets {
+            bucket.retain(|node| node.address != address);
+        }
+        if !address.ip().is_loopback() && self.all().any(|node| node.address.ip() == address.ip()) {
+            return;
+        }
+        let bucket = &mut self.buckets[index];
         let node = Node {
             id,
             address,
@@ -144,8 +175,22 @@ impl RoutingTable {
         }
     }
 
+    /// Nodes that answer, leaving out those that missed queries.
     fn len(&self) -> usize {
-        self.buckets.iter().map(Vec::len).sum()
+        self.all()
+            .filter(|node| node.failures < MAX_FAILURES)
+            .count()
+    }
+
+    /// Up to `count` nodes not heard from for [`STALE_AFTER`], longest
+    /// silent first.
+    fn stale(&self, count: usize) -> Vec<SocketAddr> {
+        let mut nodes: Vec<&Node> = self
+            .all()
+            .filter(|node| node.failures < MAX_FAILURES && node.last_seen.elapsed() >= STALE_AFTER)
+            .collect();
+        nodes.sort_by_key(|node| node.last_seen);
+        nodes.iter().take(count).map(|node| node.address).collect()
     }
 
     fn all(&self) -> impl Iterator<Item = &Node> {
@@ -215,8 +260,9 @@ struct Inner {
     /// Addresses ignored for flooding us.
     blocker: Mutex<Blocker>,
     table: Mutex<RoutingTable>,
+    /// Queries awaiting a response, by transaction id (random, as
+    /// libtorrent's, so a forged response cannot guess one).
     pending: Mutex<HashMap<[u8; 2], Pending>>,
-    next_transaction: AtomicU16,
     store: Mutex<PeerStore>,
     secrets: Mutex<Secrets>,
     shutdown: AtomicBool,
@@ -240,6 +286,9 @@ struct Inner {
 pub struct Dht {
     families: Vec<Arc<Inner>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Lookups running, at most [`MAX_LOOKUPS`]; others wait their turn.
+    lookups_running: Mutex<usize>,
+    lookup_done: Condvar,
 }
 
 impl Dht {
@@ -294,6 +343,8 @@ impl Dht {
         Ok(Arc::new(Self {
             families,
             threads: Mutex::new(threads),
+            lookups_running: Mutex::new(0),
+            lookup_done: Condvar::new(),
         }))
     }
 
@@ -369,14 +420,60 @@ impl Dht {
                 })
             })
             .collect();
+        // One deadline for every acknowledgement, not one each.
+        let deadline = Instant::now() + QUERY_TIMEOUT;
         for receiver in receivers.into_iter().flatten() {
-            let _ = receiver.recv_timeout(QUERY_TIMEOUT);
+            while !self.stopping() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero()
+                    || !matches!(
+                        receiver.recv_timeout(remaining.min(SHUTDOWN_CHECK)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    )
+                {
+                    break;
+                }
+            }
         }
         peers
     }
 
-    /// Runs a lookup on each family's node at once.
+    fn stopping(&self) -> bool {
+        self.families
+            .iter()
+            .any(|inner| inner.shutdown.load(Ordering::Acquire))
+    }
+
+    /// Runs a lookup on each family's node at once, once fewer than
+    /// [`MAX_LOOKUPS`] are running; none once the DHT is stopping.
     fn lookups(&self, info_hash: &[u8; 20]) -> Vec<(&Arc<Inner>, Lookup)> {
+        {
+            let mut running = self
+                .lookups_running
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while *running >= MAX_LOOKUPS {
+                if self.stopping() {
+                    return Vec::new();
+                }
+                running = self
+                    .lookup_done
+                    .wait_timeout(running, SHUTDOWN_CHECK)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0;
+            }
+            *running += 1;
+        }
+        let lookups = self.run_lookups(info_hash);
+        *self
+            .lookups_running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) -= 1;
+        self.lookup_done.notify_one();
+        lookups
+    }
+
+    fn run_lookups(&self, info_hash: &[u8; 20]) -> Vec<(&Arc<Inner>, Lookup)> {
         std::thread::scope(|scope| {
             let running: Vec<_> = self
                 .families
@@ -610,7 +707,6 @@ impl Inner {
             blocker: Mutex::new(Blocker::default()),
             table: Mutex::new(table),
             pending: Mutex::new(HashMap::new()),
-            next_transaction: AtomicU16::new(u16::from_be_bytes([random_bytes::<1>()[0], 0])),
             store: Mutex::new(PeerStore::default()),
             secrets: Mutex::new(Secrets {
                 current: random_bytes(),
@@ -687,27 +783,7 @@ impl Inner {
                     }
                     return;
                 }
-                // Each node takes its own family only.
-                let from = crate::net::canonical(from);
-                if from.is_ipv6() != self.v6 {
-                    return;
-                }
-                // Before any work: a flood costs us as little as possible.
-                if !self
-                    .blocker
-                    .lock()
-                    .is_ok_and(|mut blocker| blocker.allows(from.ip(), Instant::now()))
-                {
-                    return;
-                }
-                let Ok(message) = bencode::decode(bytes) else {
-                    return;
-                };
-                match message.get_bytes(b"y") {
-                    Some(b"q") => self.answer(&message, from),
-                    Some(b"r") | Some(b"e") => self.deliver(message, from),
-                    _ => {}
-                }
+                self.handle(bytes, from);
             },
             || {
                 if let Some(utp) = self.utp.get() {
@@ -715,6 +791,40 @@ impl Inner {
                 }
             },
         );
+    }
+
+    /// Handles one DHT datagram from `from`.
+    fn handle(&self, bytes: &[u8], from: SocketAddr) {
+        // Each node takes its own family only.
+        let from = crate::net::canonical(from);
+        if from.is_ipv6() != self.v6 {
+            return;
+        }
+        let message = bencode::decode(bytes).ok();
+        let kind = message.as_ref().and_then(|message| message.get_bytes(b"y"));
+        // Responses are not counted against the sender: each one
+        // answers a query we sent (others are dropped unread by
+        // `deliver`), and a node we ask a lot, such as a bootstrap
+        // node while the table fills, would otherwise be ignored.
+        if matches!(kind, Some(b"r" | b"e")) {
+            if let Some(message) = message {
+                self.deliver(message, from);
+            }
+            return;
+        }
+        // Before answering: a flood costs us as little as possible.
+        if !self
+            .blocker
+            .lock()
+            .is_ok_and(|mut blocker| blocker.allows(from.ip(), Instant::now()))
+        {
+            return;
+        }
+        if kind == Some(b"q")
+            && let Some(message) = message
+        {
+            self.answer(&message, from);
+        }
     }
 
     /// Routes a response to the query waiting on its transaction id.
@@ -924,10 +1034,17 @@ impl Inner {
         arguments: [(&[u8], Value); N],
         sender: mpsc::Sender<Reply>,
     ) -> Option<[u8; 2]> {
-        let transaction = self
-            .next_transaction
-            .fetch_add(1, Ordering::Relaxed)
-            .to_be_bytes();
+        let Ok(mut pending) = self.pending.lock() else {
+            return None;
+        };
+        let transaction = loop {
+            let transaction = random_bytes::<2>();
+            if !pending.contains_key(&transaction) {
+                break transaction;
+            }
+        };
+        pending.insert(transaction, Pending { address, sender });
+        drop(pending);
         let mut arguments: std::collections::BTreeMap<Vec<u8>, Value> = arguments
             .into_iter()
             .map(|(key, value)| (key.to_vec(), value))
@@ -943,9 +1060,6 @@ impl Inner {
             && let Value::Dict(entries) = &mut message
         {
             entries.insert(b"v".to_vec(), Value::bytes(crate::identity::DHT_VERSION));
-        }
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(transaction, Pending { address, sender });
         }
         match self.socket.send_to(&message.encode(), address) {
             Ok(_) => Some(transaction),
@@ -966,7 +1080,13 @@ impl Inner {
 
     /// Queries several nodes at once and collects the responses that
     /// arrive before the timeout. Silent nodes are marked as failing.
-    fn query_all(&self, addresses: &[SocketAddr], method: &[u8], target: &NodeId) -> Vec<Reply> {
+    /// `target` is the id looked for (none for a ping).
+    fn query_all(
+        &self,
+        addresses: &[SocketAddr],
+        method: &[u8],
+        target: Option<&NodeId>,
+    ) -> Vec<Reply> {
         let (sender, receiver) = mpsc::channel();
         let key: &[u8] = if method == b"find_node" {
             b"target"
@@ -975,22 +1095,28 @@ impl Inner {
         };
         let transactions: Vec<[u8; 2]> = addresses
             .iter()
-            .filter_map(|address| {
-                self.query_into(
+            .filter_map(|address| match target {
+                Some(target) => self.query_into(
                     *address,
                     method,
                     [(key, Value::bytes(*target))],
                     sender.clone(),
-                )
+                ),
+                None => self.query_into(*address, method, [], sender.clone()),
             })
             .collect();
         let sent = transactions.len();
         drop(sender);
         let mut deadline = Instant::now() + QUERY_TIMEOUT;
         let mut replies = Vec::new();
-        while replies.len() < sent {
+        while replies.len() < sent && !self.shutdown.load(Ordering::Acquire) {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match receiver.recv_timeout(remaining) {
+            if remaining.is_zero() {
+                break;
+            }
+            // In slices, so stopping never waits out a whole timeout.
+            match receiver.recv_timeout(remaining.min(SHUTDOWN_CHECK)) {
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Ok(reply) => {
                     replies.push(reply);
                     // Once most nodes answered, give stragglers only a
@@ -1051,6 +1177,11 @@ impl Inner {
                     .or_insert_with(|| xor(target, &[0xff; 20]));
             }
         }
+        // One contact per IP address, as libtorrent's
+        // `restrict_search_ips`, so one machine handing out many made-up
+        // nodes cannot take over the lookup.
+        let mut addresses: HashSet<IpAddr> =
+            candidates.keys().map(|address| address.ip()).collect();
         let mut queried = HashSet::new();
         let mut peers = HashSet::new();
         let mut tokens: Vec<(NodeId, SocketAddr, Vec<u8>)> = Vec::new();
@@ -1078,7 +1209,7 @@ impl Inner {
                 .map(|(address, _)| *address)
                 .collect();
             queried.extend(batch.iter().copied());
-            let replies = self.query_all(&batch, method, target);
+            let replies = self.query_all(&batch, method, Some(target));
             // Silent nodes leave the candidate set, so the lookup only ends
             // once the closest nodes that actually answer were asked.
             for address in &batch {
@@ -1104,7 +1235,11 @@ impl Inner {
                 }
                 if let Some(nodes) = response.get_bytes(self.nodes_key()) {
                     for (id, address) in parse_compact_nodes(nodes, self.v6) {
-                        if id != own_id {
+                        let repeated = !address.ip().is_loopback()
+                            && !candidates.contains_key(&address)
+                            && addresses.contains(&address.ip());
+                        if id != own_id && !repeated {
+                            addresses.insert(address.ip());
                             candidates.entry(address).or_insert(id);
                         }
                     }
@@ -1162,6 +1297,7 @@ impl Inner {
 
     fn maintenance_loop(&self) {
         let mut last_refresh: Option<Instant> = None;
+        let mut last_ping = Instant::now();
         let mut last_save = Instant::now();
         while !self.shutdown.load(Ordering::Acquire) {
             let filling = self.table.lock().map_or(0, |table| table.len()) < HEALTHY_NODES;
@@ -1179,6 +1315,19 @@ impl Inner {
                     self.iterate(&random_bytes(), b"find_node");
                 }
                 last_refresh = Some(Instant::now());
+            }
+            if last_ping.elapsed() >= PING_INTERVAL {
+                // Answers refresh a node (`deliver`); silence marks it
+                // failing, and a second makes room for a live one.
+                let stale = self
+                    .table
+                    .lock()
+                    .map(|table| table.stale(PINGS_PER_ROUND))
+                    .unwrap_or_default();
+                if !stale.is_empty() {
+                    self.query_all(&stale, b"ping", None);
+                }
+                last_ping = Instant::now();
             }
             if let Ok(mut secrets) = self.secrets.lock()
                 && secrets.rotated.elapsed() >= TOKEN_ROTATION
@@ -1461,6 +1610,151 @@ mod tests {
     }
 
     #[test]
+    fn keeps_one_node_per_ip_address_in_the_routing_table() {
+        let mut table = RoutingTable::new([0; 20]);
+        let id = |last: u8| {
+            let mut id = [0; 20];
+            id[0] = 0x80;
+            id[19] = last;
+            id
+        };
+        let address = SocketAddr::from(([203, 0, 113, 5], 6881));
+        table.insert(id(1), address);
+        table.insert(id(2), SocketAddr::from(([203, 0, 113, 5], 7000)));
+        assert_eq!(table.len(), 1, "a second node on the same IP is refused");
+        table.insert(id(3), address);
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.closest(&id(0), 1)[0].id,
+            id(3),
+            "an address with a new id replaces its old entry"
+        );
+        // This computer's own nodes share the loopback address.
+        table.insert(id(4), SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        table.insert(id(5), SocketAddr::from((Ipv4Addr::LOCALHOST, 2)));
+        assert_eq!(table.len(), 3);
+    }
+
+    /// A node we query a lot (a bootstrap node while the table fills)
+    /// answers far more than the flood limit; its answers are never held
+    /// against it.
+    #[test]
+    fn replies_to_our_own_queries_are_never_taken_for_a_flood() {
+        let node = Dht::start(0, Vec::new(), None).unwrap();
+        let inner = node.families.iter().find(|inner| !inner.v6).unwrap();
+        let busy = SocketAddr::from(([198, 51, 100, 7], 6881));
+        let (sender, receiver) = mpsc::channel();
+        for number in 0..BLOCK_RATE as u16 * 2 {
+            let transaction = number.to_be_bytes();
+            inner.pending.lock().unwrap().insert(
+                transaction,
+                Pending {
+                    address: busy,
+                    sender: sender.clone(),
+                },
+            );
+            let reply = Value::dict([
+                (b"t", Value::bytes(transaction)),
+                (b"y", Value::bytes(*b"r")),
+                (b"r", Value::dict([(b"id", Value::bytes([9; 20]))])),
+            ]);
+            inner.handle(&reply.encode(), busy);
+        }
+        assert_eq!(receiver.try_iter().count(), BLOCK_RATE as usize * 2);
+        let blocker = inner.blocker.lock().unwrap();
+        assert!(
+            blocker.watched.iter().all(|(ip, _, _)| *ip != busy.ip()),
+            "replies were counted"
+        );
+        drop(blocker);
+        node.stop();
+    }
+
+    /// Nodes not heard from for a while are pinged; ones that went away
+    /// are dropped from the count and make room for live ones.
+    #[test]
+    fn pings_nodes_it_has_not_heard_from_and_drops_gone_ones() {
+        let node = local_node(Vec::new());
+        let other = local_node(Vec::new());
+        let inner = node.families.iter().find(|inner| !inner.v6).unwrap();
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port_of(&other)));
+        assert_eq!(inner.query_all(&[address], b"ping", None).len(), 1);
+        assert_eq!(node.node_count(), 1);
+        // Still there: pings keep it.
+        std::thread::sleep(STALE_AFTER * 3);
+        assert_eq!(node.node_count(), 1);
+        other.stop();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while node.node_count() > 0 {
+            assert!(Instant::now() < deadline, "a gone node was kept");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        node.stop();
+    }
+
+    /// Stopping does not wait out a lookup's query timeout.
+    #[test]
+    fn stops_without_waiting_for_silent_nodes() {
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bootstrap = vec![silent.local_addr().unwrap().to_string()];
+        let node = Dht::start(0, bootstrap, None).unwrap();
+        let searching = {
+            let node = Arc::clone(&node);
+            std::thread::spawn(move || node.get_peers(&[4; 20]))
+        };
+        // The refresh and the search are now waiting for the silent node.
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        node.stop();
+        searching.join().unwrap();
+        assert!(
+            started.elapsed() < QUERY_TIMEOUT / 2,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn runs_a_limited_number_of_lookups_at_once() {
+        let node = Dht::start(0, Vec::new(), None).unwrap();
+        *node.lookups_running.lock().unwrap() = MAX_LOOKUPS;
+        let waiting = {
+            let node = Arc::clone(&node);
+            std::thread::spawn(move || node.get_peers(&[5; 20]))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!waiting.is_finished(), "ran past the limit");
+        *node.lookups_running.lock().unwrap() -= 1;
+        node.lookup_done.notify_one();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !waiting.is_finished() {
+            assert!(Instant::now() < deadline, "never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*node.lookups_running.lock().unwrap(), MAX_LOOKUPS - 1);
+        node.stop();
+    }
+
+    #[test]
+    fn picks_transaction_ids_at_random() {
+        let node = Dht::start(0, Vec::new(), None).unwrap();
+        let inner = node.families.iter().find(|inner| !inner.v6).unwrap();
+        let nowhere = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let (sender, _receiver) = mpsc::channel();
+        let ids: Vec<u16> = (0..64)
+            .filter_map(|_| inner.query_into(nowhere, b"ping", [], sender.clone()))
+            .map(u16::from_be_bytes)
+            .collect();
+        assert_eq!(ids.len(), 64);
+        let consecutive = ids
+            .windows(2)
+            .filter(|pair| pair[1] == pair[0].wrapping_add(1))
+            .count();
+        assert!(consecutive < 4, "counted up: {ids:?}");
+        node.stop();
+    }
+
+    #[test]
     fn peers_announced_through_the_dht_can_be_found() {
         // Three local nodes: a bootstrap node and two that join through it.
         let root = local_node(Vec::new());
@@ -1669,17 +1963,22 @@ mod tests {
         for _ in 0..BLOCK_RATE {
             client.send_to(&ping, target).unwrap();
         }
-        let mut buffer = [0; 512];
-        let mut answered = 0;
-        while client.recv(&mut buffer).is_ok() {
-            answered += 1;
-        }
-        assert_eq!(answered, BLOCK_RATE - 1, "the 50th within 10 s is dropped");
+        // Answers only: the node may also ping the client, now in its
+        // routing table, to see whether it is still there.
+        let replies = || {
+            let mut buffer = [0; 512];
+            let mut replies = 0;
+            while let Ok(size) = client.recv(&mut buffer) {
+                let reply = bencode::decode(&buffer[..size]).unwrap();
+                if reply.get_bytes(b"y") == Some(b"r") {
+                    replies += 1;
+                }
+            }
+            replies
+        };
+        assert_eq!(replies(), BLOCK_RATE - 1, "the 50th within 10 s is dropped");
         client.send_to(&ping, target).unwrap();
-        assert!(
-            client.recv(&mut buffer).is_err(),
-            "and so is everything after"
-        );
+        assert_eq!(replies(), 0, "and so is everything after");
         node.stop();
     }
 
