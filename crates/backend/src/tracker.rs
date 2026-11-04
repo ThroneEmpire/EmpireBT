@@ -790,6 +790,9 @@ fn announce_http_tracker(
         target.push_str("&trackerid=");
         target.push_str(&percent_encode(&id));
     }
+    if request.private {
+        target.push_str(&address_parameters(&tracker.binding.public_addresses()));
+    }
     let addresses = family_addresses(tracker, &format!("{}:{}", url.host, url.port))?;
     let binding = tracker.binding.clone();
     let user_agent = crate::identity::user_agent_for(&request.peer_id);
@@ -853,6 +856,17 @@ mod tier_order {
             order.insert(key(tier), tracker.url().to_owned());
         }
     }
+}
+
+/// `&ipv4=…&ipv6=…` for each of `addresses`, as libtorrent appends them.
+fn address_parameters(addresses: &[std::net::IpAddr]) -> String {
+    addresses
+        .iter()
+        .map(|ip| {
+            let key = if ip.is_ipv4() { "ipv4" } else { "ipv6" };
+            format!("&{key}={}", percent_encode(ip.to_string().as_bytes()))
+        })
+        .collect()
 }
 
 /// The `tracker id` each tracker gave for each torrent, sent back with
@@ -1187,6 +1201,39 @@ fn tracker_error(message: impl Into<String>) -> crate::BackendError {
 mod tests {
     use super::*;
 
+    /// Private torrents' HTTP announces name our public addresses, so a
+    /// tracker reached over IPv4 and IPv6 sees one client, not two.
+    #[test]
+    fn lists_our_addresses_for_private_torrents_only() {
+        let ip = |text: &str| text.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(
+            address_parameters(&[ip("203.0.113.9"), ip("2001:db8::7")]),
+            "&ipv4=203.0.113.9&ipv6=2001%3Adb8%3A%3A7"
+        );
+        let (url, requests) = recording_tracker();
+        let client = TrackerClient::from_urls([url]).unwrap();
+        let timeout = Duration::from_secs(5);
+        client
+            .announce(&request(AnnounceEvent::Started), timeout)
+            .unwrap();
+        let public = requests.recv_timeout(timeout).unwrap();
+        assert!(
+            !public.contains("ipv4=") && !public.contains("ipv6="),
+            "{public}"
+        );
+        let private = AnnounceRequest {
+            private: true,
+            ..request(AnnounceEvent::Started)
+        };
+        client.announce(&private, timeout).unwrap();
+        let sent = requests.recv_timeout(timeout).unwrap();
+        let expected = address_parameters(&crate::Binding::any().public_addresses());
+        assert!(
+            sent.contains(&format!("&no_peer_id=1{expected} ")),
+            "{sent}"
+        );
+    }
+
     #[test]
     fn announces_at_the_trackers_interval_as_libtorrent_does() {
         let next = |body: &[u8]| {
@@ -1227,6 +1274,7 @@ mod tests {
             left: 0,
             corrupt: 0,
             compact: true,
+            private: false,
             event: AnnounceEvent::None,
         };
         let error = client
@@ -1344,6 +1392,7 @@ mod tests {
             left: 1,
             corrupt: 0,
             compact: true,
+            private: false,
             event: AnnounceEvent::Started,
         };
         let down = TrackerClient::from_urls(vec![url.clone()])
@@ -1382,6 +1431,7 @@ mod tests {
                 left: 0,
                 corrupt: 0,
                 compact: true,
+                private: false,
                 event: AnnounceEvent::None,
             };
             let error = client
@@ -1616,6 +1666,7 @@ mod tests {
             left: 30,
             corrupt: 40,
             compact: true,
+            private: false,
             event,
         }
     }
@@ -1842,6 +1893,7 @@ mod tests {
             left: 4,
             corrupt: 0,
             compact: true,
+            private: false,
             event: AnnounceEvent::None,
         };
         assert!(request.query().contains("info_hash=%00%00"));
@@ -1940,6 +1992,7 @@ d8:intervali60e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
             left: 10,
             corrupt: 0,
             compact: true,
+            private: false,
             event: AnnounceEvent::None,
         };
         let response = client
@@ -1988,6 +2041,7 @@ d8:intervali60e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
             left: 10,
             corrupt: 0,
             compact: true,
+            private: false,
             event: AnnounceEvent::None,
         };
 
@@ -2054,6 +2108,11 @@ pub struct AnnounceRequest {
     pub corrupt: u64,
     pub compact: bool,
     pub event: AnnounceEvent,
+    /// For a private torrent: HTTP announces then list our public
+    /// addresses (`ipv4=`, `ipv6=`), as libtorrent's do, so a tracker
+    /// reached over both families knows the two announces are one client
+    /// rather than two.
+    pub private: bool,
 }
 
 /// Peers asked of a tracker per announce, as libtorrent asks.

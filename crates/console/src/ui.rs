@@ -394,6 +394,41 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Payload over every run, the ratio, and time seeding.
+fn totals(row: &RowView) -> String {
+    let history = &row.history;
+    let ratio = if row.ratio >= empirebt_app::MAX_RATIO {
+        "∞".to_owned()
+    } else {
+        format!("{:.2}", row.ratio)
+    };
+    let mut text = format!(
+        "↓ {}  ↑ {}  ·  ratio {ratio}",
+        format::bytes(history.downloaded),
+        format::bytes(history.uploaded)
+    );
+    if !history.seeding.is_zero() {
+        text.push_str(&format!(
+            "  ·  seeded {}",
+            format::duration(history.seeding.as_secs())
+        ));
+    }
+    text
+}
+
+/// How long ago it was added, and when it completed.
+fn added(row: &RowView) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let ago = |at: u64| format!("{} ago", format::duration(now.saturating_sub(at)));
+    match (row.history.added, row.history.completed) {
+        (0, _) => "unknown".to_owned(),
+        (added, 0) => ago(added),
+        (added, completed) => format!("{}  ·  completed {}", ago(added), ago(completed)),
+    }
+}
+
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let mut tabs = vec![Span::raw(" ")];
     for (position, tab) in DetailTab::ALL.iter().enumerate() {
@@ -473,14 +508,6 @@ fn draw_overview(frame: &mut Frame, row: &RowView, area: Rect) {
                 Span::raw("   "),
                 Span::styled("↑ ", Style::new().fg(UP)),
                 Span::raw(rate_or_zero(row.up_rate)),
-                Span::styled(
-                    row.announce
-                        .as_ref()
-                        .filter(|status| status.uploaded > 0)
-                        .map(|status| format!("  ({} sent)", format::bytes(status.uploaded)))
-                        .unwrap_or_default(),
-                    Style::new().fg(MUTED),
-                ),
             ]),
         ),
         field("Peers", Line::raw(peer_summary(row))),
@@ -491,6 +518,7 @@ fn draw_overview(frame: &mut Frame, row: &RowView, area: Rect) {
                 eta => eta,
             }),
         ),
+        field("Totals", Line::raw(totals(row))),
     ];
 
     let mut hash = format::hex(&row.hash);
@@ -534,6 +562,7 @@ fn draw_overview(frame: &mut Frame, row: &RowView, area: Rect) {
             ),
             save_to,
             labels_field(row),
+            field("Added", Line::raw(added(row))),
         ],
         None => vec![
             field("Info hash", Line::raw(hash)),

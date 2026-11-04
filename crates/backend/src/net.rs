@@ -139,6 +139,29 @@ impl Binding {
         }
     }
 
+    /// Our public addresses on the interfaces traffic may use (the chosen
+    /// one, or all), IPv4 first: each that is not private, link-local, or
+    /// loopback, as libtorrent lists its listen sockets' in private
+    /// torrents' announces. Behind a VPN, the VPN's own, never the
+    /// machine's others.
+    pub(crate) fn public_addresses(&self) -> Vec<IpAddr> {
+        let candidates: Vec<IpAddr> = match self.resolve() {
+            Ok(Some(addresses)) => addresses
+                .v4
+                .map(IpAddr::V4)
+                .into_iter()
+                .chain(addresses.v6.map(IpAddr::V6))
+                .collect(),
+            Ok(None) => if_addrs::get_if_addrs()
+                .unwrap_or_default()
+                .iter()
+                .map(if_addrs::Interface::ip)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        public_only(candidates)
+    }
+
     /// Local addresses for listening sockets on `port`, IPv4 first: both
     /// families on every interface, or the chosen interface's addresses.
     pub fn listen_addresses(&self, port: u16) -> Result<Vec<SocketAddr>, crate::BackendError> {
@@ -344,6 +367,18 @@ pub(crate) fn receive_batches(
 
 /// The canonical form of a peer's address: IPv4-mapped IPv6 addresses as
 /// the IPv4 addresses they are.
+/// The public ones of `candidates`, each once, IPv4 first.
+fn public_only(candidates: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut public: Vec<IpAddr> = Vec::new();
+    for ip in candidates {
+        if !crate::dht_id::is_local(ip) && !ip.is_unspecified() && !public.contains(&ip) {
+            public.push(ip);
+        }
+    }
+    public.sort_by_key(IpAddr::is_ipv6);
+    public
+}
+
 pub(crate) fn canonical(address: SocketAddr) -> SocketAddr {
     match address {
         SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
@@ -410,6 +445,28 @@ fn unavailable_message(interface: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_only_public_addresses_ipv4_first() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let candidates = [
+            "2001:db8::7",
+            "10.2.0.2",
+            "127.0.0.1",
+            "192.168.1.4",
+            "fe80::1",
+            "fd00::5",
+            "::1",
+            "0.0.0.0",
+            "203.0.113.9",
+            "2001:db8::7",
+            "100.64.0.1",
+        ];
+        assert_eq!(
+            public_only(candidates.iter().map(|text| ip(text)).collect()),
+            ["203.0.113.9", "100.64.0.1", "2001:db8::7"].map(ip)
+        );
+    }
     use std::net::TcpListener;
 
     const MISSING: &str = "empirebt-missing0";

@@ -201,7 +201,12 @@ Each torrent:
   "tags": ["linux"],
   "error": null,
   "magnet": false,
-  "savePath": "/home/me/Downloads/EmpireBT"
+  "savePath": "/home/me/Downloads/EmpireBT",
+  "downloaded": 4294967296,
+  "uploaded": 6442450944,
+  "ratio": 1.5,
+  "addedAt": 1793750400,
+  "finishedAt": 1793754000
 }
 ```
 
@@ -216,6 +221,14 @@ Each torrent:
   from announces or, for paused torrents, scrapes; `null` when unknown.
   **`completed`** is how many have finished downloading it, from scrapes.
 - **`savePath`** is the folder its files are in.
+- **`downloaded` and `uploaded`** are payload bytes over every run (kept
+  in the data folder's `stats` file). **`ratio`** is uploaded over
+  downloaded as qBittorrent works it out: a torrent whose download was not
+  recorded counts the data it has as downloaded, and the most is 9999
+  (shown as ∞).
+- **`addedAt` and `finishedAt`** are Unix seconds; `null` when unknown
+  (never finished, or from before EmpireBT kept them; a torrent from
+  before has its date from when it was first saved).
 
 ## Live updates
 
@@ -271,6 +284,12 @@ curl -N -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/events
   "pieceLength": 4194304,
   "format": "v1",
   "private": false,
+  "history": {
+    "activeSeconds": 86400,
+    "seedingSeconds": 72000,
+    "downloadedSession": 1073741824,
+    "uploadedSession": 2147483648
+  },
   "announce": {
     "trackersOk": 2,
     "trackersTotal": 3,
@@ -284,6 +303,9 @@ curl -N -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/events
 
 - `files`, `pieces`, `pieceLength` and `format` (`v1`, `v2` or `hybrid`)
   are empty or `null` until a magnet link's metadata arrives.
+- `history` has the time it has been running (`activeSeconds`) and
+  seeding, over every run, and what it moved this run alone. Times change
+  every second, so they come here rather than with every live update.
 - `announce` describes seeding announces. It is `null` while the torrent
   is not seeding.
 - `originalName` is the torrent's own name; `torrent.name` is the name

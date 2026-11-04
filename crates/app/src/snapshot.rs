@@ -17,6 +17,9 @@ pub struct Snapshot {
     pub torrents: Vec<TorrentView>,
     /// Total download and upload rates, in bytes per second.
     pub totals: (f64, f64),
+    /// Payload downloaded and uploaded by every torrent ever (removed ones
+    /// too), and this run alone.
+    pub transferred: Transferred,
     /// Download and upload limits in bytes per second; 0 means unlimited.
     pub rate_limits: (u64, u64),
     /// Torrents downloading now.
@@ -183,6 +186,20 @@ pub struct TorrentView {
     pub category: Option<String>,
     /// Sorted.
     pub tags: Vec<String>,
+    /// When it was added and completed, its totals, and its time active
+    /// and seeding.
+    pub history: crate::TorrentStats,
+    /// Uploaded over downloaded, as qBittorrent shows it.
+    pub ratio: f64,
+}
+
+/// Payload moved, in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Transferred {
+    pub downloaded: u64,
+    pub uploaded: u64,
+    pub downloaded_session: u64,
+    pub uploaded_session: u64,
 }
 
 /// A file of a torrent.

@@ -6,6 +6,7 @@ use crate::snapshot::{
     DhtState, Level, Network, Notice, PeerView, RateMeter, SeedStatus, SettingView, Snapshot,
     Status, TorrentView,
 };
+use crate::stats::Stats;
 use crate::{InfoHash, Store};
 use empirebt_backend::{
     AnnounceStatus, BackendError, Client, ClientConfig, ConfigFile, ContentLayout, Dht, MagnetLink,
@@ -304,6 +305,27 @@ impl Handle {
                 (Labels::default(), Some(error))
             }
         };
+        let (mut stats, stats_damaged) = match Stats::load(&store.stats_path()) {
+            Ok(stats) => (stats, None),
+            Err(error) => {
+                let path = store.stats_path();
+                let _ = std::fs::rename(&path, path.with_extension("damaged"));
+                (Stats::default(), Some(error))
+            }
+        };
+        // Torrents from before history was kept were added when their
+        // session file was written.
+        for hash in client
+            .torrents()
+            .iter()
+            .filter_map(|torrent| torrent.info_hash())
+        {
+            if stats.of(hash).is_none_or(|known| known.added == 0)
+                && let Some(added) = store.added_estimate(hash)
+            {
+                stats.added(*hash, added);
+            }
+        }
         let geoip = if config_file.get("peers.countries").as_deref() == Some("false") {
             crate::geoip::GeoIp::default()
         } else {
@@ -345,8 +367,17 @@ impl Handle {
         );
         let mut engine = Engine::new(client, store, settings, dht_state, config_file, overridden);
         engine.labels = labels;
+        engine.stats = stats;
         engine.geoip = geoip;
         engine.report_skipped(&warnings);
+        if let Some(error) = stats_damaged {
+            engine.notify(
+                Level::Error,
+                format!(
+                    "{error}; torrent history starts empty (the old file was kept as stats.damaged)"
+                ),
+            );
+        }
         if let Some(error) = damaged {
             engine.notify(
                 Level::Error,
@@ -559,6 +590,31 @@ struct Activity {
     queued_verify: bool,
     pausing: bool,
     start_after_verify: bool,
+    /// Where the totals were last read from (a transfer's counters, or the
+    /// seeding runtime's), and what they said, for [`Stats::traffic`].
+    counted_down: Option<(usize, u64)>,
+    counted_up: Option<(usize, u64)>,
+    /// Uploads were last read from a download's own counters.
+    up_from_transfer: bool,
+}
+
+/// The payload a counter moved since it was last read. A counter it has
+/// not read before counts in full when `from_zero` (one that started at
+/// zero), else only from now. A counter that went down started again.
+fn counted(last: &mut Option<(usize, u64)>, now: Option<(usize, u64)>, from_zero: bool) -> u64 {
+    let previous = std::mem::replace(last, now);
+    match (previous, now) {
+        (_, None) => 0,
+        (Some((source, before)), Some((current, total))) if source == current => {
+            if total >= before {
+                total - before
+            } else {
+                total
+            }
+        }
+        (_, Some((_, total))) if from_zero => total,
+        _ => 0,
+    }
 }
 
 impl Activity {
@@ -772,6 +828,8 @@ struct Engine {
     next_notice: u64,
     generation: u64,
     labels: Labels,
+    /// Each torrent's history and totals.
+    stats: Stats,
     geoip: crate::geoip::GeoIp,
     last_port_check: Instant,
     /// Swarm counts from the latest tracker scrapes.
@@ -889,6 +947,7 @@ impl Engine {
             next_notice: 0,
             generation: 0,
             labels: Labels::default(),
+            stats: Stats::default(),
             geoip: crate::geoip::GeoIp::default(),
             last_port_check: Instant::now(),
             scrapes: HashMap::new(),
@@ -1161,6 +1220,12 @@ impl Engine {
                 .count(),
             torrents,
             totals,
+            transferred: crate::snapshot::Transferred {
+                downloaded: self.stats.total_downloaded,
+                uploaded: self.stats.total_uploaded,
+                downloaded_session: self.stats.session_downloaded,
+                uploaded_session: self.stats.session_uploaded,
+            },
             rate_limits: (limits.download_rate(), limits.upload_rate()),
             network: Network {
                 listen_port: self.client.config().listen_port(),
@@ -1279,7 +1344,15 @@ impl Engine {
             (None, Some(link)) => link.trackers(),
             (None, None) => &[],
         };
+        let history = self.stats.of(&hash).cloned().unwrap_or_default();
+        let have = match (info, fraction) {
+            (Some(info), Some(fraction)) => (info.total_length() as f64 * fraction) as u64,
+            _ => 0,
+        };
+        let ratio = history.ratio(have);
         Some(TorrentView {
+            history,
+            ratio,
             hash,
             name: torrent.display_name().to_owned(),
             original_name: torrent.name().to_owned(),
@@ -1361,6 +1434,9 @@ impl Engine {
         if self.last_file_sweep.elapsed() >= Duration::from_secs(60) {
             self.last_file_sweep = Instant::now();
             self.client.close_idle_files(IDLE_FILE_CLOSE);
+            if self.stats.is_dirty() {
+                self.save_stats();
+            }
             // Periodic resume checkpoints. Ongoing writes make them stale, in
             // which case the next start simply checks the data in full.
             let running: Vec<&TransferHandle> = self
@@ -1422,6 +1498,7 @@ impl Engine {
         // Removed torrents' files go even if a transfer is slow to stop.
         self.delete_removed_files(true);
         self.save();
+        self.save_stats();
         // Last, the sockets: the DHT saves its known nodes so the next run
         // joins quickly.
         self.stop_networking();
@@ -1844,6 +1921,8 @@ impl Engine {
                 .map_err(|error| Failure::new(error.to_string()))?;
         }
         self.session_dirty = true;
+        self.stats.added(hash, crate::stats::now());
+        self.save_stats();
         if placement.category.is_some() || !placement.tags.is_empty() {
             if placement.category.is_some() {
                 self.labels.set_category(hash, placement.category);
@@ -2138,6 +2217,8 @@ impl Engine {
             self.detached.extend(job);
             return;
         };
+        self.stats.forget(&hash);
+        self.save_stats();
         if self.labels.forget(&hash) {
             let _ = self.save_labels();
         }
@@ -2300,6 +2381,7 @@ impl Engine {
                     if let Some(activity) = self.activity.remove(&hash) {
                         self.activity.insert(new_hash, activity);
                     }
+                    self.stats.rename(&hash, new_hash);
                     if self.labels.rename(&hash, new_hash) {
                         let _ = self.save_labels();
                     }
@@ -2316,6 +2398,10 @@ impl Engine {
             let was_pausing = std::mem::take(&mut activity.pausing);
             activity.down.idle();
             let mut start_next = std::mem::take(&mut activity.start_after_verify);
+            if kind == TransferKind::Download && result.is_ok() {
+                self.stats.completed(hash, crate::stats::now());
+                self.save_stats();
+            }
             let notice = match (kind, result) {
                 (_, Err(BackendError::TorrentNotFound(_))) => None,
                 (TransferKind::Metadata, Ok(_)) => {
@@ -2391,10 +2477,44 @@ impl Engine {
     }
 
     fn sample_rates(&mut self) {
-        let elapsed = self.last_sample.elapsed().as_secs_f64();
+        let since = self.last_sample.elapsed();
+        let elapsed = since.as_secs_f64();
         self.last_sample = Instant::now();
         let uploaded = self.seeding.uploaded();
+        // Which runtime the seeding counters come from: a new one counts
+        // from zero again.
+        let runtime = self
+            .seeding
+            .live()
+            .map_or(0, |runtime| Arc::as_ptr(&runtime) as usize);
         for (hash, activity) in &mut self.activity {
+            // Payload for the totals: a download's own counters while it
+            // runs, else the seeding runtime's.
+            let transfer = activity
+                .job
+                .as_ref()
+                .filter(|job| job.kind() == TransferKind::Download)
+                .map(|job| Arc::as_ptr(job.progress()) as usize);
+            // Every counter starts at zero but one: right after a download
+            // ends, the seeding runtime's may already hold what it sent.
+            let (down_now, up_now, from_zero) = match (transfer, &activity.job) {
+                (Some(id), Some(job)) => (
+                    Some((id, job.progress().received_bytes())),
+                    Some((id, job.progress().uploaded_bytes())),
+                    true,
+                ),
+                _ => (
+                    None,
+                    uploaded.get(hash).map(|bytes| (runtime, *bytes)),
+                    !activity.up_from_transfer,
+                ),
+            };
+            let down = counted(&mut activity.counted_down, down_now, true);
+            let up = counted(&mut activity.counted_up, up_now, from_zero);
+            if up_now.is_some() {
+                activity.up_from_transfer = transfer.is_some();
+            }
+            self.stats.traffic(*hash, down, up);
             match &activity.job {
                 Some(job) if job.kind() == TransferKind::Download => activity
                     .down
@@ -2419,6 +2539,28 @@ impl Engine {
             if self.client.torrent_index(hash).is_some() {
                 self.activity.entry(*hash).or_default();
             }
+        }
+        // Time running, and of that seeding: not paused, not only checking.
+        for torrent in self.client.torrents() {
+            let Some(hash) = torrent.info_hash().copied() else {
+                continue;
+            };
+            let job = self.activity.get(&hash).and_then(Activity::job_kind);
+            let seeding = job.is_none()
+                && matches!(
+                    torrent.state(),
+                    TransferState::Seeding | TransferState::Complete
+                )
+                && !self.seeding.left_out.contains_key(&hash);
+            if seeding || matches!(job, Some(TransferKind::Download | TransferKind::Metadata)) {
+                self.stats.time(hash, since, seeding);
+            }
+        }
+    }
+
+    fn save_stats(&mut self) {
+        if let Err(error) = self.stats.save(&self.store.stats_path()) {
+            tracing::warn!(target: "engine", "{error}");
         }
     }
 
@@ -3469,6 +3611,158 @@ mod tests {
         assert!(handle.snapshot().torrent(&hash).is_some(), "it was saved");
         handle.shutdown();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An engine in `root` with its peer port at `port`, offline otherwise.
+    fn start_on_port(root: &std::path::Path, port: u16) -> Handle {
+        let store = Store::open(root.join("data")).unwrap();
+        let mut config = store.config().unwrap();
+        config.set("console.start_on_add", "false").unwrap();
+        let client_config = config
+            .client_config()
+            .unwrap()
+            .with_listen_port(port)
+            .with_dht(false)
+            .with_lsd(false)
+            .with_download_directory(root.join("downloads"));
+        Handle::start(store, config, client_config, Vec::new()).unwrap()
+    }
+
+    /// Downloading counts what came in and marks the torrent completed;
+    /// seeding counts what went out; both survive a restart, and removing
+    /// the torrent keeps the totals.
+    #[test]
+    fn keeps_each_torrents_history_and_totals_across_runs() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-app-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let content: Vec<u8> = (0..300_000).map(|byte| (byte % 251) as u8).collect();
+        std::fs::create_dir_all(root.join("seed/downloads")).unwrap();
+        std::fs::write(root.join("seed/downloads/history.bin"), &content).unwrap();
+        let port = free_port();
+        // A tracker that names the seed to whoever asks.
+        let tracker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/announce", tracker.local_addr().unwrap());
+        let (announced, announces) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for mut stream in tracker.incoming().flatten() {
+                let mut request = [0; 2048];
+                let size = stream.read(&mut request).unwrap_or(0);
+                let _ = announced.send(String::from_utf8_lossy(&request[..size]).into_owned());
+                let mut body = b"d8:intervali1800e5:peers6:\x7f\x00\x00\x01".to_vec();
+                body.extend(port.to_be_bytes());
+                body.extend(b"e");
+                let mut reply =
+                    format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                        .into_bytes();
+                reply.extend(body);
+                let _ = stream.write_all(&reply);
+            }
+        });
+        let torrent = [
+            format!("d8:announce{}:{url}", url.len()).into_bytes(),
+            single_file("history.bin", &content, 16384)[1..].to_vec(),
+        ]
+        .concat();
+        let seed = start_on_port(&root.join("seed"), port);
+        let hash = add_started(&seed, torrent.clone(), root.join("seed/downloads"));
+        assert!(
+            wait_for(&seed, 20, |snapshot| seeds(snapshot, 1)),
+            "never seeded"
+        );
+
+        let before = super::super::stats::now();
+        let leech = start_in(&root.join("leech"));
+        let mut request = AddRequest::new(AddSource::Torrent(torrent));
+        request.start = Some(true);
+        handle_ok(&leech, Command::AddWith(request));
+        assert!(
+            wait_for(&leech, 30, |snapshot| snapshot
+                .torrent(&hash)
+                .is_some_and(|torrent| torrent.status == Status::Seeding)),
+            "never downloaded: {:?} {:?}",
+            leech
+                .snapshot()
+                .torrent(&hash)
+                .map(|torrent| (torrent.status, torrent.error.clone())),
+            leech
+                .snapshot()
+                .notices
+                .iter()
+                .map(|notice| &notice.text)
+                .collect::<Vec<_>>()
+        );
+        let downloaded = leech.snapshot().torrent(&hash).unwrap().history.clone();
+        assert!(downloaded.added >= before, "added now");
+        assert!(
+            downloaded.completed >= downloaded.added,
+            "completed after it was added"
+        );
+        assert!(
+            downloaded.downloaded >= content.len() as u64,
+            "downloaded {} of {}",
+            downloaded.downloaded,
+            content.len()
+        );
+        assert_eq!(downloaded.downloaded_session, downloaded.downloaded);
+        assert!(
+            wait_for(&seed, 10, |snapshot| {
+                let torrent = snapshot.torrent(&hash).unwrap();
+                torrent.history.uploaded >= content.len() as u64 && torrent.ratio >= 1.0
+            }),
+            "the seed's upload was not counted: {:?}",
+            seed.snapshot().torrent(&hash).unwrap().history
+        );
+        assert!(seed.snapshot().transferred.uploaded >= content.len() as u64);
+
+        // A restart keeps the history; this run's counts start again, and
+        // so do the counts trackers hear: a new `started` is a new tracker
+        // session, as libtorrent's `start_announcing` resets them. The
+        // all-time totals are never announced.
+        leech.shutdown();
+        while announces.try_recv().is_ok() {}
+        let leech = start_in(&root.join("leech"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let started = loop {
+            assert!(
+                Instant::now() < deadline,
+                "the restarted seed never announced"
+            );
+            if let Ok(request) = announces.recv_timeout(Duration::from_millis(200))
+                && request.contains("event=started")
+            {
+                break request;
+            }
+        };
+        assert!(
+            started.contains("&uploaded=0&downloaded=0&left=0&"),
+            "{started}"
+        );
+        let kept = leech.snapshot().torrent(&hash).unwrap().history.clone();
+        assert_eq!(
+            (kept.added, kept.completed, kept.downloaded),
+            (
+                downloaded.added,
+                downloaded.completed,
+                downloaded.downloaded
+            )
+        );
+        assert_eq!(kept.downloaded_session, 0);
+
+        // Removed: forgotten, but the totals keep it.
+        handle_ok(&leech, Command::Remove(hash));
+        assert!(leech.snapshot().transferred.downloaded >= content.len() as u64);
+        leech.shutdown();
+        let leech = start_in(&root.join("leech"));
+        assert!(leech.snapshot().transferred.downloaded >= content.len() as u64);
+        leech.shutdown();
+        seed.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn handle_ok(handle: &Handle, command: Command) {
+        handle.call(command).unwrap();
     }
 
     #[test]

@@ -453,7 +453,7 @@ button.chip { padding: 6px 12px; font-size: 13px; }
 .detail-body { overflow: auto; padding: 14px 16px 16px; flex: 1; overscroll-behavior: contain; }
 .detail-body.fade { animation: fade 0.2s ease-out; }
 .detail-body > .muted:only-child { margin: 8px 0; }
-.overview { display: grid; grid-template-columns: 1fr 1fr; gap: 0 32px; }
+.overview { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 0 32px; }
 .field { display: flex; gap: 14px; padding: 5px 0; }
 .field .label { width: 86px; flex: none; color: var(--muted); }
 .field .value { overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }

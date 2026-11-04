@@ -300,6 +300,7 @@ mod tests {
             left: 1,
             corrupt: 0,
             compact: true,
+            private: false,
             event,
         }
     }

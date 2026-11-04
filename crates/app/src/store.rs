@@ -17,6 +17,8 @@ const LOCK_FILE: &str = "lock";
 const LOG_FILE: &str = "empirebt.log";
 /// Categories and tags.
 const LABELS_FILE: &str = "labels";
+/// Each torrent's history and totals ([`crate::stats`]).
+const STATS_FILE: &str = "stats";
 
 /// Settings of the application, in the `[console]` section (named for the
 /// first interface; the web UI shares them).
@@ -203,6 +205,25 @@ impl Store {
 
     pub fn labels_path(&self) -> PathBuf {
         self.data_dir.join(LABELS_FILE)
+    }
+
+    pub fn stats_path(&self) -> PathBuf {
+        self.data_dir.join(STATS_FILE)
+    }
+
+    /// When a torrent was most likely added, for one from before history
+    /// was kept: when its file in the session was written, which happens
+    /// once, as it is added. Unix seconds.
+    pub(crate) fn added_estimate(&self, hash: &crate::InfoHash) -> Option<u64> {
+        let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+        let torrents = self.session_path().join("torrents");
+        ["torrent", "magnet"].iter().find_map(|extension| {
+            std::fs::metadata(torrents.join(format!("{hex}.{extension}")))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_secs())
+        })
     }
 
     /// Where the DHT keeps its node id and known nodes between runs.

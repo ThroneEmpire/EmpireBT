@@ -189,6 +189,9 @@ pub struct Planned {
     /// Files qBittorrent keeps under other names (renamed, or laid out
     /// without the torrent's folder): the torrent's path to the one used.
     pub renames: BTreeMap<PathBuf, PathBuf>,
+    /// Its history in qBittorrent: when it was added and completed, its
+    /// totals, and its time active and seeding, which keep its ratio.
+    pub history: crate::TorrentStats,
     source: Option<Source>,
 }
 
@@ -302,6 +305,27 @@ fn read_categories(
     categories
 }
 
+/// A torrent's history from its `torrents/info` entry. qBittorrent says
+/// -1 or 0 for a date it does not have.
+fn history(torrent: &Value) -> crate::TorrentStats {
+    let number = |key: &str| {
+        torrent
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|number| *number > 0)
+            .map_or(0, |number| number as u64)
+    };
+    crate::TorrentStats {
+        added: number("added_on"),
+        completed: number("completion_on"),
+        downloaded: number("downloaded"),
+        uploaded: number("uploaded"),
+        active: std::time::Duration::from_secs(number("time_active")),
+        seeding: std::time::Duration::from_secs(number("seeding_time")),
+        ..crate::TorrentStats::default()
+    }
+}
+
 /// Plans one torrent from its `torrents/info` entry, asking for its files,
 /// pieces, and `.torrent`.
 fn plan_torrent(
@@ -333,6 +357,7 @@ fn plan_torrent(
         pieces: None,
         shown_name: None,
         renames: BTreeMap::new(),
+        history: history(torrent),
         source: None,
     };
     if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -642,6 +667,7 @@ pub struct Imported {
 pub fn import(plan: &Plan, store: &Store, config: &ClientConfig) -> Result<Imported, String> {
     let (mut client, _) = store.load(config.clone())?;
     let mut labels = Labels::load(&store.labels_path())?;
+    let mut stats = crate::stats::Stats::load(&store.stats_path())?;
     let mut imported = Imported::default();
     for (name, folder) in &plan.categories {
         if !labels.categories.contains(name) {
@@ -716,10 +742,12 @@ pub fn import(plan: &Plan, store: &Store, config: &ClientConfig) -> Result<Impor
         if !planned.tags.is_empty() {
             labels.set_tags(hash, planned.tags.iter().cloned().collect());
         }
+        stats.import(hash, planned.history.clone());
         imported.torrents += 1;
     }
     store.save(&client)?;
     labels.save(&store.labels_path())?;
+    stats.save(&store.stats_path())?;
     tracing::info!(
         target: "import",
         "imported {} torrents, {} new categories, and {} new tags from {}",
@@ -734,6 +762,22 @@ pub fn import(plan: &Plan, store: &Store, config: &ClientConfig) -> Result<Impor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brings_over_qbittorrents_history() {
+        let entry: Value = serde_json::from_str(
+            r#"{"added_on": 1700000000, "completion_on": -1, "downloaded": 1000,
+                "uploaded": 5000, "time_active": 3600, "seeding_time": 1800}"#,
+        )
+        .unwrap();
+        let history = history(&entry);
+        assert_eq!(history.added, 1_700_000_000);
+        assert_eq!(history.completed, 0, "-1 is no date");
+        assert_eq!((history.downloaded, history.uploaded), (1000, 5000));
+        assert_eq!(history.active.as_secs(), 3600);
+        assert_eq!(history.seeding.as_secs(), 1800);
+        assert_eq!(history.ratio(1000), 5.0);
+    }
 
     #[test]
     fn pieces_touching_a_skipped_file_are_downloaded_again() {

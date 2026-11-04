@@ -1709,6 +1709,8 @@ fn fetch_magnet_metadata(
         corrupt: 0,
         compact: true,
         event,
+        // Private torrents come from `.torrent` files, never magnet links.
+        private: false,
     };
     let hashes = [*link.info_hash()];
     // Starts due announces and takes in their results and peers; returns

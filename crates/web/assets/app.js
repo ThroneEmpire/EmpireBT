@@ -101,6 +101,23 @@ function rate(value) {
   return value >= 1 ? `${bytes(Math.round(value))}/s` : "";
 }
 
+// A length of time, briefly: "3d 4h", "2h 5m", "4m", "30s".
+function duration(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m`;
+  return `${Math.floor(seconds)}s`;
+}
+
+// A date from Unix seconds, in the viewer's own format; "—" when unknown.
+function when(seconds) {
+  return seconds ? new Date(seconds * 1000).toLocaleString() : "—";
+}
+
 function etaSeconds(torrent) {
   if (!torrent.remaining || torrent.down < 1) return Infinity;
   return torrent.remaining / torrent.down;
@@ -794,6 +811,7 @@ function renderOverview(body, torrent) {
     ? ` · swarm ${torrent.seeders ?? "?"} seeders, ${torrent.leechers ?? "?"} leechers${completed}` : "";
   const pieces = details && details.pieces
     ? `${details.verifiedPieces ?? "?"} / ${details.pieces} pieces` : "";
+  const history = details && details.torrent && details.torrent.hash === torrent.hash ? details.history : null;
   const values = [
     [
       ["Status", torrent.statusLabel + (torrent.error ? ` — ${torrent.error}` : "")],
@@ -809,6 +827,15 @@ function renderOverview(body, torrent) {
       ["Saved in", torrent.savePath || "—"],
       ["Category", torrent.category || "none"],
       ["Tags", torrent.tags.length ? torrent.tags.join(", ") : "none"],
+    ],
+    [
+      ["Added", when(torrent.addedAt)],
+      ["Completed", torrent.finishedAt ? when(torrent.finishedAt) : torrent.progress === 1 ? "—" : "not yet"],
+      ["Downloaded", `${bytes(torrent.downloaded)}${history ? ` (${bytes(history.downloadedSession)} this run)` : ""}`],
+      ["Uploaded", `${bytes(torrent.uploaded)}${history ? ` (${bytes(history.uploadedSession)} this run)` : ""}`],
+      ["Ratio", torrent.ratio >= 9999 ? "∞" : torrent.ratio.toFixed(2)],
+      ["Active", history ? duration(history.activeSeconds) : "—"],
+      ["Seeding", history ? duration(history.seedingSeconds) : "—"],
     ],
   ];
   const shape = `overview:${torrent.hash}`;

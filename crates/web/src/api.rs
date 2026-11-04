@@ -470,6 +470,13 @@ struct TorrentJson<'a> {
     magnet: bool,
     /// The folder its files are in.
     save_path: std::borrow::Cow<'a, str>,
+    /// Payload over every run, and uploaded over downloaded.
+    downloaded: u64,
+    uploaded: u64,
+    ratio: f64,
+    /// When it was added and finished, in Unix seconds; `null` unknown.
+    added_at: Option<u64>,
+    finished_at: Option<u64>,
 }
 
 fn torrent_json(torrent: &TorrentView) -> TorrentJson<'_> {
@@ -492,6 +499,12 @@ fn torrent_json(torrent: &TorrentView) -> TorrentJson<'_> {
         error: torrent.error.as_deref(),
         magnet: torrent.info.is_none(),
         save_path: torrent.save_dir.to_string_lossy(),
+        downloaded: torrent.history.downloaded,
+        uploaded: torrent.history.uploaded,
+        // Three decimals: enough to show, and steady between updates.
+        ratio: (torrent.ratio * 1000.0).round() / 1000.0,
+        added_at: Some(torrent.history.added).filter(|added| *added > 0),
+        finished_at: Some(torrent.history.completed).filter(|completed| *completed > 0),
     }
 }
 
@@ -802,6 +815,14 @@ async fn details(State(state): State<Shared>, Path(hash): Path<String>) -> Respo
             empirebt_backend::TorrentFormat::Hybrid => "hybrid",
         }),
         "private": info.is_some_and(|info| info.is_private()),
+        // Times change every second, so they come with details, not with
+        // every live update.
+        "history": {
+            "activeSeconds": torrent.history.active.as_secs(),
+            "seedingSeconds": torrent.history.seeding.as_secs(),
+            "downloadedSession": torrent.history.downloaded_session,
+            "uploadedSession": torrent.history.uploaded_session,
+        },
         "announce": announce,
         "savePath": torrent.save_dir.to_string_lossy(),
     }))
@@ -1307,9 +1328,12 @@ mod tests {
                     error: None,
                     category: None,
                     tags: Vec::new(),
+                    history: Default::default(),
+                    ratio: 0.0,
                 })
                 .collect(),
             totals: (0.0, 0.0),
+            transferred: Default::default(),
             rate_limits: (0, 0),
             active_count: 0,
             seeding_count: 0,

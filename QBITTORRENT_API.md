@@ -59,14 +59,13 @@ These answer 404, and qui shows an error if you try them:
 - RSS, search, the torrent creator, exporting `.torrent` files, logs,
   piece states.
 
-EmpireBT doesn't record some facts yet, so these read as zero:
+Each torrent's history is real: when it was added and completed, downloaded
+and uploaded over every run and this run, ratio, time active and seeding,
+and the all-time totals in `server_state`. Importing from qBittorrent brings
+its history over, so ratios carry on.
 
-- when a torrent was added or completed;
-- totals across runs: downloaded, uploaded, ratio, seeding time;
-- connected seeds counted separately from peers (`num_seeds` is 0, and
-  `num_leechs` counts every connection).
-
-Upload totals for seeds come from this run.
+EmpireBT doesn't tell connected seeds apart from other peers, so
+`num_seeds` is 0 and `num_leechs` counts every connection.
 
 ## Security
 

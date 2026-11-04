@@ -13,6 +13,7 @@ mod geoip;
 mod labels;
 pub mod qbittorrent;
 mod snapshot;
+mod stats;
 pub mod store;
 
 pub use empirebt_backend::ContentLayout;
@@ -30,8 +31,9 @@ pub const SOURCE: &str = env!("CARGO_PKG_REPOSITORY");
 pub use labels::{MAX_NAME, clean_name};
 pub use snapshot::{
     DhtState, FileView, Level, Network, Notice, PeerView, RateMeter, SeedStatus, SettingView,
-    Snapshot, Status, TorrentView,
+    Snapshot, Status, TorrentView, Transferred,
 };
+pub use stats::{MAX_RATIO, TorrentStats};
 pub use store::{Store, default_data_dir, home_dir};
 
 /// A torrent's identity: its info hash (the truncated v2 hash for v2-only

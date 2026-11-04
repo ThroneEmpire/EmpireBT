@@ -460,8 +460,8 @@ fn transfer_json(snapshot: &Snapshot) -> Map<String, Value> {
         "dht_nodes": network.dht_nodes.unwrap_or(0),
         "dl_info_speed": snapshot.totals.0 as u64,
         "up_info_speed": snapshot.totals.1 as u64,
-        "dl_info_data": 0,
-        "up_info_data": 0,
+        "dl_info_data": snapshot.transferred.downloaded_session,
+        "up_info_data": snapshot.transferred.uploaded_session,
         "dl_rate_limit": snapshot.rate_limits.0,
         "up_rate_limit": snapshot.rate_limits.1,
     }) else {
@@ -473,9 +473,18 @@ fn transfer_json(snapshot: &Snapshot) -> Map<String, Value> {
 fn server_state(snapshot: &Snapshot) -> Map<String, Value> {
     let mut map = transfer_json(snapshot);
     for (key, value) in [
-        ("alltime_dl", json!(0)),
-        ("alltime_ul", json!(0)),
-        ("global_ratio", json!("0.00")),
+        ("alltime_dl", json!(snapshot.transferred.downloaded)),
+        ("alltime_ul", json!(snapshot.transferred.uploaded)),
+        (
+            "global_ratio",
+            json!(format!(
+                "{:.2}",
+                match snapshot.transferred.downloaded {
+                    0 => 0.0,
+                    downloaded => snapshot.transferred.uploaded as f64 / downloaded as f64,
+                }
+            )),
+        ),
         ("free_space_on_disk", json!(0)),
         ("queueing", json!(false)),
         ("use_alt_speed_limits", json!(false)),
@@ -678,7 +687,7 @@ fn tracker_rows(torrent: &TorrentView) -> Vec<Value> {
 }
 
 /// A torrent as `torrents/info` and the sync describe it. What EmpireBT
-/// does not keep (when it was added, totals across runs, share limits)
+/// does not keep (share limits, availability)
 /// reads as qBittorrent's "none".
 fn torrent_object(torrent: &TorrentView) -> Map<String, Value> {
     let info = torrent.info.as_ref();
@@ -708,10 +717,10 @@ fn torrent_object(torrent: &TorrentView) -> Map<String, Value> {
         "progress": progress,
         "amount_left": left,
         "completed": size - left,
-        "downloaded": 0,
-        "uploaded": torrent.announce.as_ref().map_or(0, |status| status.uploaded),
-        "downloaded_session": 0,
-        "uploaded_session": torrent.announce.as_ref().map_or(0, |status| status.uploaded),
+        "downloaded": torrent.history.downloaded,
+        "uploaded": torrent.history.uploaded,
+        "downloaded_session": torrent.history.downloaded_session,
+        "uploaded_session": torrent.history.uploaded_session,
         "dlspeed": torrent.down_rate as u64,
         "upspeed": torrent.up_rate as u64,
         "eta": eta,
@@ -737,13 +746,13 @@ fn torrent_object(torrent: &TorrentView) -> Map<String, Value> {
         "pieces_have": torrent.verified_pieces.unwrap_or(0),
         "tracker": tracker.unwrap_or_default(),
         "trackers_count": torrent.trackers.len(),
-        "ratio": 0,
-        "added_on": 0,
-        "completion_on": 0,
+        "ratio": (torrent.ratio * 1000.0).round() / 1000.0,
+        "added_on": torrent.history.added,
+        "completion_on": torrent.history.completed,
         "last_activity": 0,
         "seen_complete": 0,
-        "time_active": 0,
-        "seeding_time": 0,
+        "time_active": torrent.history.active.as_secs(),
+        "seeding_time": torrent.history.seeding.as_secs(),
         "reannounce": torrent.announce.as_ref().map_or(0, |status| {
             status
                 .next_announce
@@ -1165,16 +1174,19 @@ async fn properties(State(state): State<Shared>, params: Params) -> Response {
         "comment": "",
         "created_by": "",
         "creation_date": -1,
-        "addition_date": 0,
-        "completion_date": -1,
+        "addition_date": torrent.history.added,
+        "completion_date": match torrent.history.completed {
+            0 => -1,
+            completed => completed as i64,
+        },
         "last_seen": -1,
         "is_private": field("private"),
         "piece_size": field("piece_size"),
         "pieces_num": field("pieces_num"),
         "pieces_have": field("pieces_have"),
         "total_size": field("total_size"),
-        "total_downloaded": 0,
-        "total_downloaded_session": 0,
+        "total_downloaded": field("downloaded"),
+        "total_downloaded_session": field("downloaded_session"),
         "total_uploaded": field("uploaded"),
         "total_uploaded_session": field("uploaded_session"),
         "total_wasted": 0,
@@ -1191,9 +1203,9 @@ async fn properties(State(state): State<Shared>, params: Params) -> Response {
         "peers_total": field("num_incomplete"),
         "seeds": 0,
         "seeds_total": field("num_complete"),
-        "share_ratio": 0,
-        "seeding_time": 0,
-        "time_elapsed": 0,
+        "share_ratio": field("ratio"),
+        "seeding_time": field("seeding_time"),
+        "time_elapsed": field("time_active"),
         "reannounce": field("reannounce"),
     }))
 }

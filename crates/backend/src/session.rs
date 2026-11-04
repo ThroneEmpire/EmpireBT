@@ -621,6 +621,7 @@ impl DownloadSession {
             corrupt: self.progress.corrupt_bytes(),
             compact: true,
             event,
+            private: self.info.is_private(),
         }
     }
 

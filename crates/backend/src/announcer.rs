@@ -210,6 +210,8 @@ struct Entry {
     /// The peer ID the torrent uses in the runtime.
     peer_id: [u8; 20],
     trackers: Arc<TrackerClient>,
+    /// A private torrent (BEP 27).
+    private: bool,
     next_announce: Instant,
     started: bool,
     in_flight: bool,
@@ -390,6 +392,7 @@ impl AnnounceLoop {
                         announce_hashes: target.announce_hashes,
                         peer_id: target.peer_id,
                         trackers: Arc::new(trackers),
+                        private: target.private,
                         next_announce: Instant::now(),
                         started: false,
                         in_flight: false,
@@ -451,7 +454,16 @@ impl AnnounceLoop {
             let requests: Vec<AnnounceRequest> = entry
                 .announce_hashes
                 .iter()
-                .map(|hash| request(*hash, entry.peer_id, self.port, entry.uploaded(), event))
+                .map(|hash| {
+                    request(
+                        *hash,
+                        entry.peer_id,
+                        self.port,
+                        entry.uploaded(),
+                        event,
+                        entry.private,
+                    )
+                })
                 .collect();
             let (trackers, timeout, sender) = (
                 Arc::clone(&entry.trackers),
@@ -577,6 +589,7 @@ impl AnnounceLoop {
                     self.port,
                     entry.uploaded(),
                     AnnounceEvent::Stopped,
+                    entry.private,
                 )
             })
             .collect();
@@ -692,6 +705,7 @@ fn request(
     port: u16,
     uploaded: u64,
     event: AnnounceEvent,
+    private: bool,
 ) -> AnnounceRequest {
     AnnounceRequest {
         info_hash: announce_hash,
@@ -703,6 +717,7 @@ fn request(
         corrupt: 0,
         compact: true,
         event,
+        private,
     }
 }
 
@@ -878,6 +893,7 @@ mod tests {
             announce_hashes: Vec::new(),
             peer_id: [0; 20],
             trackers: Arc::new(TrackerClient::default()),
+            private: false,
             next_announce: Instant::now(),
             started: false,
             in_flight: false,
