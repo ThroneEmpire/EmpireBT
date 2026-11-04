@@ -8,10 +8,6 @@ use std::time::{Duration, Instant};
 
 use crate::{AnnounceEvent, AnnounceRequest, Dht, Runtime, TrackerClient};
 
-/// Regular re-announce interval when trackers do not specify one.
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(30 * 60);
-const MIN_INTERVAL: Duration = Duration::from_secs(60);
-const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// First retry delay after every tracker failed; doubles up to the maximum.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
@@ -490,12 +486,19 @@ impl AnnounceLoop {
                         accepted.iter().flat_map(|response| response.peers()),
                     );
                 }
+                // One schedule for every tracker: the soonest any asks,
+                // but never sooner than any allows (`min interval`).
+                let soonest_allowed = accepted
+                    .iter()
+                    .filter_map(|response| response.min_interval())
+                    .max()
+                    .map_or(Duration::ZERO, Duration::from_secs);
                 let interval = accepted
                     .iter()
-                    .filter_map(|response| response.interval())
+                    .map(|response| response.next_announce_in())
                     .min()
-                    .map_or(DEFAULT_INTERVAL, Duration::from_secs)
-                    .clamp(MIN_INTERVAL, MAX_INTERVAL);
+                    .unwrap_or(crate::tracker::DEFAULT_ANNOUNCE_INTERVAL)
+                    .max(soonest_allowed);
                 entry.next_announce = Instant::now() + jittered(interval);
             }
             let status = AnnounceStatus {

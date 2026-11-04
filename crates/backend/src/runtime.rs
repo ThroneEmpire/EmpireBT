@@ -1259,6 +1259,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A peer that takes an upload slot and asks for nothing loses it,
+    /// as libtorrent drops such peers, so a seed's slots go to peers that
+    /// download.
+    #[test]
+    fn drops_a_peer_that_is_unchoked_but_asks_for_nothing() {
+        let (info, address, shutdown, server, root) = serving(
+            "no-request",
+            64 * 1024,
+            Arc::new(crate::Limits::unlimited()),
+        );
+        let mut stream = interested_peer(address, &info, 1);
+        while read_message(&mut stream).unwrap() != PeerMessage::Unchoke {}
+        let unchoked = std::time::Instant::now();
+        // Never a request: the connection should end.
+        while read_message(&mut stream).is_ok() {}
+        let elapsed = unchoked.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(5),
+            "{elapsed:?}"
+        );
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn keeps_uploads_under_the_upload_limit() {
         use std::io::Write;

@@ -213,6 +213,15 @@ pub const SOURCE_DHT: u8 = 2;
 pub const SOURCE_PEX: u8 = 4;
 pub const SOURCE_LSD: u8 = 8;
 
+/// After a failed connection an address waits this long times its
+/// failures before it is tried again, as libtorrent's
+/// `min_reconnect_time`...
+const RECONNECT_DELAY: Duration = Duration::from_secs(60);
+/// ...and after this many failures in a row (libtorrent's `max_failcount`)
+/// it rests until trackers and the DHT have had time to say it is back.
+const MAX_FAILURES: u32 = 3;
+const GIVE_UP_DELAY: Duration = Duration::from_secs(30 * 60);
+
 /// Rates are measured over windows at least this long.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
@@ -221,8 +230,10 @@ const RATE_WINDOW: Duration = Duration::from_secs(1);
 struct History {
     /// Payload bytes it has sent us.
     received: u64,
-    /// Connections that failed before any data arrived.
+    /// Connections that failed in a row before any data arrived.
     failures: u32,
+    /// Not dialed again before this, after failing.
+    retry_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -308,6 +319,11 @@ impl Swarm {
         let mut inner = self.lock();
         if inner.banned.contains(&identity(address)) {
             return None;
+        }
+        // It answered: failures before are forgiven.
+        if let Some(history) = inner.history.get_mut(&address) {
+            history.failures = 0;
+            history.retry_at = None;
         }
         let key = PeerKey(inner.next_key);
         inner.next_key += 1;
@@ -618,10 +634,23 @@ impl Swarm {
         }
     }
 
-    /// A connection to `address` failed before it sent anything.
+    /// A connection to `address` failed before it sent anything: it is not
+    /// dialed again for a minute per failure in a row, half an hour after
+    /// three, so a peer that refuses us is not asked every round.
     pub fn connect_failed(&self, address: SocketAddr) {
+        self.connect_failed_at(address, Instant::now());
+    }
+
+    fn connect_failed_at(&self, address: SocketAddr, now: Instant) {
         let mut inner = self.lock();
-        inner.history.entry(address).or_default().failures += 1;
+        let history = inner.history.entry(address).or_default();
+        history.failures += 1;
+        let wait = if history.failures >= MAX_FAILURES {
+            GIVE_UP_DELAY
+        } else {
+            RECONNECT_DELAY * history.failures
+        };
+        history.retry_at = Some(now + wait);
         // Perhaps it is behind a NAT: the peer that told us of it can
         // introduce us, so both sides connect at once (BEP 55), as
         // libtorrent asks after a failed connection.
@@ -713,11 +742,16 @@ impl Swarm {
         inner.banned.contains(&identity)
     }
 
-    /// Orders candidate addresses best first, without banned ones: those
-    /// that sent us the most data, then untried ones, then those that
-    /// failed most often. Ties go to the higher canonical peer priority
-    /// (BEP 40), once our public address is known.
+    /// Orders candidate addresses best first, without banned ones or
+    /// those waiting after failed connections: those that sent us the
+    /// most data, then untried ones, then those that failed most often.
+    /// Ties go to the higher canonical peer priority (BEP 40), once our
+    /// public address is known.
     pub fn rank(&self, addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+        self.rank_at(addresses, Instant::now())
+    }
+
+    fn rank_at(&self, addresses: &[SocketAddr], now: Instant) -> Vec<SocketAddr> {
         let inner = self.lock();
         let us = inner
             .external_ip()
@@ -725,6 +759,13 @@ impl Swarm {
         let mut ranked: Vec<(SocketAddr, History, u32)> = addresses
             .iter()
             .filter(|address| !inner.banned.contains(&identity(**address)))
+            .filter(|address| {
+                inner
+                    .history
+                    .get(address)
+                    .and_then(|history| history.retry_at)
+                    .is_none_or(|retry_at| now >= retry_at)
+            })
             .map(|address| {
                 let priority = us
                     .and_then(|us| crate::priority::peer_priority(us, *address))
@@ -1260,11 +1301,46 @@ mod tests {
         let (good, flaky, fresh, bad) = (address(1), address(2), address(3), address(4));
         let key = swarm.join(good, now).unwrap();
         swarm.record_download(key, 10);
-        swarm.connect_failed(flaky);
+        swarm.connect_failed_at(flaky, now);
         for _ in 0..3 {
             swarm.piece_corrupt(bad);
         }
-        assert_eq!(swarm.rank(&[bad, flaky, fresh, good]), [good, fresh, flaky]);
+        // A failed address waits a minute before it is tried again, then
+        // comes after the untried.
+        assert_eq!(
+            swarm.rank_at(&[bad, flaky, fresh, good], now),
+            [good, fresh]
+        );
+        let later = now + RECONNECT_DELAY;
+        assert_eq!(
+            swarm.rank_at(&[bad, flaky, fresh, good], later),
+            [good, fresh, flaky]
+        );
+    }
+
+    #[test]
+    fn waits_longer_after_each_failed_connection_as_libtorrent_does() {
+        let swarm = Swarm::new(4);
+        let now = Instant::now();
+        let refusing = address(5);
+        let waits: Vec<Duration> = (1..=4)
+            .map(|_| {
+                swarm.connect_failed_at(refusing, now);
+                let mut wait = Duration::ZERO;
+                while swarm.rank_at(&[refusing], now + wait).is_empty() {
+                    wait += Duration::from_secs(60);
+                }
+                wait
+            })
+            .collect();
+        assert_eq!(
+            waits,
+            [60, 120, 1800, 1800].map(Duration::from_secs),
+            "a minute per failure, then half an hour after three"
+        );
+        // Once it answers, it starts over.
+        swarm.join(refusing, now).unwrap();
+        assert_eq!(swarm.rank_at(&[refusing], now), [refusing]);
     }
 
     #[test]

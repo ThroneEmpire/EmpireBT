@@ -44,10 +44,17 @@ pub(crate) struct ExtensionOffer {
     pub client_version: bool,
     /// Offer to relay hole punches (BEP 55; never for private torrents).
     pub holepunch: bool,
+    /// A private torrent's: no metadata exchange at all, as libtorrent
+    /// leaves `ut_metadata` out for them, so its info dictionary goes
+    /// only to those who already have the `.torrent` file.
+    pub private: bool,
 }
 
 pub(crate) fn extension_handshake_with(offer: &ExtensionOffer) -> PeerMessage {
-    let mut extensions = vec![(&b"ut_metadata"[..], Value::Int(UT_METADATA.into()))];
+    let mut extensions = Vec::new();
+    if !offer.private {
+        extensions.push((&b"ut_metadata"[..], Value::Int(UT_METADATA.into())));
+    }
     if offer.pex {
         extensions.push((b"ut_pex", Value::Int(crate::pex::UT_PEX.into())));
     }
@@ -67,7 +74,10 @@ pub(crate) fn extension_handshake_with(offer: &ExtensionOffer) -> PeerMessage {
                     .collect(),
             ),
         ),
-        (b"reqq".to_vec(), Value::Int(250)),
+        (
+            b"reqq".to_vec(),
+            Value::Int(crate::engine::wire::MAX_QUEUED_UPLOADS as i64),
+        ),
     ];
     if offer.client_version {
         entries.push((
@@ -75,7 +85,7 @@ pub(crate) fn extension_handshake_with(offer: &ExtensionOffer) -> PeerMessage {
             Value::bytes(format!("EmpireBT {}", env!("CARGO_PKG_VERSION"))),
         ));
     }
-    if let Some(size) = offer.metadata_size {
+    if let Some(size) = offer.metadata_size.filter(|_| !offer.private) {
         entries.push((b"metadata_size".to_vec(), Value::Int(size as i64)));
     }
     if let Some(ip) = offer.your_ip {
@@ -197,9 +207,10 @@ pub(crate) fn serve_extended(
     let piece = message
         .get_int(b"piece")
         .and_then(|piece| usize::try_from(piece).ok());
-    let reply = match (info, piece) {
-        (Some(info), Some(piece)) if piece * PIECE_SIZE < info.len() => {
-            let start = piece * PIECE_SIZE;
+    // The peer picks `piece`: a huge one must not overflow.
+    let start = piece.and_then(|piece| piece.checked_mul(PIECE_SIZE));
+    let reply = match (info, piece, start) {
+        (Some(info), Some(piece), Some(start)) if start < info.len() => {
             let end = (start + PIECE_SIZE).min(info.len());
             let mut bytes = Value::dict([
                 (b"msg_type", Value::Int(1)),
@@ -560,6 +571,46 @@ mod tests {
         });
         assert!(named.is_some_and(|name| name.starts_with("EmpireBT")));
         assert_eq!(client(&ExtensionOffer::default()), None);
+    }
+
+    #[test]
+    fn private_torrents_offer_no_metadata_exchange() {
+        let offer = |private: bool| {
+            let PeerMessage::Extended { payload, .. } = extension_handshake_with(&ExtensionOffer {
+                metadata_size: Some(1234),
+                private,
+                ..ExtensionOffer::default()
+            }) else {
+                panic!("not an extended message");
+            };
+            let remote = parse_extension_handshake(&payload).unwrap();
+            (remote.message_id, remote.size)
+        };
+        assert_eq!(offer(false), (Some(UT_METADATA), Some(1234)));
+        assert_eq!(offer(true), (None, None));
+    }
+
+    #[test]
+    fn refuses_metadata_pieces_past_the_end_without_overflowing() {
+        let mut remote = RemoteMetadata {
+            message_id: Some(3),
+            ..RemoteMetadata::default()
+        };
+        for piece in [1, i64::MAX] {
+            let request =
+                Value::dict([(b"msg_type", Value::Int(0)), (b"piece", Value::Int(piece))]).encode();
+            let replies =
+                serve_extended(UT_METADATA, &request, Some(&[0; 100]), &mut remote).unwrap();
+            let [PeerMessage::Extended { id: 3, payload }] = replies.as_slice() else {
+                panic!("no reply");
+            };
+            let (reply, _) = bencode::decode_prefix(payload).unwrap();
+            assert_eq!(
+                reply.get_int(b"msg_type"),
+                Some(2),
+                "a reject for piece {piece}"
+            );
+        }
     }
 
     /// Serves `info` over ut_metadata to one peer, like a seeder would.

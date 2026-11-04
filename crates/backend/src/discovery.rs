@@ -14,13 +14,6 @@ use std::time::{Duration, Instant};
 
 use crate::{AnnounceEvent, AnnounceRequest, BackendError, TrackerClient, TrackerResponse};
 
-/// Re-announce interval when a tracker does not specify one.
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(30 * 60);
-/// Upper bound on a tracker-requested interval.
-const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// Retry delay after a failed announce.
-const FAILURE_DELAY: Duration = crate::progress::ANNOUNCE_FAILURE_DELAY;
-
 /// Called with the peers from each successful announce, on the thread that
 /// made it.
 pub(crate) type OnPeers = Arc<dyn Fn(&[SocketAddr]) + Send + Sync>;
@@ -37,6 +30,8 @@ struct Schedule {
     started: bool,
     /// Whether any announce to it has finished, successfully or not.
     answered: bool,
+    /// Announces that failed in a row, for the back-off.
+    failures: u32,
 }
 
 /// A finished announce to one tracker, for every hash of the swarm.
@@ -60,9 +55,6 @@ pub(crate) struct Announcer {
     replies: Arc<Mutex<Vec<Reply>>>,
     on_peers: OnPeers,
     timeout: Duration,
-    /// Caps tracker-requested intervals, for callers that want fresh peers
-    /// more often (metadata for a magnet link).
-    max_interval: Duration,
     succeeded: bool,
 }
 
@@ -79,19 +71,14 @@ impl Announcer {
                     in_flight: false,
                     started: false,
                     answered: false,
+                    failures: 0,
                 })
                 .collect(),
             replies: Arc::default(),
             on_peers,
             timeout,
-            max_interval: MAX_INTERVAL,
             succeeded: false,
         }
-    }
-
-    pub fn with_max_interval(mut self, interval: Duration) -> Self {
-        self.max_interval = interval;
-        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -182,14 +169,10 @@ impl Announcer {
             schedule.answered = true;
             match reply.primary {
                 Ok(response) => {
+                    schedule.failures = 0;
                     schedule.started = true;
                     self.succeeded = true;
-                    let interval = response
-                        .min_interval()
-                        .or(response.interval())
-                        .map_or(DEFAULT_INTERVAL, Duration::from_secs)
-                        .clamp(Duration::from_secs(1), self.max_interval);
-                    schedule.next = now + interval;
+                    schedule.next = now + response.next_announce_in();
                     let size = |response: &TrackerResponse| {
                         response.seeders().unwrap_or(0) + response.leechers().unwrap_or(0)
                     };
@@ -202,7 +185,11 @@ impl Announcer {
                     }
                 }
                 Err(error) => {
-                    schedule.next = now + FAILURE_DELAY;
+                    // Longer after each failure, as libtorrent backs off, so a
+                    // tracker that refuses the torrent is not asked every few
+                    // seconds for as long as it runs.
+                    schedule.failures = schedule.failures.saturating_add(1);
+                    schedule.next = now + crate::tracker::retry_delay(schedule.failures);
                     collected.error = Some(error);
                 }
             }

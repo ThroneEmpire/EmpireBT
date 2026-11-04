@@ -258,7 +258,19 @@ cargo run --release -p empirebt-backend --example throughput -- [MIB] [PIECE_KIB
 ONLY=utp cargo run --release -p empirebt-backend --example throughput   # just the uTP tests
 ```
 
-Results vary about 15% between runs on WSL; compare several runs. To
+Results vary about 15% between runs on WSL; compare several runs.
+
+With latency, as a distant peer sees it: `scripts/throughput-with-latency.sh
+100 128 1024 4` (as root) runs it in a private network namespace whose own
+loopback delays packets 100 ms each way, so the host is untouched. `BIN=`
+runs another build, `ONLY=` picks tests, and `TCP_BUFFER=33554432` lifts
+the kernel's 4 MiB TCP send buffer limit in the namespace, which otherwise
+caps one connection at about 12-20 MiB/s at a 200 ms round trip whatever
+the client does. Measured 2026-11-04 at a 200 ms round trip, after raising
+the request queues to libtorrent 2.1's (1500 out, 2000 in): one peer 7 to
+12 MiB/s (9 to 37 MiB/s over 512 MiB with larger TCP buffers), four
+downloaders 30 to 48 MiB/s (70 with larger buffers); unchanged with no
+latency. To
 profile one test: `ONLY="utp, plain" perf record -g ./target/release/examples/throughput 256`.
 This `perf` cannot name Rust symbols, so map addresses with `nm -C`. To
 compare with older code, build it in a separate `git worktree`, never by

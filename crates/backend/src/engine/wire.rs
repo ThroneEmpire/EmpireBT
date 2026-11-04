@@ -23,9 +23,13 @@
 //!   magnet link. Unless the torrent is private (BEP 27) we also exchange
 //!   peers (BEP 11): a full list once the peer's extension handshake
 //!   arrives, then changes at most once a minute.
-//! - Connections neither side needs close, keep-alives go out, silent peers
-//!   are dropped, and a peer that stops sending requested blocks is
-//!   snubbed.
+//! - Keep-alives go out, silent peers are dropped, and a peer that stops
+//!   sending requested blocks is snubbed: its pieces go to others for a
+//!   while, as in libtorrent, and the connection stays.
+//! - Connections neither side needs close: between two seeds soon, else
+//!   after ten minutes, or soon while connection slots run short
+//!   (libtorrent's `inactivity_timeout`). While seeding, a peer that takes
+//!   an upload slot and asks for nothing for a minute is dropped.
 //!
 //! Blocks we did not request are ignored rather than closing the
 //! connection, since an end-game cancel can cross a block in flight.
@@ -195,6 +199,7 @@ impl PeerWire {
                 listen_port: torrent.swarm.listen_port(),
                 client_version: crate::identity::identifies(&torrent.peer_id),
                 holepunch: !self.private,
+                private: self.private,
             };
             out.push(Action::Send(crate::metadata::extension_handshake_with(
                 &offer,
@@ -214,12 +219,16 @@ impl PeerWire {
     /// Everything that happens with time rather than in reply to a
     /// message: announcing pieces, interest and choking, requests,
     /// uploads, timeouts, peer exchange, and keep-alives.
+    /// `crowded`: connection slots are running short, so connections no
+    /// one needs close sooner.
     pub(crate) fn tick(
         &mut self,
         now: Instant,
+        crowded: bool,
         out: &mut Vec<Action>,
     ) -> Result<Flow, crate::BackendError> {
         let torrent = Arc::clone(&self.torrent);
+        let crowded = crowded || torrent.crowded();
         let key = self.link.key;
         if torrent.swarm.is_evicted(key) {
             return Ok(Flow::Finished);
@@ -248,11 +257,7 @@ impl PeerWire {
         }
         if self.state.interest_changed {
             self.state.interest_changed = false;
-            let seed = self
-                .bitfield
-                .as_deref()
-                .is_some_and(|bits| (0..torrent.piece_count()).all(|index| has_bit(bits, index)));
-            if seed {
+            if self.peer_is_seed() {
                 torrent.swarm.update_pex_flags(key, crate::pex::SEED, 0);
             }
             let wanted = self
@@ -273,24 +278,46 @@ impl PeerWire {
         self.update_choke(now, out);
         self.request_pieces(now, out)?;
         // A peer that stops sending requested blocks is snubbed: its pieces
-        // go to other peers, and it gets no requests for a while. It is
-        // kept only if it still wants data from us.
+        // go to other peers, and it gets no requests for a while. While
+        // there is room the connection stays, as in libtorrent: a slow seed
+        // may be the only one there is. When slots run short, a snubbed
+        // peer that wants nothing from us makes way for another, as
+        // libtorrent replaces its worst peers when full.
         let waiting = self
             .downloads
             .iter()
             .any(|download| !download.outstanding.is_empty());
-        if waiting && now - self.state.last_block > torrent.timeout {
+        if waiting && now - self.state.last_block > torrent.timeout.max(PIECE_TIMEOUT) {
             self.downloads.clear();
             self.state.snubbed_until = Some(now + SNUB_COOLDOWN);
             torrent.swarm.set_snubbed(self.link.key, true);
-            if !self.state.peer_interested {
-                return Err(invalid_peer("peer stopped sending requested blocks"));
-            }
+        }
+        let snubbed = self.state.snubbed_until.is_some_and(|until| now < until);
+        if snubbed && crowded && !self.state.peer_interested {
+            return Err(invalid_peer(
+                "peer stopped sending requested blocks, and its slot is needed",
+            ));
         }
 
         self.pump_uploads(out);
 
-        // Connections that neither side needs make room for others.
+        // A seed's upload slot taken by a peer that asks for nothing goes
+        // to one that will, as libtorrent drops such peers.
+        if torrent.is_complete()
+            && !self.state.am_choking
+            && self.state.peer_interested
+            && self.state.uploads.is_empty()
+            && self.reads_in_flight == 0
+            && now - self.state.last_upload_activity >= NO_REQUEST_LIMIT
+        {
+            return Err(invalid_peer(
+                "peer took an upload slot and asked for nothing",
+            ));
+        }
+
+        // Connections that neither side needs make room for others: two
+        // seeds have nothing for each other ever; others may soon, as
+        // either gets new pieces, so they stay unless slots run short.
         if self.state.am_interested
             || self.state.peer_interested
             || !self.downloads.is_empty()
@@ -298,8 +325,15 @@ impl PeerWire {
             || self.reads_in_flight > 0
         {
             self.state.idle_since = None;
-        } else if now - *self.state.idle_since.get_or_insert(now) >= IDLE_LIMIT {
-            return Ok(Flow::Finished);
+        } else {
+            let limit = if crowded || (torrent.is_complete() && self.peer_is_seed()) {
+                IDLE_LIMIT
+            } else {
+                INACTIVITY_LIMIT
+            };
+            if now - *self.state.idle_since.get_or_insert(now) >= limit {
+                return Ok(Flow::Finished);
+            }
         }
         if now - self.state.last_received >= SILENCE_LIMIT {
             return Err(invalid_peer("peer went silent"));
@@ -338,6 +372,9 @@ impl PeerWire {
             return;
         }
         self.state.am_choking = !unchoke;
+        if unchoke {
+            self.state.last_upload_activity = now;
+        }
         let message = if unchoke {
             PeerMessage::Unchoke
         } else {
@@ -393,6 +430,11 @@ impl PeerWire {
         if !self.state.am_interested || snubbed || (choked && self.allowed.is_empty()) {
             return Ok(());
         }
+        // Enough pieces to hold `depth` requests, however small they are.
+        let blocks_per_piece = (torrent.info.piece_length() as usize)
+            .div_ceil(16 * 1024)
+            .max(1);
+        let max_pieces = MAX_PIECES_PER_PEER.max(depth.div_ceil(blocks_per_piece) + 1);
         let allowed = &self.allowed;
         let requestable =
             |download: &Download| !choked || allowed.contains(&(download.index as u32));
@@ -403,7 +445,7 @@ impl PeerWire {
                 .filter(|download| requestable(download))
                 .map(|download| download.outstanding.len() + download.unsent.len())
                 .sum();
-            if queued >= depth || self.downloads.len() >= MAX_PIECES_PER_PEER {
+            if queued >= depth || self.downloads.len() >= max_pieces {
                 break;
             }
             let next = if choked {
@@ -513,10 +555,11 @@ impl PeerWire {
                         .update_pex_flags(key, crate::pex::SUPPORTS_HOLEPUNCH, 0);
                 }
             }
+            // Not offered for a private torrent, so not answered either.
             PeerMessage::Extended {
                 id: crate::metadata::UT_METADATA,
                 payload,
-            } => {
+            } if !self.private => {
                 let replies = crate::metadata::serve_extended(
                     crate::metadata::UT_METADATA,
                     &payload,
@@ -677,6 +720,7 @@ impl PeerWire {
                 let starting = self.bitfield.as_deref().map_or(0, |bits| {
                     bits.iter().map(|byte| byte.count_ones()).sum::<u32>()
                 }) < crate::fast::ALLOWED_FAST_COUNT as u32;
+                self.state.last_upload_activity = now;
                 let permitted = !self.state.am_choking
                     || (fast && starting && self.granted.contains(&piece_index));
                 if permitted
@@ -776,6 +820,7 @@ impl PeerWire {
         out: &mut Vec<Action>,
     ) {
         self.reads_in_flight = self.reads_in_flight.saturating_sub(1);
+        self.state.last_upload_activity = now;
         self.torrent
             .swarm
             .record_upload(self.link.key, block.len() as u64);
@@ -826,6 +871,14 @@ impl PeerWire {
     fn send(&mut self, out: &mut Vec<Action>, message: PeerMessage, now: Instant) {
         out.push(Action::Send(message));
         self.state.last_sent = now;
+    }
+
+    /// The peer has said it has every piece.
+    fn peer_is_seed(&self) -> bool {
+        let count = self.torrent.piece_count();
+        self.bitfield
+            .as_deref()
+            .is_some_and(|bits| (0..count).all(|index| has_bit(bits, index)))
     }
 
     fn peer_has(&self, index: usize) -> bool {
@@ -916,7 +969,7 @@ impl Pex {
         let limit = if self.sent_any {
             crate::pex::MAX_PER_MESSAGE
         } else {
-            usize::MAX
+            MAX_FIRST_PEX
         };
         let current: std::collections::HashSet<SocketAddr> =
             contacts.iter().map(|(address, _)| *address).collect();
@@ -959,6 +1012,9 @@ struct State {
     /// When the connection stopped being useful to either side.
     idle_since: Option<Instant>,
     snubbed_until: Option<Instant>,
+    /// When we last unchoked the peer, it last asked for a block, or we
+    /// last sent it one.
+    last_upload_activity: Instant,
     /// When a requested block last arrived, or requests last went out to
     /// an idle pipeline.
     last_block: Instant,
@@ -981,6 +1037,7 @@ impl State {
             last_received: now,
             idle_since: None,
             snubbed_until: None,
+            last_upload_activity: now,
             last_block: now,
             window_bytes: 0,
             rate_at: now,
@@ -1000,13 +1057,14 @@ impl State {
     }
 
     /// Blocks to keep requested: enough for [`REQUEST_QUEUE_TIME`] at the
-    /// current rate, within the peer's advertised queue (`reqq`).
+    /// current rate, never more than the peer's advertised queue (`reqq`),
+    /// as libtorrent keeps to it, however small.
     fn request_depth(&self, reqq: Option<usize>) -> usize {
         let wanted = (self.rate * REQUEST_QUEUE_TIME.as_secs_f64() / 16_384.0) as usize;
         let ceiling = reqq
             .unwrap_or(MAX_REQUEST_DEPTH)
-            .clamp(MIN_REQUEST_DEPTH, MAX_REQUEST_DEPTH);
-        wanted.clamp(MIN_REQUEST_DEPTH, ceiling)
+            .clamp(1, MAX_REQUEST_DEPTH);
+        wanted.clamp(MIN_REQUEST_DEPTH.min(ceiling), ceiling)
     }
 }
 
@@ -1049,19 +1107,26 @@ fn validate_bitfield(bitfield: &[u8], piece_count: usize) -> Result<(), crate::B
 }
 
 /// Block requests kept in flight per peer: enough to cover this long at the
-/// peer's current rate, as libtorrent does. One request per round trip
-/// would cap a peer at 16 KiB per round trip.
-const REQUEST_QUEUE_TIME: Duration = Duration::from_secs(2);
+/// peer's current rate, as libtorrent's `request_queue_time`. One request
+/// per round trip would cap a peer at 16 KiB per round trip.
+const REQUEST_QUEUE_TIME: Duration = Duration::from_secs(3);
 /// At least this many (256 KiB), so new and slow peers can speed up.
 const MIN_REQUEST_DEPTH: usize = 16;
-/// At most this many, or the peer's own `reqq` if lower.
-const MAX_REQUEST_DEPTH: usize = 250;
-/// Pieces in flight from one peer at most.
+/// At most this many (24 MiB), or the peer's own `reqq` if lower:
+/// libtorrent's `max_out_request_queue` since 2.1 (arvidn/libtorrent
+/// 170663b). A peer's speed is at most what is in flight per round trip,
+/// so a fast peer far away needs many.
+const MAX_REQUEST_DEPTH: usize = 1500;
+/// Pieces in flight from one peer at least may reach this; more when the
+/// request depth needs more pieces than that (small pieces, fast peer).
+/// Blocks are kept only as they arrive, so idle room costs nothing.
 const MAX_PIECES_PER_PEER: usize = 16;
 /// Block reads for one peer handed to the driver at once.
 const MAX_READS_IN_FLIGHT: usize = 8;
-/// Requests queued per peer, matching the `reqq` that clients assume.
-const MAX_QUEUED_UPLOADS: usize = 250;
+/// Requests a peer may queue with us, as our `reqq` says: libtorrent's
+/// `max_allowed_in_request_queue`, so a fast downloader far away is not
+/// held back by us. Each is a few bytes; disk reads are limited apart.
+pub(crate) const MAX_QUEUED_UPLOADS: usize = 2000;
 /// BEP 11: at most one peer exchange message a minute.
 const PEX_INTERVAL: Duration = Duration::from_secs(60);
 /// How soon to check again while there is nobody to tell a peer about.
@@ -1076,14 +1141,76 @@ const MAX_SUGGESTIONS: usize = 32;
 const MAX_ALLOWED_FAST: usize = 32;
 /// How long a snubbed peer gets no requests.
 const SNUB_COOLDOWN: Duration = Duration::from_secs(30);
-/// A connection neither side is interested in closes after this, freeing
-/// its slot for a peer that can help. Peers learn of new pieces through
-/// later connections.
+/// No requested block for this long (or `network.peer_timeout`, if
+/// longer) snubs a peer: libtorrent's `piece_timeout`.
+const PIECE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(20)
+};
+/// A connection neither side is interested in closes after this when it
+/// can never be useful (two seeds) or slots run short...
 const IDLE_LIMIT: Duration = if cfg!(test) {
     Duration::from_millis(300)
 } else {
     Duration::from_secs(15)
 };
-/// Peers send keep-alives about every two minutes.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(90);
+/// ...and otherwise after this, libtorrent's `inactivity_timeout`: either
+/// side may soon have pieces the other wants.
+const INACTIVITY_LIMIT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(10 * 60)
+};
+/// While seeding, an unchoked peer that asks for nothing this long is
+/// dropped (libtorrent's `timed_out_no_request`).
+const NO_REQUEST_LIMIT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(60)
+};
+/// A keep-alive goes out after this long without sending anything: half
+/// of libtorrent's 120-second `peer_timeout`, as libtorrent sends them.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const SILENCE_LIMIT: Duration = Duration::from_secs(180);
+/// Contacts in the first peer exchange message at most, as libtorrent's
+/// `max_peer_entries`; later ones carry at most 50 changes.
+const MAX_FIRST_PEX: usize = 100;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn never_queues_more_requests_than_the_peer_allows() {
+        let mut state = State::new(Instant::now());
+        // A new peer: 16 requests, or fewer if its `reqq` says so.
+        assert_eq!(state.request_depth(None), MIN_REQUEST_DEPTH);
+        assert_eq!(state.request_depth(Some(250)), MIN_REQUEST_DEPTH);
+        assert_eq!(state.request_depth(Some(8)), 8);
+        assert_eq!(state.request_depth(Some(0)), 1);
+        // A fast one: two seconds' worth, up to its `reqq` and our cap.
+        state.rate = 10.0 * 1024.0 * 1024.0;
+        assert_eq!(state.request_depth(Some(100)), 100);
+        assert_eq!(state.request_depth(Some(2000)), MAX_REQUEST_DEPTH);
+        assert_eq!(state.request_depth(Some(8)), 8);
+    }
+
+    #[test]
+    fn caps_peer_exchange_messages_as_libtorrent_does() {
+        let contacts: Vec<(SocketAddr, u8)> = (0..300)
+            .map(|index| {
+                (
+                    SocketAddr::from(([10, 0, (index / 250) as u8, (index % 250) as u8], 6881)),
+                    0,
+                )
+            })
+            .collect();
+        let mut pex = Pex::default();
+        let first = pex.changes(&contacts);
+        assert_eq!(first.added.len(), MAX_FIRST_PEX);
+        pex.sent_any = true;
+        let second = pex.changes(&contacts);
+        assert_eq!(second.added.len(), crate::pex::MAX_PER_MESSAGE);
+    }
+}

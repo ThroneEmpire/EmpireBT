@@ -1684,10 +1684,7 @@ fn fetch_magnet_metadata(
                 announced.extend_from_slice(found);
             }
         })
-    })
-    // Fresh peers matter more than tracker etiquette while nobody we know
-    // has the metadata.
-    .with_max_interval(Duration::from_secs(60));
+    });
     // Local peers that have the torrent can hand over its metadata too.
     let _local = lsd.as_ref().map(|lsd| {
         let announced = Arc::clone(&announced);

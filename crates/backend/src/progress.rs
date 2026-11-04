@@ -75,9 +75,6 @@ pub struct TransferProgress {
 
 const UNKNOWN: u64 = u64::MAX;
 
-/// Delay before re-announcing after a tracker request fails outright.
-pub(crate) const ANNOUNCE_FAILURE_DELAY: Duration = Duration::from_secs(15);
-
 impl Default for TransferProgress {
     fn default() -> Self {
         Self {

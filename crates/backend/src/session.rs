@@ -683,6 +683,7 @@ impl DownloadSession {
         max_connections: usize,
     ) -> Result<(usize, Option<crate::BackendError>), crate::BackendError> {
         let before = self.progress.verified_pieces();
+        torrent.set_connection_limit(max_connections);
         // Productive peers first; banned ones are skipped.
         let ranked = self.swarm.rank(addresses);
         self.swarm.note_known(&ranked);
@@ -1433,6 +1434,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A snubbed peer stays while there is room (a slow seed may be the
+    /// only one); here the one connection allowed is needed, so it goes.
     #[test]
     fn abandons_a_peer_that_only_sends_keep_alives() {
         let (info, data) = two_block_torrent();

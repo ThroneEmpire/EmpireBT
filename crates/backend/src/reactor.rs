@@ -54,6 +54,7 @@ const OUTPUT_HIGH: usize = 4 << 20;
 const OUTPUT_LOW: usize = 1 << 20;
 /// Peers send keep-alives about every two minutes.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+use crate::engine::active::CROWDED_MARGIN;
 const TICK: Duration = Duration::from_millis(200);
 /// How soon connections held back by a rate limit try again.
 const THROTTLE_RETRY: Duration = Duration::from_millis(10);
@@ -441,6 +442,13 @@ impl Server<'_> {
         self.connections.len() < self.max_connections && self.limits.has_room(0)
     }
 
+    /// Within a few connections of a limit, as libtorrent checks before
+    /// closing connections no one needs.
+    fn crowded(&self) -> bool {
+        self.connections.len() + CROWDED_MARGIN >= self.max_connections
+            || !self.limits.has_room(CROWDED_MARGIN)
+    }
+
     /// Lets connections held back by a rate limit read and write again.
     /// Each retry starts with a different connection, so no peer is always
     /// first to the tokens.
@@ -641,6 +649,7 @@ impl Server<'_> {
     /// as the connection's limits allow. Returns whether any input was used.
     fn process(&mut self, id: usize) -> Result<bool, BackendError> {
         let routes = self.routes;
+        let crowded = self.crowded();
         let Some(connection) = self.connections.get_mut(&id) else {
             return Ok(false);
         };
@@ -765,7 +774,7 @@ impl Server<'_> {
         connection.input.drain(..consumed);
         // Requests and uploads follow the messages at once.
         if consumed > 0 {
-            run_tick(id, connection, &self.jobs, routes)?;
+            run_tick(id, connection, &self.jobs, routes, crowded)?;
         }
         Ok(progressed || consumed > 0)
     }
@@ -805,6 +814,7 @@ impl Server<'_> {
 
     /// Runs the timed part of the protocol on every active connection.
     fn tick(&mut self) {
+        let crowded = self.crowded();
         let ids: Vec<usize> = self
             .connections
             .iter()
@@ -815,7 +825,7 @@ impl Server<'_> {
             let Some(connection) = self.connections.get_mut(&id) else {
                 continue;
             };
-            if let Err(error) = run_tick(id, connection, &self.jobs, self.routes) {
+            if let Err(error) = run_tick(id, connection, &self.jobs, self.routes, crowded) {
                 self.fail(id, error);
             } else {
                 self.flush(id);
@@ -1006,6 +1016,7 @@ fn run_tick(
     connection: &mut Connection,
     jobs: &mpsc::Sender<Job>,
     routes: &crate::runtime::Routes,
+    crowded: bool,
 ) -> Result<(), BackendError> {
     let Phase::Active { torrent, wire } = &mut connection.phase else {
         return Ok(());
@@ -1014,7 +1025,7 @@ fn run_tick(
         return Err(invalid("the torrent is no longer shared"));
     }
     let mut out = Vec::new();
-    if wire.tick(Instant::now(), &mut out)? == Flow::Finished {
+    if wire.tick(Instant::now(), crowded, &mut out)? == Flow::Finished {
         return Err(invalid("connection finished"));
     }
     dispatch(id, connection, jobs, out)?;

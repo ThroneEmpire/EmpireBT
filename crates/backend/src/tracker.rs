@@ -1,3 +1,25 @@
+/// How long to wait before announcing again to a tracker that failed
+/// `failures` times in a row, as libtorrent's `announce_infohash::failed`
+/// with its default `tracker_backoff` of 250: 5 s plus 12.5 s times the
+/// failures squared (about 17 s, 55 s, 2 min, 3.5 min, 5 min...), at most
+/// an hour.
+pub(crate) fn retry_delay(failures: u32) -> std::time::Duration {
+    const MIN: u64 = 5;
+    const MAX: u64 = 60 * 60;
+    let failures = u64::from(failures.min(127));
+    let seconds = MIN + failures * failures * MIN * 250 / 100;
+    std::time::Duration::from_secs(seconds.min(MAX))
+}
+
+/// Announce interval when a tracker gives none.
+pub(crate) const DEFAULT_ANNOUNCE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+/// No tracker is announced to more often than this, whatever it asks:
+/// libtorrent's `min_announce_interval`. Trackers that answer `interval
+/// 0` or 60 would otherwise be asked every minute by every torrent.
+pub(crate) const MIN_ANNOUNCE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
 /// A tracker endpoint advertised by torrent metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tracker {
@@ -26,6 +48,76 @@ fn parse_udp_url(url: &str) -> Result<(String, u16), crate::BackendError> {
 /// Attempts per UDP request; UDP datagrams are routinely lost, so a single
 /// unanswered packet must not fail the whole announce (BEP 15).
 const UDP_ATTEMPTS: u32 = 3;
+
+/// How long a UDP tracker's connection ID is reused: BEP 15's minute, as
+/// libtorrent's `udp_tracker_token_expiry`, so each announce is one round
+/// trip, not two.
+const CONNECTION_ID_LIFETIME: Duration = Duration::from_secs(60);
+
+/// Connection IDs by tracker address, and when each was given.
+type ConnectionIds = std::sync::Mutex<HashMap<SocketAddr, ([u8; 8], std::time::Instant)>>;
+
+fn connection_ids() -> &'static ConnectionIds {
+    static IDS: std::sync::OnceLock<ConnectionIds> = std::sync::OnceLock::new();
+    IDS.get_or_init(Default::default)
+}
+
+/// A fresh connection ID from the tracker at `address` (BEP 15 `connect`).
+fn connect_udp(socket: &UdpSocket, address: SocketAddr) -> Result<[u8; 8], Failure> {
+    let transaction = transaction_id();
+    let mut connect = Vec::with_capacity(16);
+    connect.extend(0x41727101980_u64.to_be_bytes());
+    connect.extend(0_u32.to_be_bytes());
+    connect.extend(transaction.to_be_bytes());
+    let response = udp_exchange(socket, &connect, 0, transaction, 16)?;
+    let id: [u8; 8] = response[8..16].try_into().expect("16 bytes checked");
+    if let Ok(mut ids) = connection_ids().lock() {
+        // Expired ones go once there are many, so the map stays small.
+        if ids.len() >= 1024 {
+            ids.retain(|_, (_, at)| at.elapsed() < CONNECTION_ID_LIFETIME);
+        }
+        ids.insert(address, (id, std::time::Instant::now()));
+    }
+    Ok(id)
+}
+
+/// Runs `exchange` with a connection ID for `address`: a cached one while
+/// it is fresh, else a new one. A cached one that fails is dropped and the
+/// exchange tried once more with a new one, as the tracker may have
+/// forgotten it sooner.
+fn with_connection_id<T>(
+    socket: &UdpSocket,
+    address: SocketAddr,
+    exchange: impl Fn([u8; 8]) -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    let cached = connection_ids().lock().ok().and_then(|ids| {
+        ids.get(&address)
+            .filter(|(_, at)| at.elapsed() < CONNECTION_ID_LIFETIME)
+            .map(|(id, _)| *id)
+    });
+    if let Some(id) = cached {
+        match exchange(id) {
+            Ok(result) => return Ok(result),
+            Err(_) => {
+                if let Ok(mut ids) = connection_ids().lock() {
+                    ids.remove(&address);
+                }
+            }
+        }
+    }
+    exchange(connect_udp(socket, address)?)
+}
+
+/// What follows the host and port in a UDP tracker URL (`/announce`, a
+/// passkey path, a query), sent with each announce as BEP 41's URLData
+/// option, as libtorrent sends it: private UDP trackers tell users apart by
+/// it. At most 255 bytes fit.
+fn udp_request_string(url: &str) -> &[u8] {
+    let rest = url.strip_prefix("udp://").unwrap_or(url);
+    let path = rest.find(['/', '?']).map_or("", |at| &rest[at..]);
+    let bytes = path.as_bytes();
+    &bytes[..bytes.len().min(255)]
+}
 
 fn announce_udp_tracker(
     tracker: &Tracker,
@@ -158,31 +250,32 @@ fn announce_udp_at(
         .set_read_timeout(Some(attempt_timeout))
         .map_err(|error| tracker_error(error.to_string()))?;
 
-    let transaction = transaction_id();
-    let mut connect = Vec::with_capacity(16);
-    connect.extend(0x41727101980_u64.to_be_bytes());
-    connect.extend(0_u32.to_be_bytes());
-    connect.extend(transaction.to_be_bytes());
-    let response = udp_exchange(&socket, &connect, 0, transaction, 16)?;
-    let connection_id = response[8..16].to_vec();
-
-    let transaction = transaction_id().wrapping_add(1);
-    let mut announce = Vec::with_capacity(98);
-    announce.extend(&connection_id);
-    announce.extend(1_u32.to_be_bytes());
-    announce.extend(transaction.to_be_bytes());
-    announce.extend(request.info_hash);
-    announce.extend(request.peer_id);
-    announce.extend(request.downloaded.to_be_bytes());
-    announce.extend(request.left.to_be_bytes());
-    announce.extend(request.uploaded.to_be_bytes());
-    announce.extend(request.event.udp_code().to_be_bytes());
-    // Our address (0: the one the packet came from), key, peers wanted.
-    announce.extend(0_u32.to_be_bytes());
-    announce.extend(request.key().to_be_bytes());
-    announce.extend(request.num_want().to_be_bytes());
-    announce.extend(request.port.to_be_bytes());
-    let response = udp_exchange(&socket, &announce, 1, transaction, 20)?;
+    let request_string = udp_request_string(tracker.url());
+    let response = with_connection_id(&socket, address, |connection_id| {
+        let transaction = transaction_id();
+        let mut announce = Vec::with_capacity(100 + request_string.len());
+        announce.extend(connection_id);
+        announce.extend(1_u32.to_be_bytes());
+        announce.extend(transaction.to_be_bytes());
+        announce.extend(request.info_hash);
+        announce.extend(request.peer_id);
+        announce.extend(request.downloaded.to_be_bytes());
+        announce.extend(request.left.to_be_bytes());
+        announce.extend(request.uploaded.to_be_bytes());
+        announce.extend(request.event.udp_code().to_be_bytes());
+        // Our address (0: the one the packet came from), key, peers wanted.
+        announce.extend(0_u32.to_be_bytes());
+        announce.extend(request.key().to_be_bytes());
+        announce.extend(request.num_want().to_be_bytes());
+        announce.extend(request.port.to_be_bytes());
+        if !request_string.is_empty() {
+            // BEP 41 option 2, URLData.
+            announce.push(2);
+            announce.push(request_string.len() as u8);
+            announce.extend(request_string);
+        }
+        udp_exchange(&socket, &announce, 1, transaction, 20)
+    })?;
     let read = |at: usize| u64::from(u32::from_be_bytes(response[at..at + 4].try_into().unwrap()));
     let (interval, leechers, seeders) = (read(8), read(12), read(16));
     // Peers are returned in the address family the tracker was reached on.
@@ -342,12 +435,11 @@ fn udp_exchange(
     Err(last_error.unwrap_or_else(|| unreachable("UDP tracker did not respond")))
 }
 
+/// A random transaction ID, as libtorrent's: one read off the clock could
+/// be guessed by someone forging tracker replies (made-up peers, a huge
+/// interval).
 fn transaction_id() -> u32 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    (nanos as u64 ^ (nanos >> 32) as u64) as u32
+    u32::from_be_bytes(crate::dht::random_bytes())
 }
 
 fn invalid(message: impl Into<String>) -> crate::BackendError {
@@ -584,16 +676,27 @@ impl TrackerClient {
     }
 
     /// Announces to configured HTTP(S) or UDP trackers in order until one
-    /// succeeds.
+    /// succeeds, starting with the one that last answered (BEP 12: a
+    /// tracker that works moves to the front of its tier), so a dead first
+    /// tracker does not cost every announce a timeout.
     pub fn announce(
         &self,
         request: &AnnounceRequest,
         timeout: Duration,
     ) -> Result<TrackerResponse, crate::BackendError> {
         let mut last_error = None;
-        for tracker in &self.trackers {
+        let preferred = tier_order::preferred(&self.trackers);
+        let order = preferred.iter().chain(
+            self.trackers
+                .iter()
+                .filter(|tracker| preferred.first() != Some(*tracker)),
+        );
+        for tracker in order {
             match announce_tracker(tracker, request, timeout) {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    tier_order::worked(&self.trackers, tracker);
+                    return Ok(response);
+                }
                 Err(error) => last_error = Some(error),
             }
         }
@@ -681,16 +784,113 @@ fn announce_http_tracker(
         .map_err(|message| tracker_error(format!("tracker {message}")))?;
     // Private trackers embed credentials in the announce URL's own query.
     let separator = if url.path.contains('?') { '&' } else { '?' };
-    let target = format!("{}{separator}{}", url.path, request.query());
+    let mut target = format!("{}{separator}{}", url.path, request.query());
+    // What the tracker asked to be sent back (`tracker id`).
+    if let Some(id) = tracker_ids::get(tracker.url(), &request.info_hash) {
+        target.push_str("&trackerid=");
+        target.push_str(&percent_encode(&id));
+    }
     let addresses = family_addresses(tracker, &format!("{}:{}", url.host, url.port))?;
     let binding = tracker.binding.clone();
     let user_agent = crate::identity::user_agent_for(&request.peer_id);
-    over_each_family(
+    let response = over_each_family(
         addresses,
         Arc::new(move |address| {
             http_announce_at(address, &url, &target, user_agent, timeout, &binding)
         }),
-    )
+    )?;
+    if request.event == AnnounceEvent::Stopped {
+        tracker_ids::forget(tracker.url(), &request.info_hash);
+    } else if let Some(id) = &response.tracker_id {
+        tracker_ids::set(tracker.url(), &request.info_hash, id.clone());
+    }
+    Ok(response)
+}
+
+/// The tracker that last answered in each tier of several trackers, tried
+/// first next time (BEP 12), shared by every torrent with that tier.
+mod tier_order {
+    use super::Tracker;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn worked_last() -> &'static Mutex<HashMap<Vec<String>, String>> {
+        static ORDER: OnceLock<Mutex<HashMap<Vec<String>, String>>> = OnceLock::new();
+        ORDER.get_or_init(Default::default)
+    }
+
+    fn key(tier: &[Tracker]) -> Vec<String> {
+        tier.iter()
+            .map(|tracker| tracker.url().to_owned())
+            .collect()
+    }
+
+    /// The tracker of `tier` that answered last, if it is not the first
+    /// anyway.
+    pub(super) fn preferred(tier: &[Tracker]) -> Vec<Tracker> {
+        if tier.len() < 2 {
+            return Vec::new();
+        }
+        let Ok(order) = worked_last().lock() else {
+            return Vec::new();
+        };
+        order
+            .get(&key(tier))
+            .and_then(|url| tier.iter().find(|tracker| tracker.url() == url))
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+
+    pub(super) fn worked(tier: &[Tracker], tracker: &Tracker) {
+        if tier.len() < 2 {
+            return;
+        }
+        if let Ok(mut order) = worked_last().lock() {
+            if order.len() >= 10_000 {
+                order.clear();
+            }
+            order.insert(key(tier), tracker.url().to_owned());
+        }
+    }
+}
+
+/// The `tracker id` each tracker gave for each torrent, sent back with
+/// later announces as BEP 3 asks and libtorrent does.
+mod tracker_ids {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    type Ids = HashMap<(String, [u8; 20]), Vec<u8>>;
+
+    fn ids() -> &'static Mutex<Ids> {
+        static IDS: OnceLock<Mutex<Ids>> = OnceLock::new();
+        IDS.get_or_init(Default::default)
+    }
+
+    pub(super) fn get(url: &str, info_hash: &[u8; 20]) -> Option<Vec<u8>> {
+        ids()
+            .lock()
+            .ok()?
+            .get(&(url.to_owned(), *info_hash))
+            .cloned()
+    }
+
+    pub(super) fn set(url: &str, info_hash: &[u8; 20], id: Vec<u8>) {
+        if let Ok(mut ids) = ids().lock() {
+            // Bounded: torrents that left without `stopped` cannot pile up.
+            if ids.len() >= 20_000 {
+                ids.clear();
+            }
+            ids.insert((url.to_owned(), *info_hash), id);
+        }
+    }
+
+    pub(super) fn forget(url: &str, info_hash: &[u8; 20]) {
+        if let Ok(mut ids) = ids().lock() {
+            ids.remove(&(url.to_owned(), *info_hash));
+        }
+    }
 }
 
 fn http_announce_at(
@@ -701,19 +901,43 @@ fn http_announce_at(
     timeout: Duration,
     binding: &crate::Binding,
 ) -> Result<TrackerResponse, Failure> {
-    let response = crate::http::request_at(
-        address,
-        url,
-        target,
-        user_agent,
-        timeout,
-        MAX_HTTP_RESPONSE,
-        binding,
-    )
-    .map_err(|error| match error {
-        crate::http::Error::Unreachable(message) => unreachable(message),
-        crate::http::Error::Invalid(message) => tracker_error(message).into(),
-    })?;
+    let fetch = |address: SocketAddr, url: &crate::http::Url, target: &str| {
+        crate::http::request_at(
+            address,
+            url,
+            target,
+            user_agent,
+            timeout,
+            MAX_HTTP_RESPONSE,
+            binding,
+        )
+        .map_err(|error| match error {
+            crate::http::Error::Unreachable(message) => unreachable(message),
+            crate::http::Error::Invalid(message) => Failure::from(tracker_error(message)),
+        })
+    };
+    let mut response = fetch(address, url, target)?;
+    // A tracker that moved (to HTTPS, say) is followed, up to five times,
+    // as libtorrent follows it.
+    let mut redirects = 0;
+    while matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+        redirects += 1;
+        if redirects > crate::http::MAX_REDIRECTS {
+            return Err(tracker_error("tracker redirected too many times").into());
+        }
+        let location = response
+            .header("location")
+            .ok_or_else(|| tracker_error("tracker redirected without a Location"))?;
+        let next = url
+            .join(location.trim())
+            .map_err(|message| tracker_error(format!("tracker redirect: {message}")))?;
+        let address = format!("{}:{}", next.host, next.port)
+            .to_socket_addrs()
+            .map_err(|error| unreachable(error.to_string()))?
+            .find(|candidate| binding.reaches(candidate))
+            .ok_or_else(|| unreachable("tracker redirect resolved to no usable addresses"))?;
+        response = fetch(address, &next, &next.path)?;
+    }
     if response.status != 200 {
         return Err(tracker_error(format!(
             "tracker returned HTTP status {}",
@@ -921,20 +1145,16 @@ fn scrape_udp_at(
     socket
         .set_read_timeout(Some(attempt_timeout))
         .map_err(|error| tracker_error(error.to_string()))?;
-    let transaction = transaction_id();
-    let mut connect = Vec::with_capacity(16);
-    connect.extend(0x41727101980_u64.to_be_bytes());
-    connect.extend(0_u32.to_be_bytes());
-    connect.extend(transaction.to_be_bytes());
-    let response = udp_exchange(&socket, &connect, 0, transaction, 16)?;
-    let transaction = transaction_id().wrapping_add(1);
-    let mut scrape = response[8..16].to_vec();
-    scrape.extend(2_u32.to_be_bytes());
-    scrape.extend(transaction.to_be_bytes());
-    for hash in info_hashes {
-        scrape.extend(hash);
-    }
-    let response = udp_exchange(&socket, &scrape, 2, transaction, 8)?;
+    let response = with_connection_id(&socket, address, |connection_id| {
+        let transaction = transaction_id();
+        let mut scrape = connection_id.to_vec();
+        scrape.extend(2_u32.to_be_bytes());
+        scrape.extend(transaction.to_be_bytes());
+        for hash in info_hashes {
+            scrape.extend(hash);
+        }
+        udp_exchange(&socket, &scrape, 2, transaction, 8)
+    })?;
     Ok(info_hashes
         .iter()
         .zip(response[8..].as_chunks::<12>().0)
@@ -966,6 +1186,31 @@ fn tracker_error(message: impl Into<String>) -> crate::BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn announces_at_the_trackers_interval_as_libtorrent_does() {
+        let next = |body: &[u8]| {
+            TrackerResponse::from_bencode(body)
+                .unwrap()
+                .next_announce_in()
+        };
+        let minutes = |count: u64| std::time::Duration::from_secs(count * 60);
+        // `interval`, not the `min interval` a client may at most use.
+        assert_eq!(
+            next(b"d8:intervali1800e12:min intervali300e5:peers0:e"),
+            minutes(30)
+        );
+        // Never sooner than `min interval`, nor than five minutes.
+        assert_eq!(
+            next(b"d8:intervali600e12:min intervali900e5:peers0:e"),
+            minutes(15)
+        );
+        assert_eq!(next(b"d8:intervali60e5:peers0:e"), minutes(5));
+        assert_eq!(next(b"d8:intervali0e5:peers0:e"), minutes(5));
+        // A tracker that asks for longer gets it.
+        assert_eq!(next(b"d8:intervali7200e5:peers0:e"), minutes(120));
+        assert_eq!(next(b"d5:peers0:e"), minutes(30), "none given");
+    }
     use std::io::{Read, Write};
 
     #[test]
@@ -1188,6 +1433,177 @@ mod tests {
             }
         });
         (url, receiver)
+    }
+
+    /// An HTTP tracker answering each connection with the next of
+    /// `bodies` (as `status`, `extra headers`, body), recording requests.
+    fn scripted_tracker(
+        answers: Vec<(&'static str, String, Vec<u8>)>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/announce", listener.local_addr().unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for ((status, headers, body), stream) in answers.into_iter().zip(listener.incoming()) {
+                let Ok(mut stream) = stream else { return };
+                let mut request = [0; 2048];
+                let size = stream.read(&mut request).unwrap_or(0);
+                let _ = stream.write_all(
+                    &[
+                        format!(
+                            "HTTP/1.0 {status}\r\n{headers}Content-Length: {}\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                        &body,
+                    ]
+                    .concat(),
+                );
+                let _ = sender.send(String::from_utf8_lossy(&request[..size]).into_owned());
+            }
+        });
+        (url, receiver)
+    }
+
+    fn ok(body: &[u8]) -> (&'static str, String, Vec<u8>) {
+        ("200 OK", String::new(), body.to_vec())
+    }
+
+    #[test]
+    fn backs_off_after_failures_as_libtorrent_does() {
+        let delays: Vec<u64> = (1..=6)
+            .map(|failures| retry_delay(failures).as_secs())
+            .collect();
+        assert_eq!(delays, [17, 55, 117, 205, 317, 455]);
+        assert_eq!(retry_delay(1000).as_secs(), 3600, "at most an hour");
+    }
+
+    #[test]
+    fn reads_answers_as_leniently_as_libtorrent() {
+        // No peers at all: an answer, often to `stopped`.
+        let response = TrackerResponse::from_bencode(b"d8:intervali1800ee").unwrap();
+        assert!(response.peers().is_empty());
+        // A tracker id to send back, and a warning that is not UTF-8.
+        let response = TrackerResponse::from_bencode(
+            b"d10:tracker id3:abc15:warning message2:\xff!5:peers0:e",
+        )
+        .unwrap();
+        assert_eq!(response.tracker_id.as_deref(), Some(&b"abc"[..]));
+        assert_eq!(response.warning(), Some("\u{fffd}!"));
+    }
+
+    #[test]
+    fn sends_back_the_tracker_id_until_leaving() {
+        let (url, requests) = scripted_tracker(vec![
+            ok(b"d10:tracker id3:x y5:peers0:e"),
+            ok(b"d5:peers0:e"),
+            ok(b"d5:peers0:e"),
+            ok(b"d5:peers0:e"),
+        ]);
+        let client = TrackerClient::from_urls([url]).unwrap();
+        let timeout = Duration::from_secs(5);
+        let next = || requests.recv_timeout(timeout).unwrap();
+        client
+            .announce(&request(AnnounceEvent::Started), timeout)
+            .unwrap();
+        assert!(!next().contains("trackerid"));
+        client
+            .announce(&request(AnnounceEvent::None), timeout)
+            .unwrap();
+        assert!(next().contains("&trackerid=x%20y "), "sent back");
+        client
+            .announce(&request(AnnounceEvent::Stopped), timeout)
+            .unwrap();
+        assert!(next().contains("&trackerid=x%20y "));
+        client
+            .announce(&request(AnnounceEvent::Started), timeout)
+            .unwrap();
+        assert!(!next().contains("trackerid"), "forgotten after stopped");
+    }
+
+    #[test]
+    fn follows_a_tracker_that_moved() {
+        let (moved_to, moved_requests) = scripted_tracker(vec![ok(
+            b"d8:intervali1800e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
+        )]);
+        let (url, requests) = scripted_tracker(vec![(
+            "301 Moved Permanently",
+            format!("Location: {moved_to}?moved=1\r\n"),
+            Vec::new(),
+        )]);
+        let response = TrackerClient::from_urls([url])
+            .unwrap()
+            .announce(&request(AnnounceEvent::Started), Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(response.peers(), ["127.0.0.1:6881".parse().unwrap()]);
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let followed = moved_requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(followed.starts_with("GET /announce?moved=1 "), "{followed}");
+    }
+
+    #[test]
+    fn tries_the_tracker_that_answered_first_in_its_tier() {
+        let refusing = || ok(b"d14:failure reason6:no wayee");
+        let (first, first_requests) = scripted_tracker(vec![refusing(), refusing()]);
+        let (second, second_requests) =
+            scripted_tracker(vec![ok(b"d5:peers0:e"), ok(b"d5:peers0:e")]);
+        let client = TrackerClient::from_tiers([vec![first, second]]).unwrap();
+        let timeout = Duration::from_secs(5);
+        client
+            .announce(&request(AnnounceEvent::Started), timeout)
+            .unwrap();
+        client
+            .announce(&request(AnnounceEvent::None), timeout)
+            .unwrap();
+        assert_eq!(
+            first_requests.try_iter().count(),
+            1,
+            "asked once, then passed over"
+        );
+        assert_eq!(second_requests.try_iter().count(), 2);
+    }
+
+    /// The URL's path goes along as BEP 41's URLData option, and the
+    /// connection ID is reused within its minute.
+    #[test]
+    fn announces_over_udp_with_the_url_path_and_one_connect() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let url = format!("udp://{}/announce/secret?x=1", socket.local_addr().unwrap());
+        let tracker = std::thread::spawn(move || {
+            let mut buffer = [0; 1024];
+            let mut connects = 0;
+            let mut options = Vec::new();
+            for _ in 0..3 {
+                let (length, from) = socket.recv_from(&mut buffer).unwrap();
+                let action = u32::from_be_bytes(buffer[8..12].try_into().unwrap());
+                let mut reply = action.to_be_bytes().to_vec();
+                reply.extend(&buffer[12..16]);
+                if length == 16 {
+                    connects += 1;
+                    reply.extend(7_u64.to_be_bytes());
+                } else {
+                    assert_eq!(&buffer[..8], &7_u64.to_be_bytes());
+                    options.push(buffer[98..length].to_vec());
+                    for count in [1800_u32, 0, 0] {
+                        reply.extend(count.to_be_bytes());
+                    }
+                }
+                socket.send_to(&reply, from).unwrap();
+            }
+            (connects, options)
+        });
+        let client = TrackerClient::from_urls([url]).unwrap();
+        for event in [AnnounceEvent::Started, AnnounceEvent::None] {
+            client
+                .announce(&request(event), Duration::from_secs(5))
+                .unwrap();
+        }
+        let (connects, options) = tracker.join().unwrap();
+        assert_eq!(connects, 1);
+        let mut expected = vec![2, 20];
+        expected.extend(b"/announce/secret?x=1");
+        assert_eq!(options, [expected.clone(), expected]);
     }
 
     fn request(event: AnnounceEvent) -> AnnounceRequest {
@@ -1585,7 +2001,7 @@ d8:intervali60e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Lifecycle event reported with an announce.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1697,6 +2113,8 @@ pub struct TrackerResponse {
     warning: Option<String>,
     seeders: Option<u64>,
     leechers: Option<u64>,
+    /// `tracker id`, to send back with later announces.
+    tracker_id: Option<Vec<u8>>,
 }
 
 impl TrackerResponse {
@@ -1711,7 +2129,7 @@ impl TrackerResponse {
         if let Some(failure) = dictionary.get(b"failure reason".as_slice()) {
             return Err(tracker_error(format!(
                 "tracker refused the announce: {}",
-                failure.as_text()?
+                String::from_utf8_lossy(failure.as_bytes()?)
             )));
         }
         let count = |key: &[u8]| {
@@ -1720,23 +2138,27 @@ impl TrackerResponse {
                 .and_then(|value| value.as_integer().ok())
         };
         let (seeders, leechers) = (count(b"complete"), count(b"incomplete"));
-        let interval = dictionary
-            .get(b"interval".as_slice())
-            .map(Value::as_integer)
-            .transpose()?;
-        let min_interval = dictionary
-            .get(b"min interval".as_slice())
-            .map(Value::as_integer)
-            .transpose()?;
-        let warning = dictionary
-            .get(b"warning message".as_slice())
-            .map(Value::as_text)
-            .transpose()?;
+        // As libtorrent reads them: a malformed optional field is left
+        // out rather than failing the whole answer.
+        let interval = count(b"interval");
+        let min_interval = count(b"min interval");
+        let text = |key: &[u8]| {
+            dictionary
+                .get(key)
+                .and_then(|value| value.as_bytes().ok())
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        };
+        let warning = text(b"warning message");
+        let tracker_id = dictionary
+            .get(b"tracker id".as_slice())
+            .and_then(|value| value.as_bytes().ok())
+            .filter(|id| !id.is_empty())
+            .map(<[u8]>::to_vec);
 
+        // No peers at all is an answer too (often to `stopped`, or for an
+        // empty swarm); libtorrent accepts it.
         let mut peers = Vec::new();
-        let mut peers_field_present = false;
         if let Some(value) = dictionary.get(b"peers".as_slice()) {
-            peers_field_present = true;
             match value {
                 Value::Bytes(compact) => peers.extend(
                     Self::from_compact_peers_with_min_interval(
@@ -1752,7 +2174,6 @@ impl TrackerResponse {
             }
         }
         if let Some(value) = dictionary.get(b"peers6".as_slice()) {
-            peers_field_present = true;
             peers.extend(
                 Self::from_compact_ipv6_with_min_interval(
                     value.as_bytes()?,
@@ -1763,9 +2184,6 @@ impl TrackerResponse {
                 .peers,
             );
         }
-        if !peers_field_present {
-            return Err(invalid("tracker response does not contain peers"));
-        }
         Ok(Self {
             peers,
             interval,
@@ -1773,6 +2191,7 @@ impl TrackerResponse {
             warning,
             seeders,
             leechers,
+            tracker_id,
         })
     }
 
@@ -1811,6 +2230,7 @@ impl TrackerResponse {
             warning,
             seeders: None,
             leechers: None,
+            tracker_id: None,
         })
     }
 
@@ -1847,6 +2267,7 @@ impl TrackerResponse {
             warning,
             seeders: None,
             leechers: None,
+            tracker_id: None,
         })
     }
 
@@ -1860,6 +2281,19 @@ impl TrackerResponse {
 
     pub fn min_interval(&self) -> Option<u64> {
         self.min_interval
+    }
+
+    /// When to announce again after this response, as libtorrent decides:
+    /// the tracker's `interval` (30 minutes if it gives none), never
+    /// sooner than its `min interval` or than [`MIN_ANNOUNCE_INTERVAL`].
+    /// `min interval` is the least a client may wait, not how often to
+    /// announce.
+    pub fn next_announce_in(&self) -> std::time::Duration {
+        let seconds = |value: Option<u64>| value.map(std::time::Duration::from_secs);
+        seconds(self.interval)
+            .unwrap_or(DEFAULT_ANNOUNCE_INTERVAL)
+            .max(seconds(self.min_interval).unwrap_or_default())
+            .max(MIN_ANNOUNCE_INTERVAL)
     }
 
     /// Swarm seeders reported by the tracker, when it reports them.

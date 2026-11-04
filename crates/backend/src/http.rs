@@ -10,7 +10,7 @@ use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 /// Redirects followed by [`get`] before giving up.
-const MAX_REDIRECTS: usize = 5;
+pub(crate) const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Url {
@@ -64,7 +64,7 @@ impl Url {
     }
 
     /// Resolves a redirect's `Location` against this URL.
-    fn join(&self, location: &str) -> Result<Self, String> {
+    pub(crate) fn join(&self, location: &str) -> Result<Self, String> {
         if location.starts_with("http://") || location.starts_with("https://") {
             return Self::parse(location, "");
         }
@@ -99,7 +99,7 @@ pub(crate) struct Response {
 }
 
 impl Response {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))

@@ -889,6 +889,9 @@ struct Listener {
 pub(crate) struct Shared {
     /// One socket per address family, on the same port.
     sockets: Vec<UdpSocket>,
+    /// Whether each of `sockets` is IPv6, looked up once: asking the
+    /// socket on every send costs a system call.
+    socket_is_v6: Vec<bool>,
     epoch: Instant,
     /// Keyed by peer address and the connection id its packets carry.
     connections: Mutex<HashMap<(SocketAddr, u16), Arc<Entry>>>,
@@ -992,11 +995,11 @@ impl Shared {
 
     /// The socket of `to`'s address family, if there is one.
     fn socket_for(&self, to: &SocketAddr) -> Option<&UdpSocket> {
-        self.sockets.iter().find(|socket| {
-            socket
-                .local_addr()
-                .is_ok_and(|local| local.is_ipv6() == to.is_ipv6())
-        })
+        self.sockets
+            .iter()
+            .zip(&self.socket_is_v6)
+            .find(|(_, v6)| **v6 == to.is_ipv6())
+            .map(|(socket, _)| socket)
     }
 
     fn reset(&self, packet: &Packet, to: SocketAddr) {
@@ -1112,8 +1115,13 @@ impl UtpSocket {
     }
 
     fn start(sockets: Vec<UdpSocket>) -> Self {
+        let socket_is_v6 = sockets
+            .iter()
+            .map(|socket| socket.local_addr().is_ok_and(|local| local.is_ipv6()))
+            .collect();
         let shared = Arc::new(Shared {
             sockets,
+            socket_is_v6,
             epoch: Instant::now(),
             connections: Mutex::new(HashMap::new()),
             listener: Mutex::new(None),

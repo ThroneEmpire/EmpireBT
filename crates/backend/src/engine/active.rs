@@ -185,6 +185,8 @@ pub(crate) struct ActiveTorrent {
     pieces: Arc<Mutex<PieceManager>>,
     /// Open peer connections, counted by their protocol state.
     connections: std::sync::atomic::AtomicUsize,
+    /// The most connections this torrent keeps, when a download limits it.
+    connection_limit: std::sync::atomic::AtomicUsize,
     /// Why the last connection that failed did so.
     last_error: Mutex<Option<crate::BackendError>>,
     /// Computed on the first leaf-layer hash request for a file, so
@@ -221,6 +223,7 @@ impl ActiveTorrent {
             swarm,
             pieces: Arc::new(Mutex::new(pieces)),
             connections: std::sync::atomic::AtomicUsize::new(0),
+            connection_limit: std::sync::atomic::AtomicUsize::new(usize::MAX),
             last_error: Mutex::new(None),
             leaf_layers: Mutex::new(HashMap::new()),
         })
@@ -277,6 +280,21 @@ impl ActiveTorrent {
     /// Open peer connections for this torrent.
     pub(crate) fn connection_count(&self) -> usize {
         self.connections.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Limits this torrent to `limit` connections, for [`Self::crowded`].
+    pub(crate) fn set_connection_limit(&self, limit: usize) {
+        self.connection_limit
+            .store(limit, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Within [`CROWDED_MARGIN`] connections of this torrent's limit, so
+    /// connections that do nothing for it should make way.
+    pub(crate) fn crowded(&self) -> bool {
+        let limit = self
+            .connection_limit
+            .load(std::sync::atomic::Ordering::Acquire);
+        self.connection_count().saturating_add(CROWDED_MARGIN) >= limit
     }
 
     pub(crate) fn connection_opened(&self) {
@@ -525,6 +543,9 @@ impl ActiveTorrent {
 
 /// The largest block a peer may request; 16 KiB is the standard size.
 const MAX_UPLOAD_BLOCK: u32 = 16 * 1024;
+/// How near a connection limit counts as running short of slots, as
+/// libtorrent checks (`connections_limit - 5`).
+pub(crate) const CROWDED_MARGIN: usize = 5;
 
 pub(crate) fn has_bit(bits: &[u8], index: usize) -> bool {
     bits.get(index / 8)
