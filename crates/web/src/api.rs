@@ -126,6 +126,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/torrents/{hash}/tags", put(set_tags))
         .route("/api/torrents/{hash}/name", put(rename_torrent))
         .route("/api/torrents/{hash}/rename", post(rename_path))
+        .route("/api/torrents/{hash}/move", post(move_torrent))
         .route("/api/torrents/{hash}/peers", get(peers))
         .route("/api/torrents/{hash}/{action}", post(action))
         .route("/api/categories", post(create_category))
@@ -468,8 +469,14 @@ struct TorrentJson<'a> {
     error: Option<&'a str>,
     /// A magnet link whose metadata has not arrived.
     magnet: bool,
-    /// The folder its files are in.
+    /// The folder its files belong in: where they are, or where they go
+    /// once complete.
     save_path: std::borrow::Cow<'a, str>,
+    /// Downloading in the incomplete folder: that folder.
+    download_path: Option<std::borrow::Cow<'a, str>>,
+    /// Its files are moving: where to, and how far (0 to 1).
+    moving_to: Option<std::borrow::Cow<'a, str>>,
+    move_progress: Option<f64>,
     /// Payload over every run, and uploaded over downloaded.
     downloaded: u64,
     uploaded: u64,
@@ -498,7 +505,20 @@ fn torrent_json(torrent: &TorrentView) -> TorrentJson<'_> {
         tags: &torrent.tags,
         error: torrent.error.as_deref(),
         magnet: torrent.info.is_none(),
-        save_path: torrent.save_dir.to_string_lossy(),
+        save_path: torrent.final_dir().to_string_lossy(),
+        download_path: torrent
+            .complete_dir
+            .as_ref()
+            .map(|_| torrent.save_dir.to_string_lossy()),
+        moving_to: torrent
+            .moving
+            .as_ref()
+            .map(|moving| moving.to.to_string_lossy()),
+        // Whole percents: steady between updates.
+        move_progress: torrent
+            .moving
+            .as_ref()
+            .map(|moving| (moving.fraction * 100.0).floor() / 100.0),
         downloaded: torrent.history.downloaded,
         uploaded: torrent.history.uploaded,
         // Three decimals: enough to show, and steady between updates.
@@ -519,6 +539,7 @@ fn status_key(status: empirebt_app::Status) -> &'static str {
         Status::Waiting => "waiting",
         Status::Retrying => "retrying",
         Status::Pausing => "pausing",
+        Status::Moving => "moving",
         Status::Seeding => "seeding",
         Status::Paused => "paused",
         Status::Error => "error",
@@ -824,7 +845,8 @@ async fn details(State(state): State<Shared>, Path(hash): Path<String>) -> Respo
             "uploadedSession": torrent.history.uploaded_session,
         },
         "announce": announce,
-        "savePath": torrent.save_dir.to_string_lossy(),
+        "savePath": torrent.final_dir().to_string_lossy(),
+        "downloadPath": torrent.complete_dir.as_ref().map(|_| torrent.save_dir.to_string_lossy()),
     }))
     .into_response()
 }
@@ -915,11 +937,23 @@ async fn peers(State(state): State<Shared>, Path(hash): Path<String>) -> Respons
 }
 
 /// A path inside a torrent with `/` between its parts on every system.
+/// A full path keeps its root: `/downloads/a`, not `//downloads/a`.
 pub(crate) fn slashed(path: &std::path::Path) -> String {
-    path.iter()
-        .map(|part| part.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    use std::path::Component;
+    let mut text = String::new();
+    for part in path.components() {
+        match part {
+            Component::Prefix(prefix) => text.push_str(&prefix.as_os_str().to_string_lossy()),
+            Component::RootDir => text.push('/'),
+            other => {
+                if !text.is_empty() && !text.ends_with('/') {
+                    text.push('/');
+                }
+                text.push_str(&other.as_os_str().to_string_lossy());
+            }
+        }
+    }
+    text
 }
 
 #[derive(Deserialize)]
@@ -1205,6 +1239,29 @@ async fn rename_path(
     }
 }
 
+#[derive(Deserialize)]
+struct MoveBody {
+    #[serde(rename = "savePath")]
+    save_path: String,
+}
+
+/// Moves a torrent's files, only to a folder the web UI may save in.
+async fn move_torrent(
+    State(state): State<Shared>,
+    Path(hash): Path<String>,
+    axum::Json(body): axum::Json<MoveBody>,
+) -> Response {
+    let torrent = match known_hash(&state, &hash) {
+        Ok(torrent) => torrent,
+        Err(response) => return response,
+    };
+    match allowed_save_dir(&state.engine.snapshot(), Some(&body.save_path)) {
+        Ok(Some(folder)) => run(&state, Command::Move { torrent, folder }).await,
+        Ok(None) => error(StatusCode::BAD_REQUEST, "choose a folder to move it to"),
+        Err(response) => response,
+    }
+}
+
 async fn create_category(
     State(state): State<Shared>,
     axum::Json(body): axum::Json<NameBody>,
@@ -1314,6 +1371,8 @@ mod tests {
                     original_name: format!("torrent {index}"),
                     renames: Default::default(),
                     save_dir: "/data".into(),
+                    complete_dir: None,
+                    moving: None,
                     info: None,
                     trackers: Vec::new(),
                     status: empirebt_app::Status::Paused,
@@ -1366,6 +1425,15 @@ mod tests {
 
     /// Browsers save only in the download folder, `storage.allowed_dirs`,
     /// or folders inside them; no climbing out with `..`.
+    #[test]
+    fn paths_have_one_slash_between_parts() {
+        let path = |text: &str| slashed(std::path::Path::new(text));
+        assert_eq!(path("/downloads/films"), "/downloads/films");
+        assert_eq!(path("/"), "/");
+        assert_eq!(path("album/02.flac"), "album/02.flac");
+        assert_eq!(path(""), "");
+    }
+
     #[test]
     fn browsers_save_only_in_allowed_folders() {
         let snapshot = snapshot(0);

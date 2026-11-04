@@ -87,6 +87,8 @@ pub(crate) fn router() -> Router<Shared> {
         .route("/torrents/renameFile", post(rename_path))
         .route("/torrents/renameFolder", post(rename_path))
         .route("/torrents/setCategory", post(set_category))
+        .route("/torrents/setLocation", post(set_location))
+        .route("/torrents/setSavePath", post(set_save_path))
         .route("/torrents/categories", get(categories))
         .route("/torrents/createCategory", post(create_category))
         .route("/torrents/editCategory", post(edit_category))
@@ -190,7 +192,12 @@ async fn run_all(state: &Shared, commands: Vec<Command>) -> Response {
 /// The torrents `hashes` names: hashes between `|`, or `all`. Unknown
 /// ones are left out, as qBittorrent does.
 fn hashes(snapshot: &Snapshot, params: &Params) -> Vec<InfoHash> {
-    match params.get("hashes").or(params.get("hash")) {
+    listed(snapshot, params.get("hashes").or(params.get("hash")))
+}
+
+/// Torrents listed as `hashes` lists them.
+fn listed(snapshot: &Snapshot, list: Option<&str>) -> Vec<InfoHash> {
+    match list {
         Some("all") => snapshot
             .torrents
             .iter()
@@ -326,8 +333,10 @@ fn preferences_json(snapshot: &Snapshot) -> Value {
     let on = |key: &str| setting(snapshot, key) == "true";
     json!({
         "save_path": api::slashed(&snapshot.download_dir),
-        "temp_path_enabled": false,
-        "temp_path": "",
+        "temp_path_enabled": !setting(snapshot, "storage.incomplete_dir").trim().is_empty(),
+        "temp_path": api::slashed(std::path::Path::new(
+            setting(snapshot, "storage.incomplete_dir").trim()
+        )),
         "listen_port": snapshot.network.listen_port,
         "random_port": false,
         "upnp": false,
@@ -571,6 +580,7 @@ fn state_name(torrent: &TorrentView) -> &'static str {
             }
         }
         Status::Metadata => "metaDL",
+        Status::Moving => "moving",
         Status::Checking => {
             if complete {
                 "checkingUP"
@@ -607,6 +617,15 @@ fn state_name(torrent: &TorrentView) -> &'static str {
 
 /// Where its content is: its one file, or the folder that holds all its
 /// files, else its save folder.
+/// Where a torrent downloading in the incomplete folder is; empty for
+/// others, as qBittorrent shows a torrent without a download path.
+fn download_path(torrent: &TorrentView) -> String {
+    match &torrent.complete_dir {
+        Some(_) => api::slashed(&torrent.save_dir),
+        None => String::new(),
+    }
+}
+
 fn content_path(torrent: &TorrentView) -> String {
     let files = torrent.files();
     let root = match files.as_slice() {
@@ -727,8 +746,8 @@ fn torrent_object(torrent: &TorrentView) -> Map<String, Value> {
         "state": state_name(torrent),
         "category": torrent.category.clone().unwrap_or_default(),
         "tags": torrent.tags.join(", "),
-        "save_path": api::slashed(&torrent.save_dir),
-        "download_path": "",
+        "save_path": api::slashed(torrent.final_dir()),
+        "download_path": download_path(torrent),
         "content_path": content_path(torrent),
         "root_path": content_path(torrent),
         "has_metadata": info.is_some(),
@@ -1170,7 +1189,7 @@ async fn properties(State(state): State<Shared>, params: Params) -> Response {
         "infohash_v2": field("infohash_v2"),
         "name": field("name"),
         "save_path": field("save_path"),
-        "download_path": "",
+        "download_path": field("download_path"),
         "comment": "",
         "created_by": "",
         "creation_date": -1,
@@ -1513,6 +1532,35 @@ async fn set_category(State(state): State<Shared>, params: Params) -> Response {
         category: category.clone(),
     })
     .await
+}
+
+/// Moves torrents' files, as qBittorrent's "Set location": `hashes` and
+/// `location`. Only to folders the web UI may save in (403 otherwise, as
+/// qBittorrent answers a folder it cannot write).
+async fn set_location(State(state): State<Shared>, params: Params) -> Response {
+    move_to(&state, &params, "hashes", "location").await
+}
+
+/// The same, as qBittorrent 4.4's `setSavePath` asks: `id` and `path`.
+async fn set_save_path(State(state): State<Shared>, params: Params) -> Response {
+    move_to(&state, &params, "id", "path").await
+}
+
+async fn move_to(state: &Shared, params: &Params, hashes: &str, folder: &str) -> Response {
+    let snapshot = state.engine.snapshot();
+    let folder = match api::allowed_save_dir(&snapshot, params.get(folder)) {
+        Ok(Some(folder)) => folder,
+        Ok(None) => return text(StatusCode::BAD_REQUEST, "Save path cannot be empty"),
+        Err(response) => return response,
+    };
+    let commands = listed(&snapshot, params.get(hashes))
+        .into_iter()
+        .map(|torrent| Command::Move {
+            torrent,
+            folder: folder.clone(),
+        })
+        .collect();
+    run_all(state, commands).await
 }
 
 async fn categories(State(state): State<Shared>) -> Response {

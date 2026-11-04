@@ -26,6 +26,9 @@ pub struct Client {
     /// In anonymous mode, the peer ID public torrents use instead of the
     /// one they are given.
     anonymous_peer_id: Option<[u8; 20]>,
+    /// Torrents kept out of the shared runtime whatever their state, such
+    /// as while their files move.
+    held: std::collections::HashSet<[u8; 20]>,
 }
 
 /// Clients compare by configuration and torrents; the DHT node is a
@@ -61,6 +64,7 @@ impl Client {
             storage,
             resume_dirty: Arc::default(),
             anonymous_peer_id: None,
+            held: std::collections::HashSet::new(),
         }
     }
 
@@ -79,6 +83,7 @@ impl Client {
             storage,
             resume_dirty: Arc::default(),
             anonymous_peer_id: None,
+            held: std::collections::HashSet::new(),
         })
     }
 
@@ -674,6 +679,9 @@ impl Client {
             let Some(hash) = torrent.info_hash().copied() else {
                 continue;
             };
+            if self.held.contains(&hash) {
+                continue;
+            }
             match torrent.state() {
                 crate::TransferState::Paused => continue,
                 crate::TransferState::Downloading => {
@@ -1194,6 +1202,43 @@ impl Client {
         if let Some(index) = self.torrent_index(handle.info_hash()) {
             self.record_resume(index, handle.progress());
         }
+    }
+
+    /// Keeps a torrent out of the shared runtime (`true`), whatever its
+    /// state, from the next [`Client::sync_runtime`] on, until released
+    /// (`false`). For a seed whose files are about to move.
+    pub fn hold(&mut self, hash: [u8; 20], held: bool) {
+        if held {
+            self.held.insert(hash);
+        } else {
+            self.held.remove(&hash);
+        }
+    }
+
+    pub fn is_held(&self, hash: &[u8; 20]) -> bool {
+        self.held.contains(hash)
+    }
+
+    /// Ties a torrent's resume data to its files as they are now, keeping
+    /// its pieces: after its files were moved unchanged.
+    pub fn restamp_resume(&mut self, index: usize) {
+        let Some(torrent) = self.torrents.get(index) else {
+            return;
+        };
+        let (Some(info), Some(resume)) = (torrent.info(), torrent.resume()) else {
+            return;
+        };
+        let resume = crate::ResumeData::capture(
+            info,
+            &self.storage_for(torrent),
+            resume.bitfield().to_vec(),
+        );
+        if let Some(hash) = torrent.info_hash().copied()
+            && let Ok(mut dirty) = self.resume_dirty.lock()
+        {
+            dirty.insert(hash);
+        }
+        self.torrents[index].set_resume(Some(resume));
     }
 
     fn record_resume(&mut self, index: usize, progress: &crate::TransferProgress) {

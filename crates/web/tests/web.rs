@@ -528,6 +528,42 @@ fn a_signed_in_browser_drives_the_engine() {
         r#"{"from":"clip/clip.mkv","to":"../clip.mkv"}"#,
     );
     assert!(escape.status >= 400, "{}", escape.body);
+    // Moving: only to folders the web UI may save in.
+    let outside = browser(
+        &running,
+        &cookie,
+        "POST",
+        &format!("/api/torrents/{clip}/move"),
+        r#"{"savePath":"/etc"}"#,
+    );
+    assert_eq!(outside.status, 403, "{}", outside.body);
+    let videos = running.root.join("downloads/videos");
+    let moved = browser(
+        &running,
+        &cookie,
+        "POST",
+        &format!("/api/torrents/{clip}/move"),
+        &serde_json::json!({ "savePath": videos }).to_string(),
+    );
+    assert_eq!(moved.status, 204, "{}", moved.body);
+    let state = browser(&running, &cookie, "GET", "/api/state", "").json();
+    let listed = state["torrents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|torrent| torrent["hash"] == clip.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(listed["savePath"], videos.display().to_string());
+    assert_eq!(listed["downloadPath"], serde_json::Value::Null);
+    let back = browser(
+        &running,
+        &cookie,
+        "POST",
+        &format!("/api/torrents/{clip}/move"),
+        &serde_json::json!({ "savePath": running.root.join("downloads") }).to_string(),
+    );
+    assert_eq!(back.status, 204, "{}", back.body);
     let details = browser(
         &running,
         &cookie,
@@ -1134,6 +1170,64 @@ fn answers_programs_made_for_qbittorrent() {
     let uploaded = list[0]["hash"].as_str().unwrap().to_owned();
     assert_eq!(list[0]["name"], "a.txt", "sorted by name");
     assert_eq!(files_of(&uploaded)[0]["name"], "a.txt");
+
+    // Set location: only to folders the web UI may save in.
+    let elsewhere = running.root.join("downloads/elsewhere");
+    let moved = qbit(
+        &running,
+        &cookie,
+        "/api/v2/torrents/setLocation",
+        &format!("hashes={HASH}&location={}", elsewhere.display()),
+    );
+    assert_eq!(moved.status, 200, "{}", moved.body);
+    let info = qbit_get(
+        &running,
+        &cookie,
+        &format!("/api/v2/torrents/info?hashes={HASH}"),
+    )
+    .json();
+    assert_eq!(info[0]["save_path"], elsewhere.display().to_string());
+    assert_eq!(info[0]["download_path"], "");
+    assert_eq!(
+        qbit(
+            &running,
+            &cookie,
+            "/api/v2/torrents/setLocation",
+            &format!("hashes={HASH}&location=/etc")
+        )
+        .status,
+        403
+    );
+    assert_eq!(
+        qbit(
+            &running,
+            &cookie,
+            "/api/v2/torrents/setLocation",
+            &format!("hashes={HASH}&location=")
+        )
+        .status,
+        400
+    );
+    let back = running.root.join("downloads");
+    assert_eq!(
+        qbit(
+            &running,
+            &cookie,
+            "/api/v2/torrents/setSavePath",
+            &format!("id={HASH}&path={}", back.display())
+        )
+        .status,
+        200
+    );
+    let properties = qbit_get(
+        &running,
+        &cookie,
+        &format!("/api/v2/torrents/properties?hash={HASH}"),
+    )
+    .json();
+    assert_eq!(properties["save_path"], back.display().to_string());
+    let preferences = qbit_get(&running, &cookie, "/api/v2/app/preferences").json();
+    assert_eq!(preferences["temp_path_enabled"], false);
 
     // The client sees the upload, then both go.
     let rid = lost["rid"].as_u64().unwrap();

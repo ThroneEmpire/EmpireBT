@@ -2,9 +2,10 @@
 //! commands from interfaces, and publishes snapshots.
 
 use crate::labels::{Labels, clean_name};
+use crate::moves::{Journal, MoveError, Moved, Mover};
 use crate::snapshot::{
-    DhtState, Level, Network, Notice, PeerView, RateMeter, SeedStatus, SettingView, Snapshot,
-    Status, TorrentView,
+    DhtState, Level, MoveView, Network, Notice, PeerView, RateMeter, SeedStatus, SettingView,
+    Snapshot, Status, TorrentView,
 };
 use crate::stats::Stats;
 use crate::{InfoHash, Store};
@@ -146,6 +147,15 @@ pub enum Command {
         torrent: InfoHash,
         from: PathBuf,
         to: PathBuf,
+    },
+    /// Moves a torrent's files to `folder` (a full path; `~` is expanded),
+    /// as qBittorrent's "Set location". A download stops for the move and
+    /// carries on after it; a seed leaves the swarm meanwhile. A torrent
+    /// still downloading in the incomplete folder stays there, and goes to
+    /// `folder` once complete.
+    Move {
+        torrent: InfoHash,
+        folder: PathBuf,
     },
 }
 
@@ -313,6 +323,14 @@ impl Handle {
                 (Stats::default(), Some(error))
             }
         };
+        let (journal, journal_damaged) = match Journal::load(&store.moves_path()) {
+            Ok(journal) => (journal, None),
+            Err(error) => {
+                let path = store.moves_path();
+                let _ = std::fs::rename(&path, path.with_extension("damaged"));
+                (Journal::default(), Some(error))
+            }
+        };
         // Torrents from before history was kept were added when their
         // session file was written.
         for hash in client
@@ -365,11 +383,28 @@ impl Handle {
             on_off(client.lsd().is_some()),
             client.torrents().len(),
         );
-        let mut engine = Engine::new(client, store, settings, dht_state, config_file, overridden);
+        let mut engine = Engine::new(
+            client,
+            store,
+            settings,
+            dht_state,
+            config_file,
+            overridden,
+            journal,
+        );
         engine.labels = labels;
         engine.stats = stats;
         engine.geoip = geoip;
         engine.report_skipped(&warnings);
+        if let Some(error) = journal_damaged {
+            engine.notify(
+                Level::Error,
+                format!(
+                    "{error}; moves under way and incomplete torrents' save folders are \
+                     forgotten (the old file was kept as moves.damaged)"
+                ),
+            );
+        }
         if let Some(error) = stats_damaged {
             engine.notify(
                 Level::Error,
@@ -830,6 +865,10 @@ struct Engine {
     labels: Labels,
     /// Each torrent's history and totals.
     stats: Stats,
+    /// Moves under way and where incomplete torrents go, as saved.
+    journal: Journal,
+    /// Moves under way: waiting for the torrent to stop, or running.
+    moves: HashMap<InfoHash, Move>,
     geoip: crate::geoip::GeoIp,
     last_port_check: Instant,
     /// Swarm counts from the latest tracker scrapes.
@@ -851,6 +890,16 @@ struct Engine {
     logged_interface_up: Option<bool>,
     /// The chosen network interface came back after being down.
     interface_returned: bool,
+}
+
+/// A torrent's files moving to another folder.
+struct Move {
+    from: PathBuf,
+    to: PathBuf,
+    /// Carrying on a move an earlier run began.
+    resuming: bool,
+    /// Started once the torrent has stopped reading and writing.
+    mover: Option<Mover>,
 }
 
 /// A move of every network service to `port`, begun by [`Engine::rebind`]:
@@ -922,6 +971,7 @@ impl Engine {
         dht_state: DhtState,
         config: ConfigFile,
         overridden: Vec<&'static str>,
+        journal: Journal,
     ) -> Self {
         let port = client.config().listen_port();
         let seeding = SeedService::new(port, &settings, client.dht().cloned());
@@ -948,6 +998,8 @@ impl Engine {
             generation: 0,
             labels: Labels::default(),
             stats: Stats::default(),
+            journal,
+            moves: HashMap::new(),
             geoip: crate::geoip::GeoIp::default(),
             last_port_check: Instant::now(),
             scrapes: HashMap::new(),
@@ -967,6 +1019,10 @@ impl Engine {
             .filter_map(|torrent| Some((*torrent.info_hash()?, torrent.state())))
             .collect();
         for (hash, state) in saved {
+            // A move cut short carries on first (below).
+            if engine.journal.moving.contains_key(&hash) {
+                continue;
+            }
             match state {
                 TransferState::Downloading => engine.start(hash),
                 TransferState::Paused => {
@@ -983,6 +1039,7 @@ impl Engine {
                 TransferState::Seeding | TransferState::Complete => {}
             }
         }
+        engine.resume_moves();
         engine
     }
 
@@ -1046,6 +1103,10 @@ impl Engine {
                 self.toggle(hash);
                 Ok(Reply::Done)
             }
+            Command::Recheck(hash) if self.moves.contains_key(&hash) => Err(Failure::new(format!(
+                "{} is moving; check it once it has moved",
+                self.name(&hash)
+            ))),
             Command::Recheck(hash) => {
                 if self.queue_verify(hash) {
                     self.notify(
@@ -1056,6 +1117,14 @@ impl Engine {
                 Ok(Reply::Done)
             }
             Command::Reannounce(hash) => self.reannounce(hash),
+            Command::Remove(hash) | Command::RemoveWithFiles(hash)
+                if self.moves.contains_key(&hash) =>
+            {
+                Err(Failure::new(format!(
+                    "{} is moving; remove it once it has moved",
+                    self.name(&hash)
+                )))
+            }
             Command::Remove(hash) => {
                 self.remove(hash, false);
                 Ok(Reply::Done)
@@ -1063,6 +1132,10 @@ impl Engine {
             Command::RemoveWithFiles(hash) => {
                 self.remove(hash, true);
                 Ok(Reply::Done)
+            }
+            Command::Move { torrent, folder } => {
+                let folder = save_folder(folder)?;
+                self.relocate(torrent, folder)
             }
             Command::ChangeSetting { key, value } => {
                 self.change_setting(&key, &value).map(|()| Reply::Done)
@@ -1114,6 +1187,12 @@ impl Engine {
             }
             Command::RenamePath { torrent, from, to } => {
                 let index = self.index(&torrent)?;
+                if self.moves.contains_key(&torrent) {
+                    return Err(Failure::new(format!(
+                        "{} is moving; rename its files once it has moved",
+                        self.name(&torrent)
+                    )));
+                }
                 // Writes or checks running meanwhile could recreate or miss
                 // the files being moved; seeding only reads, and a read
                 // that misses during the move is just retried by the peer.
@@ -1162,6 +1241,383 @@ impl Engine {
                     .collect();
                 Ok(Reply::Peers(peers))
             }
+        }
+    }
+
+    // ----- moving files --------------------------------------------------------
+
+    /// Carries on the moves an earlier run did not finish: their torrents
+    /// stay out of the swarm until moved.
+    fn resume_moves(&mut self) {
+        let planned: Vec<(InfoHash, crate::moves::Planned)> = self
+            .journal
+            .moving
+            .iter()
+            .map(|(hash, planned)| (*hash, planned.clone()))
+            .collect();
+        let mut forgotten = false;
+        for (hash, planned) in planned {
+            if self.client.torrent_index(&hash).is_none() {
+                self.journal.moving.remove(&hash);
+                forgotten = true;
+                continue;
+            }
+            self.client.hold(hash, true);
+            self.seeding.resync = true;
+            tracing::info!(
+                target: "torrent",
+                "{}: carrying on the move to {}",
+                self.name(&hash),
+                planned.to.display()
+            );
+            self.moves.insert(
+                hash,
+                Move {
+                    from: planned.from,
+                    to: planned.to,
+                    resuming: true,
+                    mover: None,
+                },
+            );
+        }
+        let before = self.journal.complete.len();
+        let torrents: std::collections::HashSet<InfoHash> = self
+            .client
+            .torrents()
+            .iter()
+            .filter_map(|torrent| torrent.info_hash().copied())
+            .collect();
+        self.journal
+            .complete
+            .retain(|hash, _| torrents.contains(hash));
+        if forgotten || before != self.journal.complete.len() {
+            let _ = self.save_journal();
+        }
+        // Completed just before the last run ended, not yet moved.
+        let complete: Vec<InfoHash> = self.journal.complete.keys().copied().collect();
+        for hash in complete {
+            self.move_if_complete(hash);
+        }
+    }
+
+    fn save_journal(&mut self) -> Result<(), Failure> {
+        self.journal
+            .save(&self.store.moves_path())
+            .map_err(|error| {
+                tracing::warn!(target: "engine", "{error}");
+                Failure::new(error)
+            })
+    }
+
+    /// The folder `storage.incomplete_dir` names, if set.
+    fn incomplete_dir(&self) -> Option<PathBuf> {
+        self.config.incomplete_dir()
+    }
+
+    /// A torrent's files, relative to its folder: the folder, and them.
+    fn relative_files(&self, index: usize) -> (PathBuf, Vec<PathBuf>) {
+        let (root, paths) = self.client.file_paths(index);
+        let files = paths
+            .iter()
+            .filter_map(|path| path.strip_prefix(&root).ok())
+            .map(std::path::Path::to_path_buf)
+            .collect();
+        (root, files)
+    }
+
+    /// Moves a torrent's files to `to` (see [`Command::Move`]).
+    fn relocate(&mut self, hash: InfoHash, to: PathBuf) -> Result<Reply, Failure> {
+        let index = self.index(&hash)?;
+        let name = self.name(&hash);
+        if self.moves.contains_key(&hash) {
+            return Err(Failure::new(format!(
+                "{name} is already moving; wait for it to finish"
+            )));
+        }
+        let activity = self.activity.get(&hash);
+        let job = activity.and_then(Activity::job_kind);
+        // Started once checked, or once moved.
+        let start_after = activity.is_some_and(|activity| activity.start_after_verify);
+        let complete = matches!(
+            self.client.torrents()[index].state(),
+            TransferState::Seeding | TransferState::Complete
+        );
+        // Still downloading in the incomplete folder: only where it goes
+        // changes, as in qBittorrent.
+        if !complete && self.journal.complete.contains_key(&hash) {
+            let before = self.journal.complete.insert(hash, to.clone());
+            if let Err(error) = self.save_journal() {
+                match before {
+                    Some(before) => self.journal.complete.insert(hash, before),
+                    None => self.journal.complete.remove(&hash),
+                };
+                return Err(error);
+            }
+            self.notify(
+                Level::Info,
+                format!("{name} goes to {} once complete", to.display()),
+            );
+            return Ok(Reply::Done);
+        }
+        let had_destination = self.journal.complete.remove(&hash).is_some();
+        let (from, files) = self.relative_files(index);
+        if from == to {
+            if had_destination {
+                self.save_journal()?;
+            }
+            return Ok(Reply::Done);
+        }
+        // Nothing on disk yet, and nothing writing: just the folder changes.
+        let has_info = self.has_metadata(&hash);
+        let nothing_there = !has_info || (!complete && !crate::moves::any_exist(&from, &files));
+        // (A queued check runs in the new folder.)
+        if !matches!(job, Some(TransferKind::Download | TransferKind::Verify)) && nothing_there {
+            if had_destination {
+                self.save_journal()?;
+            }
+            self.client
+                .set_save_dir(index, to.clone())
+                .map_err(|error| Failure::new(error.to_string()))?;
+            self.session_dirty = true;
+            self.notify(Level::Info, format!("{name} now saves in {}", to.display()));
+            // Files already there (put there by hand) are found by a check.
+            if has_info && crate::moves::any_exist(&to, &files) {
+                self.queue_verify(hash);
+            }
+            return Ok(Reply::Done);
+        }
+        // Written down before anything stops or moves. A check stops too,
+        // and runs again once moved.
+        let start = job == Some(TransferKind::Download) || start_after;
+        self.journal.moving.insert(
+            hash,
+            crate::moves::Planned {
+                from: from.clone(),
+                to: to.clone(),
+                start,
+            },
+        );
+        if let Err(error) = self.save_journal() {
+            self.journal.moving.remove(&hash);
+            return Err(error);
+        }
+        if let Some(activity) = self.activity.get_mut(&hash) {
+            activity.pausing = false;
+            activity.start_after_verify = false;
+            activity.queued_verify = false;
+            if let Some(job) = &activity.job {
+                job.cancel();
+            }
+        }
+        self.verify_queue.retain(|queued| *queued != hash);
+        self.client.hold(hash, true);
+        self.seeding.resync = true;
+        self.moves.insert(
+            hash,
+            Move {
+                from,
+                to: to.clone(),
+                resuming: false,
+                mover: None,
+            },
+        );
+        self.notify(Level::Info, format!("Moving {name} to {}", to.display()));
+        Ok(Reply::Done)
+    }
+
+    /// Starts moves whose torrents have stopped reading and writing, and
+    /// finishes moves that are done.
+    fn advance_moves(&mut self) {
+        let hashes: Vec<InfoHash> = self.moves.keys().copied().collect();
+        for hash in hashes {
+            let Some(index) = self.client.torrent_index(&hash) else {
+                if let Some(mover) = self.moves.remove(&hash).and_then(|moving| moving.mover) {
+                    mover.stop();
+                }
+                continue;
+            };
+            let waiting = self
+                .moves
+                .get(&hash)
+                .is_some_and(|moving| moving.mover.is_none());
+            if waiting {
+                let busy = self
+                    .activity
+                    .get(&hash)
+                    .is_some_and(|activity| activity.job.is_some())
+                    || self.restart_after_rebind.iter().any(|restart| {
+                        restart.hash == hash
+                            && restart.old.as_ref().is_some_and(|old| !old.is_finished())
+                    })
+                    || self
+                        .client
+                        .runtime()
+                        .is_some_and(|runtime| runtime.contains(&hash));
+                if busy {
+                    continue;
+                }
+                let (_, files) = self.relative_files(index);
+                let (_, paths) = self.client.file_paths(index);
+                self.client.release_files(&paths);
+                if let Some(moving) = self.moves.get_mut(&hash) {
+                    moving.mover = Some(Mover::start(
+                        moving.from.clone(),
+                        moving.to.clone(),
+                        files,
+                        moving.resuming,
+                    ));
+                }
+                continue;
+            }
+            if !self
+                .moves
+                .get(&hash)
+                .and_then(|moving| moving.mover.as_ref())
+                .is_some_and(Mover::is_finished)
+            {
+                continue;
+            }
+            let Some(moving) = self.moves.remove(&hash) else {
+                continue;
+            };
+            let Some(mover) = moving.mover else {
+                continue;
+            };
+            let result = mover.join();
+            self.finish_move(hash, index, moving.from, moving.to, result, false);
+        }
+    }
+
+    /// Points a moved torrent at its new folder (or back at the old one
+    /// after a failure), saves, and lets it carry on.
+    fn finish_move(
+        &mut self,
+        hash: InfoHash,
+        index: usize,
+        from: PathBuf,
+        to: PathBuf,
+        result: Result<Moved, MoveError>,
+        quitting: bool,
+    ) {
+        let name = self.name(&hash);
+        let start = self
+            .journal
+            .moving
+            .get(&hash)
+            .is_some_and(|planned| planned.start);
+        let (_, paths) = self.client.file_paths(index);
+        self.client.release_files(&paths);
+        let moved = match result {
+            Err(MoveError::Stopped) => return,
+            Ok(moved) => {
+                let _ = self.client.set_save_dir(index, to.clone());
+                if !moved.adopted {
+                    self.client.restamp_resume(index);
+                }
+                Some(moved)
+            }
+            Err(MoveError::Failed(problem)) => {
+                let _ = self.client.set_save_dir(index, from.clone());
+                self.notify(
+                    Level::Error,
+                    format!(
+                        "Could not move {name} to {}: {problem}; its files are still in {}",
+                        to.display(),
+                        from.display()
+                    ),
+                );
+                None
+            }
+        };
+        // The session names the folder before the move is forgotten: if
+        // the save fails, the next run carries the move on (finding it
+        // done) instead.
+        self.session_dirty = true;
+        self.save();
+        if !self.session_dirty || moved.is_none() {
+            self.journal.moving.remove(&hash);
+            let _ = self.save_journal();
+        }
+        self.client.hold(hash, false);
+        self.seeding.resync = true;
+        // Paused during the move (or before a crash): it stays paused,
+        // next time too.
+        if !start
+            && self.client.torrents()[index].state() == TransferState::Downloading
+            && self.client.pause_torrent(index).is_ok()
+        {
+            self.session_dirty = true;
+        }
+        if quitting {
+            return;
+        }
+        match moved {
+            Some(moved) => {
+                self.notify(Level::Success, format!("Moved {name} to {}", to.display()));
+                let complete = matches!(
+                    self.client.torrents()[index].state(),
+                    TransferState::Seeding | TransferState::Complete
+                );
+                // Some files were there already, or what it has was never
+                // checked (a check stopped for the move): check them.
+                let unknown =
+                    !complete && self.has_metadata(&hash) && !self.client.resume_is_current(index);
+                if moved.adopted || unknown {
+                    self.queue_verify(hash);
+                    if start && let Some(activity) = self.activity.get_mut(&hash) {
+                        activity.start_after_verify = true;
+                    }
+                } else if start {
+                    self.start(hash);
+                }
+            }
+            None if start => self.start(hash),
+            None => {}
+        }
+    }
+
+    /// Where a torrent being added downloads: in `storage.incomplete_dir`
+    /// when set, unless its files are already in its save folder (it is
+    /// there to seed). It goes to its save folder once complete.
+    fn place_incomplete(&mut self, index: usize, hash: InfoHash) -> Result<(), Failure> {
+        let Some(incomplete) = self.incomplete_dir() else {
+            return Ok(());
+        };
+        let (save_dir, files) = self.relative_files(index);
+        if save_dir == incomplete || crate::moves::any_exist(&save_dir, &files) {
+            return Ok(());
+        }
+        self.journal.complete.insert(hash, save_dir.clone());
+        if let Err(error) = self.save_journal() {
+            self.journal.complete.remove(&hash);
+            return Err(error);
+        }
+        self.client
+            .set_save_dir(index, incomplete)
+            .map_err(|error| Failure::new(error.to_string()))
+    }
+
+    /// Moves a torrent that just became complete in the incomplete folder
+    /// to its save folder.
+    fn move_if_complete(&mut self, hash: InfoHash) {
+        let Some(folder) = self.journal.complete.get(&hash).cloned() else {
+            return;
+        };
+        let complete = self.client.torrent_index(&hash).is_some_and(|index| {
+            matches!(
+                self.client.torrents()[index].state(),
+                TransferState::Seeding | TransferState::Complete
+            )
+        });
+        if !complete || self.moves.contains_key(&hash) {
+            return;
+        }
+        if let Err(error) = self.relocate(hash, folder) {
+            let name = self.name(&hash);
+            self.notify(
+                Level::Error,
+                format!("Could not move {name} to its save folder: {error}"),
+            );
         }
     }
 
@@ -1267,7 +1723,12 @@ impl Engine {
 
         // A seed whose files the runtime could not serve.
         let left_out = self.seeding.left_out.get(&hash).filter(|_| job.is_none());
+        let moving = self.moves.get(&hash).map(|moving| MoveView {
+            to: moving.to.clone(),
+            fraction: moving.mover.as_ref().map_or(0.0, Mover::fraction),
+        });
         let status = match (job, progress) {
+            _ if moving.is_some() => Status::Moving,
             _ if activity.is_some_and(|activity| activity.pausing) => Status::Pausing,
             (Some(TransferKind::Verify), _) => Status::Checking,
             (Some(TransferKind::Metadata), Some(progress))
@@ -1362,6 +1823,8 @@ impl Engine {
                 .save_dir(index)
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_default(),
+            complete_dir: self.journal.complete.get(&hash).cloned(),
+            moving,
             info: info.cloned(),
             trackers: trackers.to_vec(),
             status,
@@ -1413,6 +1876,7 @@ impl Engine {
                 self.notify(Level::Error, format!("{name} is not seeding: {reason}"));
             }
         }
+        self.advance_moves();
         self.delete_removed_files(false);
         self.log_changes();
         if std::mem::take(&mut self.interface_returned) {
@@ -1479,15 +1943,39 @@ impl Engine {
         if let Some(rebind) = self.rebinding.take() {
             services.extend(rebind.services);
         }
+        // Moves stop after the piece they are copying, and carry on next
+        // time.
+        for mover in self
+            .moves
+            .values()
+            .filter_map(|moving| moving.mover.as_ref())
+        {
+            mover.stop();
+        }
         let deadline = Instant::now() + EXIT_GRACE;
         while Instant::now() < deadline
             && (jobs
                 .iter()
                 .chain(&detached)
                 .any(|handle| !handle.is_finished())
-                || services.iter().any(|thread| !thread.is_finished()))
+                || services.iter().any(|thread| !thread.is_finished())
+                || self
+                    .moves
+                    .values()
+                    .filter_map(|moving| moving.mover.as_ref())
+                    .any(|mover| !mover.is_finished()))
         {
             std::thread::sleep(Duration::from_millis(20));
+        }
+        // Ones that finished meanwhile are recorded; the rest carry on next
+        // time.
+        for (hash, moving) in std::mem::take(&mut self.moves) {
+            if let Some(mover) = moving.mover.filter(Mover::is_finished)
+                && let Some(index) = self.client.torrent_index(&hash)
+            {
+                let result = mover.join();
+                self.finish_move(hash, index, moving.from, moving.to, result, true);
+            }
         }
         // Transfers have stopped writing, so their progress can be saved as
         // resume data that will still match the files next time. States are
@@ -1920,6 +2408,7 @@ impl Engine {
                 .set_content_layout(index, placement.layout)
                 .map_err(|error| Failure::new(error.to_string()))?;
         }
+        self.place_incomplete(index, hash)?;
         self.session_dirty = true;
         self.stats.added(hash, crate::stats::now());
         self.save_stats();
@@ -1942,6 +2431,24 @@ impl Engine {
             return;
         };
         let name = self.name(&hash);
+        if self.moves.contains_key(&hash) {
+            let complete = matches!(
+                self.client.torrents()[index].state(),
+                TransferState::Seeding | TransferState::Complete
+            );
+            if let Some(planned) = self.journal.moving.get_mut(&hash)
+                && !complete
+                && !planned.start
+            {
+                planned.start = true;
+                let _ = self.save_journal();
+            }
+            self.notify(
+                Level::Info,
+                format!("{name} starts once its files have moved"),
+            );
+            return;
+        }
         let activity = self.activity.entry(hash).or_default();
         match activity.job_kind() {
             Some(TransferKind::Download | TransferKind::Metadata) => {
@@ -2016,6 +2523,21 @@ impl Engine {
                 restart.requested = false;
             }
         }
+        if self.moves.contains_key(&hash) {
+            if let Some(planned) = self.journal.moving.get_mut(&hash)
+                && planned.start
+            {
+                planned.start = false;
+                let _ = self.save_journal();
+            }
+            if self.client.torrents()[index].state() != TransferState::Paused
+                && self.client.pause_torrent(index).is_ok()
+            {
+                self.session_dirty = true;
+            }
+            self.notify(Level::Info, format!("Paused {name}"));
+            return;
+        }
         let activity = self.activity.entry(hash).or_default();
         activity.start_after_verify = false;
         if let Some(job) = &activity.job {
@@ -2057,7 +2579,7 @@ impl Engine {
 
     /// Queues a local data check. Returns false when the torrent is busy.
     fn queue_verify(&mut self, hash: InfoHash) -> bool {
-        if !self.has_metadata(&hash) {
+        if !self.has_metadata(&hash) || self.moves.contains_key(&hash) {
             return false;
         }
         let activity = self.activity.entry(hash).or_default();
@@ -2219,6 +2741,9 @@ impl Engine {
         };
         self.stats.forget(&hash);
         self.save_stats();
+        if self.journal.complete.remove(&hash).is_some() {
+            let _ = self.save_journal();
+        }
         if self.labels.forget(&hash) {
             let _ = self.save_labels();
         }
@@ -2382,6 +2907,10 @@ impl Engine {
                         self.activity.insert(new_hash, activity);
                     }
                     self.stats.rename(&hash, new_hash);
+                    if self.journal.complete.contains_key(&hash) {
+                        self.journal.rename(&hash, new_hash);
+                        let _ = self.save_journal();
+                    }
                     if self.labels.rename(&hash, new_hash) {
                         let _ = self.save_labels();
                     }
@@ -2402,8 +2931,14 @@ impl Engine {
                 self.stats.completed(hash, crate::stats::now());
                 self.save_stats();
             }
+            // Stopped for a move, which says what happens.
+            let moving = self.moves.contains_key(&hash);
+            if moving {
+                start_next = false;
+            }
             let notice = match (kind, result) {
                 (_, Err(BackendError::TorrentNotFound(_))) => None,
+                (_, Err(BackendError::Cancelled)) if moving => None,
                 (TransferKind::Metadata, Ok(_)) => {
                     // The magnet is now a full torrent; download it.
                     start_next = true;
@@ -2439,9 +2974,11 @@ impl Engine {
             self.session_dirty = true;
             if start_next {
                 self.start(hash);
-            } else if kind == TransferKind::Verify && was_pausing {
+            } else if kind == TransferKind::Verify && was_pausing && !moving {
                 self.pause(hash);
             }
+            // Complete in the incomplete folder: to the save folder.
+            self.move_if_complete(hash);
         }
     }
 
@@ -3778,6 +4315,382 @@ mod tests {
         let again = start_in(&root);
         assert_eq!(again.snapshot().torrent(&hash).unwrap().name, "test-9");
         again.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn notices(handle: &Handle) -> Vec<String> {
+        handle
+            .snapshot()
+            .notices
+            .iter()
+            .map(|notice| notice.text.clone())
+            .collect()
+    }
+
+    /// A seed moves to another folder and goes on seeding from there,
+    /// across a restart too, without a recheck. A move that would
+    /// overwrite a file there moves nothing, and it seeds on where it was.
+    #[test]
+    fn moves_a_seed_and_it_keeps_seeding() {
+        let (handle, root) = engine("move-seed");
+        let content: Vec<u8> = (0..200_000).map(|byte| (byte % 251) as u8).collect();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/data.bin"), &content).unwrap();
+        let hash = add_started(
+            &handle,
+            single_file("data.bin", &content, 16384),
+            root.join("a"),
+        );
+        assert!(
+            wait_for(&handle, 20, |snapshot| seeds(snapshot, 1)),
+            "never seeded"
+        );
+
+        handle_ok(
+            &handle,
+            Command::Move {
+                torrent: hash,
+                folder: root.join("b"),
+            },
+        );
+        assert!(
+            wait_for(&handle, 20, |snapshot| {
+                let torrent = snapshot.torrent(&hash).unwrap();
+                torrent.save_dir == root.join("b")
+                    && torrent.status == Status::Seeding
+                    && seeds(snapshot, 1)
+            }),
+            "never seeded from the new folder: {:?}",
+            notices(&handle)
+        );
+        assert_eq!(std::fs::read(root.join("b/data.bin")).unwrap(), content);
+        assert!(!root.join("a/data.bin").exists());
+        assert!(
+            notices(&handle)
+                .iter()
+                .any(|text| text.starts_with("Moved data.bin to"))
+        );
+        handle.shutdown();
+        let journal = Journal::load(&root.join("data/moves")).unwrap();
+        assert!(journal.moving.is_empty(), "{journal:?}");
+
+        let handle = start_in(&root);
+        assert!(
+            wait_for(&handle, 20, |snapshot| seeds(snapshot, 1)),
+            "did not seed after a restart"
+        );
+        let torrent = handle.snapshot().torrent(&hash).unwrap().clone();
+        assert_eq!(
+            (torrent.save_dir.clone(), torrent.status),
+            (root.join("b"), Status::Seeding)
+        );
+
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        std::fs::write(root.join("c/data.bin"), b"someone else's").unwrap();
+        handle_ok(
+            &handle,
+            Command::Move {
+                torrent: hash,
+                folder: root.join("c"),
+            },
+        );
+        assert!(
+            wait_for(&handle, 20, |snapshot| {
+                let torrent = snapshot.torrent(&hash).unwrap();
+                torrent.status == Status::Seeding && seeds(snapshot, 1)
+            }) && notices(&handle)
+                .iter()
+                .any(|text| text.starts_with("Could not move data.bin")),
+            "{:?}",
+            notices(&handle)
+        );
+        assert_eq!(
+            handle.snapshot().torrent(&hash).unwrap().save_dir,
+            root.join("b")
+        );
+        assert_eq!(
+            std::fs::read(root.join("c/data.bin")).unwrap(),
+            b"someone else's"
+        );
+        assert_eq!(std::fs::read(root.join("b/data.bin")).unwrap(), content);
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A torrent with nothing on disk yet just takes the new folder.
+    #[test]
+    fn moving_a_torrent_with_no_files_yet_changes_its_folder() {
+        let (handle, root) = engine("move-empty");
+        let mut request = AddRequest::new(AddSource::Torrent(single_file(
+            "later.bin",
+            b"later",
+            16384,
+        )));
+        request.save_dir = Some(root.join("a"));
+        let Ok(Reply::Added(hash)) = handle.call(Command::AddWith(request)) else {
+            panic!("not added");
+        };
+        handle_ok(
+            &handle,
+            Command::Move {
+                torrent: hash,
+                folder: root.join("b"),
+            },
+        );
+        // At once, no move needed; its first check runs there.
+        assert_eq!(
+            handle.snapshot().torrent(&hash).unwrap().save_dir,
+            root.join("b")
+        );
+        assert!(wait_for(&handle, 10, |snapshot| snapshot
+            .torrent(&hash)
+            .unwrap()
+            .status
+            == Status::Paused));
+        assert!(
+            handle
+                .call(Command::Move {
+                    torrent: hash,
+                    folder: PathBuf::from("relative"),
+                })
+                .is_err()
+        );
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A move cut short (here: the file reached the new folder, and then
+    /// EmpireBT stopped) carries on at the next start.
+    #[test]
+    fn carries_on_a_move_cut_short() {
+        let (handle, root) = engine("move-resume");
+        let content: Vec<u8> = (0..100_000).map(|byte| (byte % 13) as u8).collect();
+        std::fs::create_dir_all(root.join("a/show")).unwrap();
+        std::fs::write(root.join("a/data.bin"), &content).unwrap();
+        let hash = add_started(
+            &handle,
+            single_file("data.bin", &content, 16384),
+            root.join("a"),
+        );
+        assert!(
+            wait_for(&handle, 20, |snapshot| seeds(snapshot, 1)),
+            "never seeded"
+        );
+        handle.shutdown();
+
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::rename(root.join("a/data.bin"), root.join("b/data.bin")).unwrap();
+        let mut journal = Journal::default();
+        journal.moving.insert(
+            hash,
+            crate::moves::Planned {
+                from: root.join("a"),
+                to: root.join("b"),
+                start: false,
+            },
+        );
+        journal.save(&root.join("data/moves")).unwrap();
+
+        let handle = start_in(&root);
+        assert!(
+            wait_for(&handle, 20, |snapshot| {
+                let torrent = snapshot.torrent(&hash).unwrap();
+                torrent.save_dir == root.join("b")
+                    && torrent.status == Status::Seeding
+                    && seeds(snapshot, 1)
+            }),
+            "the move did not carry on: {:?}",
+            notices(&handle)
+        );
+        assert!(
+            Journal::load(&root.join("data/moves"))
+                .unwrap()
+                .moving
+                .is_empty()
+        );
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// With `storage.incomplete_dir` set, a download happens there and
+    /// moves to its save folder once complete, then seeds from it.
+    #[test]
+    fn downloads_in_the_incomplete_folder_and_moves_when_complete() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-app-incomplete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let content: Vec<u8> = (0..300_000).map(|byte| (byte % 241) as u8).collect();
+        let (seed, torrent, hash) = seed_behind_tracker(&root, "incomplete.bin", &content);
+        let url_torrent = torrent.clone();
+
+        let leech_root = root.join("leech");
+        let leech = start_in(&leech_root);
+        let incomplete = leech_root.join("incomplete");
+        handle_ok(
+            &leech,
+            Command::ChangeSetting {
+                key: "storage.incomplete_dir".to_owned(),
+                value: incomplete.display().to_string(),
+            },
+        );
+        handle_ok(&leech, Command::AddTorrent(torrent));
+        let added = leech.snapshot().torrent(&hash).unwrap().clone();
+        assert_eq!(added.save_dir, incomplete);
+        assert_eq!(added.complete_dir, Some(leech_root.join("downloads")));
+        assert_eq!(added.final_dir(), leech_root.join("downloads"));
+
+        handle_ok(&leech, Command::Start(hash));
+        assert!(
+            wait_for(&leech, 30, |snapshot| {
+                let torrent = snapshot.torrent(&hash).unwrap();
+                torrent.status == Status::Seeding
+                    && torrent.save_dir == leech_root.join("downloads")
+                    && seeds(snapshot, 1)
+            }),
+            "never downloaded and moved: {:?} {:?}",
+            leech.snapshot().torrent(&hash).map(|torrent| (
+                torrent.status,
+                torrent.save_dir.clone(),
+                torrent.error.clone()
+            )),
+            notices(&leech)
+        );
+        let moved = leech.snapshot().torrent(&hash).unwrap().clone();
+        assert_eq!(moved.complete_dir, None);
+        assert_eq!(
+            std::fs::read(leech_root.join("downloads/incomplete.bin")).unwrap(),
+            content
+        );
+        assert!(!incomplete.join("incomplete.bin").exists());
+        let journal = Journal::load(&leech_root.join("data/moves")).unwrap();
+        assert_eq!(journal, Journal::default());
+
+        // Files already in the save folder: it seeds them where they are.
+        handle_ok(&leech, Command::Remove(hash));
+        let mut request = AddRequest::new(AddSource::Torrent(url_torrent));
+        request.start = Some(false);
+        handle_ok(&leech, Command::AddWith(request));
+        let again = leech.snapshot().torrent(&hash).unwrap().clone();
+        assert_eq!(
+            (again.save_dir, again.complete_dir),
+            (leech_root.join("downloads"), None)
+        );
+        leech.shutdown();
+        seed.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A seed of `content` in `root/seed`, and a local tracker that names
+    /// it: the seed, the torrent, and its hash.
+    fn seed_behind_tracker(
+        root: &std::path::Path,
+        name: &str,
+        content: &[u8],
+    ) -> (Handle, Vec<u8>, InfoHash) {
+        std::fs::create_dir_all(root.join("seed/downloads")).unwrap();
+        std::fs::write(root.join("seed/downloads").join(name), content).unwrap();
+        let port = free_port();
+        let tracker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/announce", tracker.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for mut stream in tracker.incoming().flatten() {
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request);
+                let mut body = b"d8:intervali1800e5:peers6:\x7f\x00\x00\x01".to_vec();
+                body.extend(port.to_be_bytes());
+                body.extend(b"e");
+                let mut reply =
+                    format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                        .into_bytes();
+                reply.extend(body);
+                let _ = stream.write_all(&reply);
+            }
+        });
+        let torrent = [
+            format!("d8:announce{}:{url}", url.len()).into_bytes(),
+            single_file(name, content, 16384)[1..].to_vec(),
+        ]
+        .concat();
+        let seed = start_on_port(&root.join("seed"), port);
+        let hash = add_started(&seed, torrent.clone(), root.join("seed/downloads"));
+        assert!(
+            wait_for(&seed, 20, |snapshot| seeds(snapshot, 1)),
+            "never seeded"
+        );
+        (seed, torrent, hash)
+    }
+
+    /// Moving a download stops it, moves what it has, and carries on
+    /// downloading in the new folder.
+    #[test]
+    fn moves_a_download_and_carries_on() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-app-move-download-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let content: Vec<u8> = (0..1_000_000).map(|byte| (byte % 239) as u8).collect();
+        let (seed, torrent, hash) = seed_behind_tracker(&root, "slow.bin", &content);
+        let leech_root = root.join("leech");
+        let leech = start_in(&leech_root);
+        // 64 KiB/s: about 15 s for all of it.
+        handle_ok(
+            &leech,
+            Command::ChangeSetting {
+                key: "network.download_limit".to_owned(),
+                value: "64".to_owned(),
+            },
+        );
+        add_started(&leech, torrent, leech_root.join("a"));
+        assert!(
+            wait_for(&leech, 30, |snapshot| snapshot
+                .torrent(&hash)
+                .and_then(|torrent| torrent.fraction)
+                .is_some_and(|fraction| fraction > 0.1)),
+            "never started downloading"
+        );
+        handle_ok(
+            &leech,
+            Command::Move {
+                torrent: hash,
+                folder: leech_root.join("b"),
+            },
+        );
+        assert!(
+            wait_for(&leech, 20, |snapshot| {
+                let torrent = snapshot.torrent(&hash).unwrap();
+                torrent.save_dir == leech_root.join("b") && torrent.status != Status::Moving
+            }),
+            "never moved: {:?}",
+            notices(&leech)
+        );
+        assert!(leech_root.join("b/slow.bin").exists());
+        assert!(!leech_root.join("a/slow.bin").exists());
+        handle_ok(
+            &leech,
+            Command::ChangeSetting {
+                key: "network.download_limit".to_owned(),
+                value: "0".to_owned(),
+            },
+        );
+        assert!(
+            wait_for(&leech, 30, |snapshot| snapshot
+                .torrent(&hash)
+                .unwrap()
+                .status
+                == Status::Seeding),
+            "did not carry on: {:?} {:?}",
+            leech
+                .snapshot()
+                .torrent(&hash)
+                .map(|torrent| (torrent.status, torrent.error.clone())),
+            notices(&leech)
+        );
+        assert_eq!(
+            std::fs::read(leech_root.join("b/slow.bin")).unwrap(),
+            content
+        );
+        leech.shutdown();
+        seed.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }
 }

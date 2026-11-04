@@ -50,6 +50,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Sort { .. } => draw_sort(frame, app),
         Mode::PickFile { .. } => draw_pick_file(frame, app),
         Mode::Rename { .. } => draw_rename(frame, app),
+        Mode::Move { .. } => draw_move(frame, app),
     }
 }
 
@@ -58,7 +59,7 @@ fn status_color(status: Status) -> Color {
         Status::Downloading => DOWN,
         Status::Seeding => UP,
         Status::Checking | Status::Announcing | Status::Waiting => Color::Yellow,
-        Status::Retrying | Status::Pausing => Color::LightYellow,
+        Status::Retrying | Status::Pausing | Status::Moving => Color::LightYellow,
         Status::Queued => Color::Magenta,
         Status::Metadata => Color::LightMagenta,
         Status::Paused => Color::Gray,
@@ -75,6 +76,7 @@ fn status_icon(status: Status) -> &'static str {
         Status::Metadata => "◇",
         Status::Announcing | Status::Waiting => "…",
         Status::Retrying => "↻",
+        Status::Moving => "→",
         Status::Pausing | Status::Paused => "‖",
         Status::Error => "✕",
     }
@@ -525,10 +527,28 @@ fn draw_overview(frame: &mut Frame, row: &RowView, area: Rect) {
     if let Some(v2) = row.info.as_ref().and_then(|info| info.v2_info_hash()) {
         hash = format!("{hash}  (v2 {}…)", &format::hex(v2)[..16]);
     }
-    let save_to = field(
-        "Save to",
-        Line::raw(row.save_dir.join(&row.name).display().to_string()),
-    );
+    let save_to = match (&row.moving, &row.complete_dir) {
+        (Some(moving), _) => field(
+            "Moving to",
+            Line::raw(format!(
+                "{} · {:.0}%",
+                moving.to.display(),
+                moving.fraction * 100.0
+            )),
+        ),
+        (None, Some(complete)) => field(
+            "Save to",
+            Line::raw(format!(
+                "{} (downloading in {})",
+                complete.join(&row.name).display(),
+                row.save_dir.display()
+            )),
+        ),
+        (None, None) => field(
+            "Save to",
+            Line::raw(row.save_dir.join(&row.name).display().to_string()),
+        ),
+    };
     let right = match &row.info {
         Some(info) => vec![
             field("Info hash", Line::raw(hash)),
@@ -728,6 +748,58 @@ fn draw_rename(frame: &mut Frame, app: &App) {
             )
         }
     };
+    text_dialog(
+        frame,
+        title,
+        subject,
+        about,
+        input,
+        error.as_deref(),
+        "rename",
+    );
+}
+
+fn draw_move(frame: &mut Frame, app: &App) {
+    let Mode::Move {
+        torrent,
+        input,
+        error,
+    } = &app.mode
+    else {
+        return;
+    };
+    let row = app.rows().find(|row| row.hash == *torrent);
+    let subject = row.map_or(String::new(), |row| row.name.clone());
+    let about = match row.and_then(|row| row.complete_dir.as_ref().map(|_| row)) {
+        Some(row) => format!(
+            "Downloading in {}; it goes to this folder once complete.",
+            row.save_dir.display()
+        ),
+        None => {
+            "Its files move there; a download stops meanwhile, a seed leaves the swarm.".to_owned()
+        }
+    };
+    text_dialog(
+        frame,
+        "Move to folder",
+        subject,
+        about,
+        input,
+        error.as_deref(),
+        "move",
+    );
+}
+
+/// A dialog asking for one line of text about `subject`.
+fn text_dialog(
+    frame: &mut Frame,
+    title: &str,
+    subject: String,
+    about: String,
+    input: &crate::input::PathInput,
+    error: Option<&str>,
+    action: &str,
+) {
     let height = 10 + u16::from(error.is_some());
     let inner = dialog(frame, title, 76, height);
     let [label, field, error_area, hint] = Layout::vertical([
@@ -776,7 +848,7 @@ fn draw_rename(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::raw(""),
-            key_hints(&[("Enter", "rename"), ("Esc", "cancel")]),
+            key_hints(&[("Enter", action), ("Esc", "cancel")]),
         ]),
         hint,
     );
@@ -1692,6 +1764,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
                 ("C", "set category"),
                 ("R", "rename the torrent (the name shown)"),
                 ("r", "rename a file or folder on disk"),
+                ("m", "move its files to another folder"),
                 ("f", "filter by category or tag"),
                 ("S", "sort: by upload speed, size, progress…"),
                 ("esc", "show all torrents again"),

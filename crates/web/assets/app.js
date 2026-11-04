@@ -296,7 +296,7 @@ function schedule() {
 
 // ----- rendering -------------------------------------------------------------------
 
-const ACTIVE = ["downloading", "metadata", "announcing", "checking", "waiting", "retrying"];
+const ACTIVE = ["downloading", "metadata", "announcing", "checking", "waiting", "retrying", "moving"];
 
 function matches(torrent, filter) {
   switch (filter.kind) {
@@ -824,7 +824,11 @@ function renderOverview(body, torrent) {
     [
       ["Info hash", torrent.hash],
       ["Format", details && details.format ? `${details.format}${details.private ? " · private" : ""}` : torrent.magnet ? "magnet link" : "—"],
+      ...(torrent.movingTo
+        ? [["Moving to", `${torrent.movingTo} · ${percent(torrent.moveProgress || 0)}`]]
+        : []),
       ["Saved in", torrent.savePath || "—"],
+      ...(torrent.downloadPath ? [["Downloading in", torrent.downloadPath]] : []),
       ["Category", torrent.category || "none"],
       ["Tags", torrent.tags.length ? torrent.tags.join(", ") : "none"],
     ],
@@ -1117,6 +1121,8 @@ for (const button of document.querySelectorAll(".selection-actions button")) {
       categoryDialog(torrent);
     } else if (action === "tags") {
       tagsDialog(torrent);
+    } else if (action === "move") {
+      moveDialog(torrent);
     }
   });
 }
@@ -1229,7 +1235,8 @@ function confirmDialog(title, text, label, confirm) {
 // Removing, optionally with the files, as qBittorrent asks.
 function removeDialog(torrent) {
   const deleteFiles = element("input", { class: "switch", attrs: { type: "checkbox" } });
-  const where = torrent.savePath ? ` in ${torrent.savePath}` : "";
+  const folder = torrent.downloadPath || torrent.savePath;
+  const where = folder ? ` in ${folder}` : "";
   const about = element("p", { class: "muted" });
   const yes = element("button", { class: "danger", attrs: { type: "submit" } });
   const update = () => {
@@ -1365,6 +1372,22 @@ function newCategoryDialog() {
       await api("/api/categories", { method: "POST", body: { name: chosen } });
     }
   }));
+}
+
+// Moving a torrent's files, as qBittorrent's "Set location".
+function moveDialog(torrent) {
+  const [folder, choices] = folderInput(torrent.savePath);
+  const about = torrent.downloadPath
+    ? `It is downloading in ${torrent.downloadPath}, and goes to this folder once complete.`
+    : "Its files move to this folder. A download stops while they move; a seed leaves the swarm until they have.";
+  const form = openDialog(`Move “${torrent.name}”`, [
+    element("p", { class: "muted", text: about }),
+    folder,
+    choices,
+  ], [cancelButton(), element("button", { class: "primary", text: "Move", attrs: { type: "submit" } })]);
+  folder.required = true;
+  form.addEventListener("submit", submitter(form, () =>
+    api(`/api/torrents/${torrent.hash}/move`, { method: "POST", body: { savePath: folder.value.trim() } })));
 }
 
 function categoryFolderDialog(category) {

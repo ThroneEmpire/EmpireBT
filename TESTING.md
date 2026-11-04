@@ -99,6 +99,7 @@ Key areas and where they are tested:
 | Config file | `config_file.rs`, `config.rs` |
 | Application engine: commands seen in the next snapshot, failures, settings, waiting for snapshots, several interfaces at once, restart; session store and data-directory lock | `app/src/engine.rs`, `app/src/store.rs` |
 | Categories and tags: assignment, the labels file, names, restart, a damaged file | `app/src/labels.rs`, `app/src/engine.rs` |
+| Moving files and the incomplete folder: renames, copies across file systems (to `/dev/shm`, skipped where it is the same file system), conflicts, files moved by hand, moving back after a failure, carrying on after a crash; a seed, a download halfway, an empty torrent, the incomplete folder end to end with two engines | `app/src/moves.rs`, `app/src/engine.rs` |
 | Console: key input, formatting, UI, adding from a URL, labels and filters (driven by keys, checked on screens drawn to ratatui's `TestBackend`) | `console/src/input.rs`, `format.rs`, `ui.rs`, `app.rs` |
 
 ## libtorrent interop tests
@@ -230,7 +231,8 @@ image and adds torrents in every case the importer handles:
 - complete, in a category with automatic management;
 - a renamed file, in a torrent given a name of its own;
 - files laid out without the torrent's folder;
-- half done and stopped, in the incomplete folder;
+- half done and stopped, in the incomplete folder (it keeps its save
+  folder, to move to once complete);
 - a skipped file;
 - a hybrid;
 - a magnet that never resolved.
@@ -340,7 +342,7 @@ torrents) and the shapes of `/api/state`, the event stream, and
 
 `answers_programs_made_for_qbittorrent` in `web/tests/web.rs` covers the
 qBittorrent API over HTTP: sign-in, the incremental sync, adding, labels,
-renaming, removing, the refusals, and a retried request sending two `SID`
+renaming, moving (`setLocation`, `setSavePath`), removing, the refusals, and a retried request sending two `SID`
 cookies. To check against the real qui:
 
 1. Run a throwaway EmpireBT: `EMPIREBT_WEB_PASSWORD=pass empirebt --data-dir /tmp/qui-test serve`,

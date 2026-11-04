@@ -261,6 +261,9 @@ fn imports_from(live: &Live) {
     assert_eq!(partial.state, TransferState::Paused);
     assert_eq!(partial.folder, Some(downloads.join("incomplete")));
     assert_eq!(partial.progress(), Some(0.5));
+    // It goes to its save folder once complete, as in qBittorrent.
+    assert_eq!(partial.complete_folder, Some(downloads.join("complete")));
+    assert_eq!(mini.complete_folder, None);
     // A skipped file: comes over paused, with a warning.
     let pair = torrent("pair");
     assert_eq!(pair.state, TransferState::Paused);
@@ -384,6 +387,12 @@ fn imports_from(live: &Live) {
     assert_eq!(&mini.save_dir, &downloads.join("linux"));
     assert_eq!(partial.status, Status::Paused);
     assert_eq!(partial.fraction, Some(0.5));
+    assert_eq!(&partial.save_dir, &downloads.join("incomplete"));
+    assert_eq!(
+        partial.complete_dir.as_ref(),
+        Some(&downloads.join("complete"))
+    );
+    assert_eq!(partial.final_dir(), downloads.join("complete"));
     assert_eq!(
         snapshot.category_folders.get("Films"),
         Some(&downloads.join("films"))

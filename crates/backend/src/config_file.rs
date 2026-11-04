@@ -56,6 +56,14 @@ pub const BACKEND_SETTINGS: &[Setting] = &[
         needs_restart: true,
     },
     Setting {
+        key: "storage.incomplete_dir",
+        kind: SettingKind::Text,
+        description: "A folder new torrents download in, moved to their save folder once \
+                      complete (qBittorrent's incomplete folder). Empty to download straight \
+                      into the save folder. Applies to torrents added from now on.",
+        needs_restart: false,
+    },
+    Setting {
         key: "storage.allowed_dirs",
         kind: SettingKind::Text,
         description: "Folders the web UI may save torrents in besides storage.download_dir, \
@@ -327,6 +335,17 @@ impl ConfigFile {
             .collect()
     }
 
+    /// The folder `storage.incomplete_dir` names, with `~` expanded; none
+    /// when it is empty or not a full path.
+    pub fn incomplete_dir(&self) -> Option<PathBuf> {
+        let text = self.get("storage.incomplete_dir").unwrap_or_default();
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(expand_home(text)).filter(|path| path.is_absolute())
+    }
+
     /// Builds the backend configuration from the file.
     pub fn client_config(&self) -> Result<ClientConfig, BackendError> {
         let defaults = ClientConfig::default();
@@ -497,7 +516,7 @@ impl ConfigFile {
 
     fn fill_missing_backend_settings(&mut self, download_dir: &Path) {
         let defaults = ClientConfig::default();
-        let values: [(&str, Value); 16] = [
+        let values: [(&str, Value); 17] = [
             (
                 "storage.download_dir",
                 Value::from(download_dir.to_string_lossy().as_ref()),
@@ -536,6 +555,7 @@ impl ConfigFile {
             ("network.interface", Value::from("")),
             ("network.port_file", Value::from("")),
             ("storage.allowed_dirs", Value::from("")),
+            ("storage.incomplete_dir", Value::from("")),
             ("dht.enabled", Value::from(defaults.dht_enabled())),
             (
                 "dht.bootstrap",

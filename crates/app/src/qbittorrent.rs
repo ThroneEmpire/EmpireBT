@@ -179,6 +179,9 @@ pub struct Planned {
     /// Things to know about how it comes over.
     pub warnings: Vec<String>,
     pub folder: Option<PathBuf>,
+    /// Downloading in qBittorrent's incomplete folder (`folder`): its save
+    /// folder, where it goes once complete.
+    pub complete_folder: Option<PathBuf>,
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub state: TransferState,
@@ -343,6 +346,7 @@ fn plan_torrent(
         skip: None,
         warnings: Vec::new(),
         folder: None,
+        complete_folder: None,
         category: crate::clean_name(text("category")).ok(),
         tags: text("tags")
             .split(',')
@@ -452,6 +456,14 @@ fn plan_torrent(
         return Ok(planned);
     };
     planned.folder = Some(folder.clone());
+    let save = map(text("save_path"));
+    let unfinished = torrent
+        .get("progress")
+        .and_then(Value::as_f64)
+        .is_some_and(|progress| progress < 1.0);
+    if unfinished && save.is_absolute() && !folder.starts_with(&save) {
+        planned.complete_folder = Some(save);
+    }
 
     let skipped = files
         .iter()
@@ -668,6 +680,7 @@ pub fn import(plan: &Plan, store: &Store, config: &ClientConfig) -> Result<Impor
     let (mut client, _) = store.load(config.clone())?;
     let mut labels = Labels::load(&store.labels_path())?;
     let mut stats = crate::stats::Stats::load(&store.stats_path())?;
+    let mut journal = crate::moves::Journal::load(&store.moves_path())?;
     let mut imported = Imported::default();
     for (name, folder) in &plan.categories {
         if !labels.categories.contains(name) {
@@ -743,11 +756,15 @@ pub fn import(plan: &Plan, store: &Store, config: &ClientConfig) -> Result<Impor
             labels.set_tags(hash, planned.tags.iter().cloned().collect());
         }
         stats.import(hash, planned.history.clone());
+        if let Some(complete) = &planned.complete_folder {
+            journal.complete.insert(hash, complete.clone());
+        }
         imported.torrents += 1;
     }
     store.save(&client)?;
     labels.save(&store.labels_path())?;
     stats.save(&store.stats_path())?;
+    journal.save(&store.moves_path())?;
     tracing::info!(
         target: "import",
         "imported {} torrents, {} new categories, and {} new tags from {}",

@@ -177,6 +177,7 @@ with comments on first run. Change settings in any of three ways:
 | --- | --- | --- |
 | `storage.download_dir` | `~/Downloads/EmpireBT` | The folder new torrents are saved in, unless you choose another when adding (existing ones stay where they are) |
 | `storage.allowed_dirs` | empty | Extra folders the web UI may save torrents in (comma-separated); the dashboard can save anywhere |
+| `storage.incomplete_dir` | empty | A folder new torrents download in; each moves to its save folder once complete (qBittorrent's incomplete folder). Empty downloads straight into the save folder |
 | `network.port` | `6881` | Incoming peer port, over TCP and UDP (uTP and the DHT); changes apply at once |
 | `network.port_file` | empty | A file holding the port to use instead, followed while running, such as a VPN's forwarded port ([DOCKER.md](DOCKER.md#port-forwarding)) |
 | `network.max_peers` | `50` | Peers to download one torrent from at once |

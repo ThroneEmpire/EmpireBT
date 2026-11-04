@@ -11,6 +11,7 @@
 mod engine;
 mod geoip;
 mod labels;
+mod moves;
 pub mod qbittorrent;
 mod snapshot;
 mod stats;
@@ -30,8 +31,8 @@ pub const LICENSE_NOTICE: &str = "Free software under the GNU General Public Lic
 pub const SOURCE: &str = env!("CARGO_PKG_REPOSITORY");
 pub use labels::{MAX_NAME, clean_name};
 pub use snapshot::{
-    DhtState, FileView, Level, Network, Notice, PeerView, RateMeter, SeedStatus, SettingView,
-    Snapshot, Status, TorrentView, Transferred,
+    DhtState, FileView, Level, MoveView, Network, Notice, PeerView, RateMeter, SeedStatus,
+    SettingView, Snapshot, Status, TorrentView, Transferred,
 };
 pub use stats::{MAX_RATIO, TorrentStats};
 pub use store::{Store, default_data_dir, home_dir};

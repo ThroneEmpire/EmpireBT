@@ -86,6 +86,7 @@ for the right password.
 | `PUT /api/torrents/{hash}/tags` | `{"tags": ["linux", "web"]}` | `204`; replaces all tags |
 | `PUT /api/torrents/{hash}/name` | `{"name": "My album"}` (`null` or empty for its own name) | `204`; only the name shown changes |
 | `POST /api/torrents/{hash}/rename` | `{"from": "album/01.flac", "to": "album/01 - Intro.flac"}` | `204`; renames a file or folder on disk, see [Renaming](#renaming) |
+| `POST /api/torrents/{hash}/move` | `{"savePath": "/media/films"}` | `204`; moves its files there, see [Moving](#moving) |
 | `POST /api/categories` | `{"name": "ISOs"}` | `204` |
 | `PUT /api/categories/folder` | `{"name": "Films", "savePath": "/media/films"}` (`null` or empty takes the folder away) | `204`; makes the category if new |
 | `POST /api/categories/remove` | `{"name": "ISOs"}` | `204`; torrents keep their other labels |
@@ -202,6 +203,9 @@ Each torrent:
   "error": null,
   "magnet": false,
   "savePath": "/home/me/Downloads/EmpireBT",
+  "downloadPath": null,
+  "movingTo": null,
+  "moveProgress": null,
   "downloaded": 4294967296,
   "uploaded": 6442450944,
   "ratio": 1.5,
@@ -211,8 +215,8 @@ Each torrent:
 ```
 
 - **`status`** is one of `queued`, `metadata`, `checking`, `announcing`,
-  `downloading`, `waiting`, `retrying`, `pausing`, `seeding`, `paused` or
-  `error`. Show `statusLabel` to people.
+  `downloading`, `waiting`, `retrying`, `pausing`, `moving`, `seeding`,
+  `paused` or `error`. Show `statusLabel` to people.
 - **`progress`** runs from 0 to 1. It is `null` until the torrent has been
   checked.
 - **`size`** is `null` for a magnet link whose metadata hasn't arrived;
@@ -220,7 +224,12 @@ Each torrent:
 - **`seeders` and `leechers`** are the swarm size reported by trackers,
   from announces or, for paused torrents, scrapes; `null` when unknown.
   **`completed`** is how many have finished downloading it, from scrapes.
-- **`savePath`** is the folder its files are in.
+- **`savePath`** is the folder its files belong in. A torrent downloading
+  in the incomplete folder (`storage.incomplete_dir`) has its files in
+  **`downloadPath`** until it is complete, then moves to `savePath`;
+  otherwise `downloadPath` is `null`.
+- **`movingTo`** and **`moveProgress`** (0 to 1, by size) are set while
+  its files move to another folder.
 - **`downloaded` and `uploaded`** are payload bytes over every run (kept
   in the data folder's `stats` file). **`ratio`** is uploaded over
   downloaded as qBittorrent works it out: a torrent whose download was not
@@ -328,6 +337,28 @@ as needed; folders left empty are removed.
 - Paths must stay inside the torrent's folder (no `..`, nothing absolute),
   and may not take the place of another of its files or of a file already
   on disk.
+
+## Moving
+
+`POST /api/torrents/{hash}/move` moves a torrent's files to another folder,
+as qBittorrent's "Set location". The folder must be one the API may save
+in (see `savePath` above), or it answers `403`.
+
+- A download stops while its files move, and carries on after. A seed
+  leaves the swarm until they have moved. The torrent shows `moving`.
+- Within one drive, files are renamed. Across drives, each is copied
+  under a temporary name, renamed into place once whole, and only then
+  deleted where it was. A move cut short by quitting or a crash carries on
+  at the next start.
+- If a file of the torrent is already in the new folder, nothing moves and
+  a notice says why. If all its files are there already (moved by hand)
+  and none is in the old folder, they are used and checked.
+- A move that fails (a full disk, no permission) moves back what it moved,
+  and the torrent carries on where it was.
+- A torrent still downloading in the incomplete folder stays there: only
+  the folder it goes to once complete changes.
+- One that is moving can't be removed, renamed or rechecked until it is
+  done (`400`).
 
 ## Peers
 

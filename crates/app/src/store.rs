@@ -18,6 +18,7 @@ const LOG_FILE: &str = "empirebt.log";
 /// Categories and tags.
 const LABELS_FILE: &str = "labels";
 /// Each torrent's history and totals ([`crate::stats`]).
+const MOVES_FILE: &str = "moves";
 const STATS_FILE: &str = "stats";
 
 /// Settings of the application, in the `[console]` section (named for the
@@ -209,6 +210,12 @@ impl Store {
 
     pub fn stats_path(&self) -> PathBuf {
         self.data_dir.join(STATS_FILE)
+    }
+
+    /// Moves under way, and where torrents downloading in the incomplete
+    /// folder go once complete.
+    pub fn moves_path(&self) -> PathBuf {
+        self.data_dir.join(MOVES_FILE)
     }
 
     /// When a torrent was most likely added, for one from before history

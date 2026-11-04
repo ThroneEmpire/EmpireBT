@@ -49,6 +49,12 @@ pub enum Mode {
         input: PathInput,
         error: Option<String>,
     },
+    /// Moving a torrent's files to another folder.
+    Move {
+        torrent: InfoHash,
+        input: PathInput,
+        error: Option<String>,
+    },
     Add {
         input: PathInput,
         /// The folder to save it in, the download directory at first.
@@ -636,6 +642,7 @@ impl App {
             Mode::Sort { .. } => self.handle_sort_key(key),
             Mode::PickFile { .. } => self.handle_pick_file_key(key),
             Mode::Rename { .. } => self.handle_rename_key(key),
+            Mode::Move { .. } => self.handle_move_key(key),
             Mode::Settings { .. } => self.handle_settings_key(key),
             Mode::ConfirmRemove {
                 torrent,
@@ -774,7 +781,9 @@ impl App {
                 }
                 *error = None;
             }
-            Mode::Label { input, error, .. } | Mode::Rename { input, error, .. } => {
+            Mode::Label { input, error, .. }
+            | Mode::Rename { input, error, .. }
+            | Mode::Move { input, error, .. } => {
                 input.paste(text);
                 *error = None;
             }
@@ -868,6 +877,18 @@ impl App {
                     }
                     KeyCode::Char('R') => {
                         self.rename(hash, None);
+                        return;
+                    }
+                    KeyCode::Char('m') => {
+                        if let Some(view) = self.view.torrent(&hash) {
+                            let mut input = PathInput::default();
+                            input.paste(&view.final_dir().to_string_lossy());
+                            self.mode = Mode::Move {
+                                torrent: hash,
+                                input,
+                                error: None,
+                            };
+                        }
                         return;
                     }
                     KeyCode::Char('r') => {
@@ -1178,6 +1199,54 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('u') if control => input.clear(),
+            KeyCode::Char('w') if control => input.delete_word(),
+            KeyCode::Char(character) if !control => {
+                input.insert(character);
+                *error = None;
+            }
+            KeyCode::Backspace => input.backspace(),
+            KeyCode::Delete => input.delete(),
+            KeyCode::Left => input.left(),
+            KeyCode::Right => input.right(),
+            KeyCode::Home => input.home(),
+            KeyCode::End => input.end(),
+            _ => {}
+        }
+    }
+
+    fn handle_move_key(&mut self, key: KeyEvent) {
+        let Mode::Move {
+            torrent,
+            input,
+            error,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                let text = input.text().trim().to_owned();
+                if text.is_empty() {
+                    *error = Some("Type a folder.".to_owned());
+                    return;
+                }
+                let command = Command::Move {
+                    torrent: *torrent,
+                    folder: PathBuf::from(text),
+                };
+                match self.call(command) {
+                    Ok(_) => self.mode = Mode::Normal,
+                    Err(failure) => {
+                        if let Mode::Move { error, .. } = &mut self.mode {
+                            *error = Some(failure.message);
+                        }
+                    }
+                }
+            }
+            KeyCode::Tab => input.complete(),
             KeyCode::Char('u') if control => input.clear(),
             KeyCode::Char('w') if control => input.delete_word(),
             KeyCode::Char(character) if !control => {

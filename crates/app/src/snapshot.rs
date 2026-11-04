@@ -130,6 +130,8 @@ pub enum Status {
     Waiting,
     Retrying,
     Pausing,
+    /// Its files are moving to another folder.
+    Moving,
     Seeding,
     Paused,
     Error,
@@ -146,6 +148,7 @@ impl Status {
             Self::Waiting => "Waiting",
             Self::Retrying => "Retrying",
             Self::Pausing => "Pausing…",
+            Self::Moving => "Moving",
             Self::Seeding => "Seeding",
             Self::Paused => "Paused",
             Self::Error => "Error",
@@ -166,6 +169,11 @@ pub struct TorrentView {
     pub renames: Arc<BTreeMap<PathBuf, PathBuf>>,
     /// The folder its files are in.
     pub save_dir: PathBuf,
+    /// Downloading in the incomplete folder (`save_dir`): the folder it
+    /// moves to once complete.
+    pub complete_dir: Option<PathBuf>,
+    /// Its files are moving to another folder.
+    pub moving: Option<MoveView>,
     /// Metadata, which a magnet link only has once peers provided it.
     pub info: Option<TorrentInfo>,
     pub trackers: Vec<String>,
@@ -191,6 +199,23 @@ pub struct TorrentView {
     pub history: crate::TorrentStats,
     /// Uploaded over downloaded, as qBittorrent shows it.
     pub ratio: f64,
+}
+
+/// A move of a torrent's files under way.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoveView {
+    pub to: PathBuf,
+    /// How much has moved, by size; 0 while the torrent stops for it.
+    pub fraction: f64,
+}
+
+impl TorrentView {
+    /// The folder its files belong in: where they are, or for a torrent
+    /// downloading in the incomplete folder, where they go once complete
+    /// (qBittorrent's save path).
+    pub fn final_dir(&self) -> &std::path::Path {
+        self.complete_dir.as_deref().unwrap_or(&self.save_dir)
+    }
 }
 
 /// Payload moved, in bytes.

@@ -367,7 +367,7 @@ code { background: var(--surface-3); padding: 1px 6px; border-radius: 5px; font-
 .fill { height: 100%; width: 0; background: var(--faint); border-radius: 999px; transition: width 0.6s var(--spring), background-color 0.3s; }
 .fill.downloading, .fill.metadata { background: var(--down); }
 .fill.seeding { background: var(--up); }
-.fill.checking, .fill.waiting, .fill.announcing, .fill.retrying { background: var(--warn); }
+.fill.checking, .fill.waiting, .fill.announcing, .fill.retrying, .fill.moving { background: var(--warn); }
 .fill.error { background: var(--bad); }
 .percent { width: 46px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; }
 
@@ -384,7 +384,7 @@ code { background: var(--surface-3); padding: 1px 6px; border-radius: 5px; font-
 .pill.downloading, .pill.metadata { color: var(--down); background: color-mix(in srgb, var(--down) 14%, transparent); }
 .pill.seeding { color: var(--up); background: color-mix(in srgb, var(--up) 14%, transparent); }
 .pill.error { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
-.pill.checking, .pill.waiting, .pill.announcing, .pill.retrying { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.pill.checking, .pill.waiting, .pill.announcing, .pill.retrying, .pill.moving { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
 
 .chip {
   display: inline-flex;
