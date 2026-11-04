@@ -45,7 +45,11 @@ const VERIFY_CONCURRENCY: usize = 2;
 const VERIFY_BUDGET: Duration = Duration::from_millis(40);
 /// A seeding runtime that failed to start (port taken, network interface
 /// down) is tried again this often.
-const SEED_RETRY: Duration = Duration::from_secs(10);
+const SEED_RETRY: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
 /// How often seeds that could not join the runtime (files missing or
 /// unreadable, as on a drive that is not mounted yet) are tried again.
 const LEFT_OUT_RETRY: Duration = if cfg!(test) {
@@ -631,6 +635,9 @@ struct Activity {
     counted_up: Option<(usize, u64)>,
     /// Uploads were last read from a download's own counters.
     up_from_transfer: bool,
+    /// Its transfer runs without the shared runtime (none could listen on
+    /// the port): it moves there once one does.
+    outside_runtime: bool,
 }
 
 /// The payload a counter moved since it was last read. A counter it has
@@ -1889,6 +1896,7 @@ impl Engine {
                 format!("{name} is back; reconnected with a new peer ID and DHT node ID"),
             );
         }
+        self.bring_downloads_into_runtime();
         self.restart_rebound_downloads();
         self.scrape_trackers();
         if self.last_port_check.elapsed() >= PORT_FILE_POLL {
@@ -2270,6 +2278,53 @@ impl Engine {
         }
     }
 
+    /// Once the shared runtime listens (the port was taken, and is free
+    /// now), downloads that started without it move into it, as a port
+    /// move moves them: stopped with their progress, started again there,
+    /// where peers can reach them. In libtorrent every torrent takes
+    /// incoming peers as soon as the session listens again.
+    fn bring_downloads_into_runtime(&mut self) {
+        if self.rebinding.is_some() || self.client.runtime().is_none() {
+            return;
+        }
+        let mut moved = 0;
+        for (hash, activity) in &mut self.activity {
+            if !std::mem::take(&mut activity.outside_runtime) {
+                continue;
+            }
+            let networked = matches!(
+                activity.job_kind(),
+                Some(TransferKind::Download | TransferKind::Metadata)
+            );
+            if networked
+                && !activity.pausing
+                && let Some(job) = activity.job.take()
+            {
+                job.cancel();
+                self.restart_after_rebind.push(Restart {
+                    hash: *hash,
+                    old: Some(job),
+                    requested: false,
+                });
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            tracing::info!(
+                target: "seeding",
+                "moving {moved} downloads that started without a listener onto port {}",
+                self.client.config().listen_port()
+            );
+        }
+    }
+
+    /// The shared runtime is not live yet but will be (it is starting, or
+    /// about to): downloads wait for it. One that failed (the port is
+    /// taken) is not waited for.
+    fn runtime_coming(&self) -> bool {
+        self.client.runtime().is_none() && !matches!(self.seeding.status(), SeedStatus::Failed(_))
+    }
+
     /// The torrent is set to download (a restart after a move waits for it).
     fn downloading(&self, hash: &InfoHash) -> bool {
         self.client.torrent_index(hash).is_some_and(|index| {
@@ -2449,6 +2504,8 @@ impl Engine {
             );
             return;
         }
+        let wait_for_runtime = self.rebinding.is_some() || self.runtime_coming();
+        let outside_runtime = self.client.runtime().is_none();
         let activity = self.activity.entry(hash).or_default();
         match activity.job_kind() {
             Some(TransferKind::Download | TransferKind::Metadata) => {
@@ -2478,8 +2535,10 @@ impl Engine {
         activity.queued_verify = false;
         activity.error = None;
         activity.down.idle();
-        if self.rebinding.is_some() {
-            // The old runtime is closing: start on the new one.
+        if wait_for_runtime {
+            // The old runtime is closing, or the first one is starting
+            // (EmpireBT just started): start on it, not in a private one
+            // that peers cannot reach and that the Peers tab cannot see.
             match self
                 .restart_after_rebind
                 .iter_mut()
@@ -2504,6 +2563,7 @@ impl Engine {
             Ok(handle) => {
                 activity.progress = Some(Arc::clone(handle.progress()));
                 activity.job = Some(handle);
+                activity.outside_runtime = outside_runtime;
                 self.session_dirty = true;
             }
             Err(error) => {
@@ -2893,6 +2953,24 @@ impl Engine {
                 continue;
             };
             let kind = handle.kind();
+            // What it moved since the last sample: a quick download can
+            // finish between two, and its counters go with it.
+            if kind == TransferKind::Download {
+                let progress = handle.progress();
+                let id = Arc::as_ptr(progress) as usize;
+                let down = counted(
+                    &mut activity.counted_down,
+                    Some((id, progress.received_bytes())),
+                    true,
+                );
+                let up = counted(
+                    &mut activity.counted_up,
+                    Some((id, progress.uploaded_bytes())),
+                    true,
+                );
+                activity.up_from_transfer = true;
+                self.stats.traffic(hash, down, up);
+            }
             let was_seeding = self.client.torrent_index(&hash).is_some_and(|index| {
                 self.client.torrents()[index].state() == TransferState::Seeding
             });
@@ -3371,10 +3449,12 @@ mod tests {
         );
         handle.call(Command::Add(link)).unwrap();
         handle.call(Command::Start(hash)).unwrap();
-        assert_eq!(
-            handle.snapshot().torrent(&hash).unwrap().status,
-            Status::Metadata
-        );
+        // Once the runtime is up (it waits for it in the first moments).
+        assert!(wait_for(&handle, 10, |snapshot| snapshot
+            .torrent(&hash)
+            .unwrap()
+            .status
+            == Status::Metadata));
         let port = free_port();
         handle
             .call(Command::ChangeSetting {
@@ -4688,6 +4768,142 @@ mod tests {
         assert_eq!(
             std::fs::read(leech_root.join("b/slow.bin")).unwrap(),
             content
+        );
+        leech.shutdown();
+        seed.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A download interrupted by quitting starts again in the shared
+    /// runtime, once it is up: there its peers are listed, and peers can
+    /// reach it. (It started at once, before the runtime was live, in a
+    /// private one: the Peers tab stayed empty while it downloaded.)
+    #[test]
+    fn a_resumed_download_lists_its_peers() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-app-resumed-peers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let content: Vec<u8> = (0..1_000_000).map(|byte| (byte % 233) as u8).collect();
+        let (seed, torrent, hash) = seed_behind_tracker(&root, "resumed.bin", &content);
+        let leech_root = root.join("leech");
+        let leech = start_in(&leech_root);
+        handle_ok(
+            &leech,
+            Command::ChangeSetting {
+                key: "network.download_limit".to_owned(),
+                value: "32".to_owned(),
+            },
+        );
+        add_started(&leech, torrent, leech_root.join("downloads"));
+        assert!(
+            wait_for(&leech, 30, |snapshot| snapshot
+                .torrent(&hash)
+                .and_then(|torrent| torrent.fraction)
+                .is_some_and(|fraction| fraction > 0.05)),
+            "never started downloading"
+        );
+        leech.shutdown();
+
+        let leech = start_in(&leech_root);
+        // Listed while it is still downloading (at 32 KiB/s it takes
+        // about half a minute; once complete it would seed in the shared
+        // runtime anyway).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let Ok(Reply::Peers(peers)) = leech.call(Command::Peers(hash)) else {
+                panic!("no answer");
+            };
+            if !peers.is_empty() {
+                let torrent = leech.snapshot().torrent(&hash).unwrap().clone();
+                assert!(torrent.fraction.is_none_or(|fraction| fraction < 1.0));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the resumed download listed no peers: {:?}",
+                leech
+                    .snapshot()
+                    .torrent(&hash)
+                    .map(|torrent| (torrent.status, torrent.peers))
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        leech.shutdown();
+        seed.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The port is taken when EmpireBT starts: downloads go on without a
+    /// listener (outgoing connections only, as libtorrent does), and once
+    /// the port is free and the listener up, they move onto it, where
+    /// their peers are listed and peers can reach them.
+    #[test]
+    fn downloads_move_onto_the_listener_once_the_port_is_free() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-app-port-taken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let content: Vec<u8> = (0..1_000_000).map(|byte| (byte % 229) as u8).collect();
+        let (seed, torrent, hash) = seed_behind_tracker(&root, "taken.bin", &content);
+        let port = free_port();
+        let taken = std::net::TcpListener::bind(("0.0.0.0", port)).unwrap();
+        let leech_root = root.join("leech");
+        let leech = start_on_port(&leech_root, port);
+        assert!(
+            wait_for(&leech, 10, |snapshot| matches!(
+                snapshot.network.seed_status,
+                SeedStatus::Failed(_)
+            )),
+            "the taken port did not fail: {:?}",
+            leech.snapshot().network.seed_status
+        );
+        handle_ok(
+            &leech,
+            Command::ChangeSetting {
+                key: "network.download_limit".to_owned(),
+                value: "32".to_owned(),
+            },
+        );
+        add_started(&leech, torrent, leech_root.join("downloads"));
+        assert!(
+            wait_for(&leech, 20, |snapshot| snapshot
+                .torrent(&hash)
+                .and_then(|torrent| torrent.fraction)
+                .is_some_and(|fraction| fraction > 0.02)),
+            "did not download without a listener: {:?}",
+            notices(&leech)
+        );
+
+        drop(taken);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let Ok(Reply::Peers(peers)) = leech.call(Command::Peers(hash)) else {
+                panic!("no answer");
+            };
+            if !peers.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never moved onto the listener: {:?} {:?}",
+                leech.snapshot().network.seed_status,
+                leech
+                    .snapshot()
+                    .torrent(&hash)
+                    .map(|torrent| torrent.status)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let snapshot = leech.snapshot();
+        assert!(matches!(
+            snapshot.network.seed_status,
+            SeedStatus::Listening { .. }
+        ));
+        assert!(
+            snapshot
+                .torrent(&hash)
+                .unwrap()
+                .fraction
+                .is_none_or(|fraction| fraction < 1.0)
         );
         leech.shutdown();
         seed.shutdown();
