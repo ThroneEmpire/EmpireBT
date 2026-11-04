@@ -1025,7 +1025,10 @@ fn run_tick(
         return Err(invalid("the torrent is no longer shared"));
     }
     let mut out = Vec::new();
-    if wire.tick(Instant::now(), crowded, &mut out)? == Flow::Finished {
+    // Blocks still waiting to go out (an upload limit, a slow link) are
+    // uploads under way.
+    let sending = connection.output.len() > connection.written;
+    if wire.tick(Instant::now(), crowded, sending, &mut out)? == Flow::Finished {
         return Err(invalid("connection finished"));
     }
     dispatch(id, connection, jobs, out)?;

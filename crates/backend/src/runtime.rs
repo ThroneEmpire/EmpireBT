@@ -1319,6 +1319,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Under a tight upload limit, blocks a peer asked for wait to go out
+    /// long after they were read. That peer is downloading, not idle: it
+    /// keeps its connection until it has them all (it was dropped as
+    /// "asked for nothing" once its last block was read, mid-transfer).
+    #[test]
+    fn a_peer_waiting_on_a_slow_upload_is_not_idle() {
+        use std::io::Write;
+        const SIZE: usize = 256 * 1024;
+        let limits = Arc::new(crate::Limits::unlimited());
+        limits.set_upload_rate(64 * 1024);
+        let (info, address, shutdown, server, root) = serving("slow-upload", SIZE, limits);
+        let mut stream = interested_peer(address, &info, 1);
+        while read_message(&mut stream).unwrap() != PeerMessage::Unchoke {}
+        let mut requests = Vec::new();
+        for piece in 0..(SIZE / (16 * 1024)) as u32 {
+            let request = PeerMessage::Request {
+                piece_index: piece,
+                begin: 0,
+                length: 16 * 1024,
+            };
+            requests.extend(request.encode().unwrap());
+        }
+        stream.write_all(&requests).unwrap();
+        // About 4 s of sending, far past the 0.5 s tests allow an idle
+        // unchoked peer.
+        let mut received = 0;
+        while received < SIZE {
+            if let PeerMessage::Piece { block, .. } = read_message(&mut stream).unwrap() {
+                received += block.len();
+            }
+        }
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn refuses_peers_beyond_the_shared_connection_limit() {
         let limits = Arc::new(crate::Limits::unlimited());

@@ -221,10 +221,12 @@ impl PeerWire {
     /// uploads, timeouts, peer exchange, and keep-alives.
     /// `crowded`: connection slots are running short, so connections no
     /// one needs close sooner.
+    /// `sending`: bytes are still waiting to be written to the peer.
     pub(crate) fn tick(
         &mut self,
         now: Instant,
         crowded: bool,
+        sending: bool,
         out: &mut Vec<Action>,
     ) -> Result<Flow, crate::BackendError> {
         let torrent = Arc::clone(&self.torrent);
@@ -301,6 +303,11 @@ impl PeerWire {
 
         self.pump_uploads(out);
 
+        // Still sending what it asked for: the clock runs from when the
+        // last of it leaves, as libtorrent waits for its send buffer.
+        if sending {
+            self.state.last_upload_activity = now;
+        }
         // A seed's upload slot taken by a peer that asks for nothing goes
         // to one that will, as libtorrent drops such peers.
         if torrent.is_complete()
