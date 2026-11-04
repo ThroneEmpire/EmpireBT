@@ -5,7 +5,8 @@ API is served by `empirebt serve` or `empirebt ui --web`. See
 [WEB_UI.md](WEB_UI.md) for addresses, HTTPS, and passwords.
 
 The API is not yet versioned. It follows the web UI and may change between
-releases.
+releases. For a stable API, programs can use qBittorrent's instead, which
+EmpireBT also answers: see [QBITTORRENT_API.md](QBITTORRENT_API.md).
 
 ## Signing in
 

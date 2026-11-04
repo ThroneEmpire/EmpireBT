@@ -14,6 +14,10 @@
 //! folder: torrents are added by link, URL, or upload, never by server
 //! path, and settings for storage, the network interface, and the web UI
 //! itself can only be changed outside the web UI.
+//!
+//! qBittorrent's Web API, for programs made for qBittorrent, is under
+//! `/api/v2/` ([`crate::qbittorrent`]), with qBittorrent's own rules for
+//! signing in and cross-site requests.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,6 +75,8 @@ pub(crate) struct WebState {
     pub tls: bool,
     pub stop: watch::Receiver<bool>,
     pub streams: AtomicUsize,
+    /// What each qBittorrent API client was last sent.
+    pub qbittorrent: crate::qbittorrent::Syncs,
 }
 
 impl WebState {
@@ -92,11 +98,12 @@ impl WebState {
             tls,
             stop,
             streams: AtomicUsize::new(0),
+            qbittorrent: crate::qbittorrent::Syncs::default(),
         }
     }
 }
 
-type Shared = Arc<WebState>;
+pub(crate) type Shared = Arc<WebState>;
 
 pub(crate) fn router(state: Shared) -> Router {
     Router::new()
@@ -127,6 +134,7 @@ pub(crate) fn router(state: Shared) -> Router {
         .route("/api/tags", post(create_tag))
         .route("/api/tags/remove", post(remove_tag))
         .route("/api/settings", put(change_setting))
+        .nest("/api/v2", crate::qbittorrent::router())
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), checks))
@@ -183,7 +191,10 @@ fn check(state: &WebState, request: &Request) -> Result<(), Response> {
         }
         return Err(error(StatusCode::MISDIRECTED_REQUEST, &message));
     }
-    let credential = credential(state, headers);
+    if path.starts_with("/api/v2/") {
+        return check_qbittorrent(state, request, host);
+    }
+    let credential = credential(state, headers, COOKIE);
     let public = !path.starts_with("/api/") || path == "/api/login";
     if !public && credential == Credential::None {
         return Err(error(StatusCode::UNAUTHORIZED, "sign in first"));
@@ -195,28 +206,68 @@ fn check(state: &WebState, request: &Request) -> Result<(), Response> {
         if !headers.contains_key(CSRF_HEADER) {
             return Err(error(StatusCode::FORBIDDEN, "missing X-EmpireBT header"));
         }
-        if let Some(origin) = headers.get(header::ORIGIN) {
-            let origin = origin.to_str().unwrap_or("");
-            let origin_host = origin.split_once("://").map_or("", |(_, rest)| rest);
-            // Behind a reverse proxy that does not pass `Host` on, the name
-            // the browser used arrives as `X-Forwarded-Host`. Cross-site
-            // pages cannot send that, or `X-EmpireBT`, without our consent.
-            let forwarded = headers
-                .get("x-forwarded-host")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(',').next())
-                .map(str::trim);
-            if !origin_host.eq_ignore_ascii_case(host)
-                && !forwarded.is_some_and(|forwarded| origin_host.eq_ignore_ascii_case(forwarded))
+        if let Some(origin) = headers.get(header::ORIGIN)
+            && !names_us(headers, host, origin.to_str().unwrap_or(""))
+        {
+            return Err(error(StatusCode::FORBIDDEN, "cross-site request refused"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `url` (an `Origin` or `Referer`) is on this server. Behind a
+/// reverse proxy that does not pass `Host` on, the name the browser used
+/// arrives as `X-Forwarded-Host`; cross-site pages cannot send that, or
+/// `X-EmpireBT`, without our consent.
+fn names_us(headers: &HeaderMap, host: &str, url: &str) -> bool {
+    let named = url
+        .split_once("://")
+        .map_or("", |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let forwarded = headers
+        .get("x-forwarded-host")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim);
+    named.eq_ignore_ascii_case(host)
+        || forwarded.is_some_and(|forwarded| named.eq_ignore_ascii_case(forwarded))
+}
+
+/// qBittorrent's rules for its API: signed in by its `SID` cookie or an
+/// API token, else 403 (which its clients take as "sign in again"); and a
+/// request with a cookie that sends `Origin` or `Referer` must name this
+/// server, as qBittorrent's cross-site protection checks. Its clients are
+/// programs, which send neither.
+#[allow(clippy::result_large_err)]
+fn check_qbittorrent(state: &WebState, request: &Request, host: &str) -> Result<(), Response> {
+    let headers = request.headers();
+    let credential = credential(state, headers, crate::qbittorrent::COOKIE);
+    let forbidden = || {
+        (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/plain; charset=UTF-8")],
+            "Forbidden",
+        )
+            .into_response()
+    };
+    if request.uri().path() != "/api/v2/auth/login" && credential == Credential::None {
+        return Err(forbidden());
+    }
+    if credential != Credential::Token {
+        for name in [header::ORIGIN, header::REFERER] {
+            if let Some(value) = headers.get(name)
+                && !names_us(headers, host, value.to_str().unwrap_or(""))
             {
-                return Err(error(StatusCode::FORBIDDEN, "cross-site request refused"));
+                return Err(forbidden());
             }
         }
     }
     Ok(())
 }
 
-fn credential(state: &WebState, headers: &HeaderMap) -> Credential {
+fn credential(state: &WebState, headers: &HeaderMap, cookie_name: &str) -> Credential {
     if let Some(token) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -228,21 +279,32 @@ fn credential(state: &WebState, headers: &HeaderMap) -> Credential {
             Credential::None
         };
     }
-    match session_cookie(headers) {
-        Some(token) if state.sessions.check(&token) => Credential::Cookie,
-        _ => Credential::None,
+    // A client retrying a request after signing in again can send the
+    // old cookie and the new one under the same name (Go's HTTP client
+    // does); any live one will do.
+    if cookies(headers, cookie_name).any(|token| state.sessions.check(&token)) {
+        Credential::Cookie
+    } else {
+        Credential::None
     }
 }
 
-fn session_cookie(headers: &HeaderMap) -> Option<String> {
+/// The values of every cookie called `wanted`, in the order sent.
+fn cookies<'a>(headers: &'a HeaderMap, wanted: &'a str) -> impl Iterator<Item = String> + 'a {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, _)| *name == COOKIE)
+        .filter(move |(name, _)| *name == wanted)
         .map(|(_, value)| value.to_owned())
+}
+
+/// The value of the cookie called `wanted`; the last, when sent more than
+/// once, as it is the newest.
+pub(crate) fn cookie(headers: &HeaderMap, wanted: &str) -> Option<String> {
+    cookies(headers, wanted).last()
 }
 
 /// The host name of a `Host` header, without port or brackets, lowercase.
@@ -356,7 +418,7 @@ async fn login(
 }
 
 async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    if let Some(token) = session_cookie(&headers) {
+    if let Some(token) = cookie(&headers, COOKIE) {
         state.sessions.end(&token);
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
@@ -377,7 +439,7 @@ async fn session() -> Response {
 /// Settings a browser session may not change: where files go, which
 /// network interface carries traffic, files read for the port, and the web
 /// UI's own setup.
-fn editable_from_web(key: &str) -> bool {
+pub(crate) fn editable_from_web(key: &str) -> bool {
     !(key.starts_with("storage.")
         || key.starts_with("web.")
         || key == "network.interface"
@@ -832,7 +894,7 @@ async fn peers(State(state): State<Shared>, Path(hash): Path<String>) -> Respons
 }
 
 /// A path inside a torrent with `/` between its parts on every system.
-fn slashed(path: &std::path::Path) -> String {
+pub(crate) fn slashed(path: &std::path::Path) -> String {
     path.iter()
         .map(|part| part.to_string_lossy())
         .collect::<Vec<_>>()
@@ -880,7 +942,7 @@ struct UploadOptions {
 /// inside one of them. Anything else would let a browser write wherever
 /// EmpireBT can. Empty means the download directory.
 #[allow(clippy::result_large_err)]
-fn allowed_save_dir(
+pub(crate) fn allowed_save_dir(
     snapshot: &Snapshot,
     text: Option<&str>,
 ) -> Result<Option<std::path::PathBuf>, Response> {
@@ -1205,7 +1267,7 @@ async fn change_setting(
     .await
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

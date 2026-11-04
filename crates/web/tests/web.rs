@@ -901,3 +901,292 @@ fn ring_digest(bytes: &[u8]) -> Vec<String> {
         })
         .collect()
 }
+
+/// A qBittorrent API request as its clients send it: a form body, the
+/// `SID` cookie, no `Origin`.
+fn qbit(running: &Running, cookie: &str, path: &str, form: &str) -> Response {
+    let mut headers = vec![("Content-Type", "application/x-www-form-urlencoded")];
+    if !cookie.is_empty() {
+        headers.push(("Cookie", cookie));
+    }
+    send(running.port, "POST", path, &headers, form.as_bytes())
+}
+
+fn qbit_get(running: &Running, cookie: &str, path: &str) -> Response {
+    send(running.port, "GET", path, &[("Cookie", cookie)], b"")
+}
+
+/// Programs made for qBittorrent (qui, scripts) sign in, sync the list
+/// incrementally, and drive torrents through `/api/v2/`, with the web
+/// UI's password and limits.
+#[test]
+fn answers_programs_made_for_qbittorrent() {
+    let running = start("qbittorrent", "127.0.0.1");
+    let version = send(running.port, "GET", "/api/v2/app/version", &[], b"");
+    assert_eq!((version.status, version.body.as_str()), (403, "Forbidden"));
+
+    let wrong = qbit(
+        &running,
+        "",
+        "/api/v2/auth/login",
+        "username=admin&password=nope",
+    );
+    assert_eq!((wrong.status, wrong.body.as_str()), (200, "Fails."));
+    let login = qbit(
+        &running,
+        "",
+        "/api/v2/auth/login",
+        &format!("username=admin&password={}", running.password()),
+    );
+    assert_eq!((login.status, login.body.as_str()), (200, "Ok."));
+    let set_cookie = login.header("set-cookie").unwrap();
+    assert!(set_cookie.starts_with("SID=") && set_cookie.contains("HttpOnly"));
+    let cookie = set_cookie.split(';').next().unwrap().to_owned();
+
+    assert_eq!(
+        qbit_get(&running, &cookie, "/api/v2/app/webapiVersion").body,
+        "2.11.4"
+    );
+    assert!(
+        qbit_get(&running, &cookie, "/api/v2/app/version")
+            .body
+            .starts_with('v')
+    );
+    // Another site's page cannot use a signed-in browser's cookie.
+    let cross = send(
+        running.port,
+        "POST",
+        "/api/v2/torrents/createTags",
+        &[
+            ("Cookie", &cookie),
+            ("Origin", "https://evil.example"),
+            ("Content-Type", "application/x-www-form-urlencoded"),
+        ],
+        b"tags=x",
+    );
+    assert_eq!(cross.status, 403);
+    // Server paths are not for API clients.
+    let path = qbit(
+        &running,
+        &cookie,
+        "/api/v2/torrents/add",
+        "urls=/etc/passwd",
+    );
+    assert_eq!(path.status, 400);
+    let outside = qbit(
+        &running,
+        &cookie,
+        "/api/v2/torrents/add",
+        &format!("urls={MAGNET}&savepath=/etc"),
+    );
+    assert_eq!(outside.status, 403, "{}", outside.body);
+
+    assert_eq!(
+        qbit(
+            &running,
+            &cookie,
+            "/api/v2/torrents/createCategory",
+            "category=Movies"
+        )
+        .status,
+        200
+    );
+    let add = qbit(
+        &running,
+        &cookie,
+        "/api/v2/torrents/add",
+        &format!(
+            "urls={}&category=Movies&tags=a,b&stopped=true",
+            MAGNET.replace('&', "%26")
+        ),
+    );
+    assert_eq!((add.status, add.body.as_str()), (200, "Ok."));
+
+    let full = qbit_get(&running, &cookie, "/api/v2/sync/maindata?rid=0").json();
+    assert_eq!(full["full_update"], true);
+    let torrent = &full["torrents"][HASH];
+    assert_eq!(torrent["name"], "web-test");
+    assert_eq!(torrent["category"], "Movies");
+    assert_eq!(torrent["tags"], "a, b");
+    assert_eq!(torrent["state"], "stoppedDL");
+    assert_eq!(torrent["has_metadata"], false);
+    assert_eq!(full["categories"]["Movies"]["name"], "Movies");
+    assert!(full["server_state"]["connection_status"].is_string());
+    let rid = full["rid"].as_u64().unwrap();
+
+    let quiet = qbit_get(
+        &running,
+        &cookie,
+        &format!("/api/v2/sync/maindata?rid={rid}"),
+    )
+    .json();
+    assert_eq!(quiet["full_update"], false);
+    assert!(quiet.get("torrents").is_none(), "nothing changed: {quiet}");
+
+    assert_eq!(
+        qbit(
+            &running,
+            &cookie,
+            "/api/v2/torrents/setCategory",
+            &format!("hashes={HASH}&category=")
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        qbit(
+            &running,
+            &cookie,
+            "/api/v2/torrents/addTags",
+            &format!("hashes={HASH}&tags=c")
+        )
+        .status,
+        200
+    );
+    let rid = quiet["rid"].as_u64().unwrap();
+    let delta = qbit_get(
+        &running,
+        &cookie,
+        &format!("/api/v2/sync/maindata?rid={rid}"),
+    )
+    .json();
+    assert_eq!(delta["full_update"], false);
+    assert_eq!(
+        delta["torrents"][HASH],
+        serde_json::json!({ "category": "", "tags": "a, b, c" }),
+        "only what changed"
+    );
+    assert_eq!(delta["tags"], serde_json::json!(["c"]));
+    // A client that lost its place gets everything again.
+    let lost = qbit_get(&running, &cookie, "/api/v2/sync/maindata?rid=999").json();
+    assert_eq!(lost["full_update"], true);
+
+    let stopped = qbit_get(&running, &cookie, "/api/v2/torrents/info?filter=stopped").json();
+    assert_eq!(stopped.as_array().unwrap().len(), 1);
+    let seeding = qbit_get(&running, &cookie, "/api/v2/torrents/info?filter=seeding").json();
+    assert!(seeding.as_array().unwrap().is_empty());
+    let trackers = qbit_get(
+        &running,
+        &cookie,
+        &format!("/api/v2/torrents/trackers?hash={HASH}"),
+    )
+    .json();
+    assert_eq!(trackers[0]["url"], "** [DHT] **");
+    let properties = qbit_get(
+        &running,
+        &cookie,
+        &format!("/api/v2/torrents/properties?hash={HASH}"),
+    );
+    assert_eq!(properties.json()["name"], "web-test");
+    assert_eq!(
+        qbit_get(&running, &cookie, "/api/v2/torrents/properties?hash=00").status,
+        404
+    );
+
+    assert_eq!(
+        qbit(
+            &running,
+            &cookie,
+            "/api/v2/torrents/rename",
+            &format!("hash={HASH}&name=Renamed")
+        )
+        .status,
+        200
+    );
+    let info = qbit_get(
+        &running,
+        &cookie,
+        &format!("/api/v2/torrents/info?hashes={HASH}"),
+    )
+    .json();
+    assert_eq!(info[0]["name"], "Renamed");
+
+    // A .torrent upload, as qui sends one.
+    let mut torrent = b"d4:infod6:lengthi3e4:name5:a.txt12:piece lengthi16384e6:pieces20:".to_vec();
+    torrent.extend([3; 20]);
+    torrent.extend(b"ee");
+    let mut body = b"--XyZ\r\nContent-Disposition: form-data; name=\"torrents\"; filename=\"a.torrent\"\r\nContent-Type: application/x-bittorrent\r\n\r\n".to_vec();
+    body.extend(&torrent);
+    body.extend(
+        b"\r\n--XyZ\r\nContent-Disposition: form-data; name=\"stopped\"\r\n\r\ntrue\r\n--XyZ--\r\n",
+    );
+    let upload = send(
+        running.port,
+        "POST",
+        "/api/v2/torrents/add",
+        &[
+            ("Cookie", &cookie),
+            ("Content-Type", "multipart/form-data; boundary=XyZ"),
+        ],
+        &body,
+    );
+    assert_eq!((upload.status, upload.body.as_str()), (200, "Ok."));
+    let files_of = |hash: &str| {
+        qbit_get(
+            &running,
+            &cookie,
+            &format!("/api/v2/torrents/files?hash={hash}"),
+        )
+        .json()
+    };
+    let list = qbit_get(&running, &cookie, "/api/v2/torrents/info?sort=name").json();
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    let uploaded = list[0]["hash"].as_str().unwrap().to_owned();
+    assert_eq!(list[0]["name"], "a.txt", "sorted by name");
+    assert_eq!(files_of(&uploaded)[0]["name"], "a.txt");
+
+    // The client sees the upload, then both go.
+    let rid = lost["rid"].as_u64().unwrap();
+    let seen = qbit_get(
+        &running,
+        &cookie,
+        &format!("/api/v2/sync/maindata?rid={rid}"),
+    )
+    .json();
+    assert!(seen["torrents"].get(&uploaded).is_some(), "{seen}");
+    let rid = seen["rid"].as_u64().unwrap();
+    assert_eq!(
+        qbit(
+            &running,
+            &cookie,
+            "/api/v2/torrents/delete",
+            &format!("hashes={HASH}|{uploaded}&deleteFiles=false")
+        )
+        .status,
+        200
+    );
+    let gone = qbit_get(
+        &running,
+        &cookie,
+        &format!("/api/v2/sync/maindata?rid={rid}"),
+    )
+    .json();
+    let mut removed: Vec<&str> = gone["torrents_removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hash| hash.as_str().unwrap())
+        .collect();
+    removed.sort_unstable();
+    let mut expected = vec![HASH, uploaded.as_str()];
+    expected.sort_unstable();
+    assert_eq!(removed, expected);
+
+    assert_eq!(
+        qbit_get(&running, &cookie, "/api/v2/rss/items").status,
+        404,
+        "methods EmpireBT does not have"
+    );
+    // Go's HTTP client, retrying after signing in again, sends the old
+    // cookie and the new one; the live one counts.
+    let both = format!("SID=expired; {cookie}");
+    assert_eq!(
+        qbit_get(&running, &both, "/api/v2/app/webapiVersion").status,
+        200
+    );
+    qbit(&running, &cookie, "/api/v2/auth/logout", "");
+    assert_eq!(
+        qbit_get(&running, &cookie, "/api/v2/app/version").status,
+        403
+    );
+}

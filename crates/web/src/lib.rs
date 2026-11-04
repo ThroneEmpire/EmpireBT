@@ -8,9 +8,13 @@
 //! API tokens instead (see [`create_token`]). See `api` for what each
 //! request is checked for.
 
+// qBittorrent's torrent objects are one large `json!`.
+#![recursion_limit = "256"]
+
 mod api;
 mod assets;
 mod auth;
+mod qbittorrent;
 mod server;
 
 use std::net::{IpAddr, SocketAddr};

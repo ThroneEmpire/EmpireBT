@@ -324,6 +324,28 @@ What the Rust tests do cover for the frontend's sake: the update protocol
 torrents) and the shapes of `/api/state`, the event stream, and
 `/api/torrents/{hash}/peers` (`web/tests/web.rs`).
 
+## qui and the qBittorrent API
+
+`answers_programs_made_for_qbittorrent` in `web/tests/web.rs` covers the
+qBittorrent API over HTTP: sign-in, the incremental sync, adding, labels,
+renaming, removing, the refusals, and a retried request sending two `SID`
+cookies. To check against the real qui:
+
+1. Run a throwaway EmpireBT: `EMPIREBT_WEB_PASSWORD=pass empirebt --data-dir /tmp/qui-test serve`,
+   with `web.port` set to a free port.
+2. Run qui on the host network:
+   `docker run -d --name qui-test --network host -e QUI__HOST=127.0.0.1 ghcr.io/autobrr/qui:latest`.
+3. Open `http://127.0.0.1:7476`, create a user, and add an instance with
+   the EmpireBT address and password (any username), or an API key from
+   `empirebt web token qui` (restart EmpireBT afterwards).
+
+Last checked on 2026-11-04 with qui v1.35.0. Connecting by password and
+by API key both worked, the list and its states were right, and these all
+took effect in EmpireBT: pause, resume, create a category, set a category,
+add and remove tags, rename, add a magnet (stopped, with a category),
+delete, and the properties, trackers, files and peers tabs. qui logged no
+errors. After EmpireBT restarted, qui signed in again once.
+
 ## Known intermittent failures
 
 None known. `keeps_seeding_to_its_peers_after_finishing_a_download` failed

@@ -144,6 +144,9 @@ over HTTPS only, and a browser session can't reach the file system.
 - [WEB_UI.md](WEB_UI.md) covers remote access, passwords, and how the web
   UI is protected.
 - [WEB_API.md](WEB_API.md) is the JSON API, for scripts with an API token.
+- [QBITTORRENT_API.md](QBITTORRENT_API.md): EmpireBT also answers
+  qBittorrent's Web API, so qBittorrent front ends such as qui and other
+  qBittorrent tools work with it.
 
 ## Docker
 
