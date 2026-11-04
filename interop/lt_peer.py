@@ -8,6 +8,7 @@
     lt_peer.py seed <torrent> <save_dir> <port>
     lt_peer.py download <torrent|magnet> <save_dir> <port> <peer_host:port> <seconds>
     lt_peer.py identify-peer <torrent|magnet> <save_dir> <port> <peer_host:port> <seconds>
+    lt_peer.py files <torrent>
 
 `seed` prints READY once its data is checked and it is listening, then runs
 until killed. Both `seed` and `download` print `encryption: rc4`,
@@ -231,6 +232,19 @@ def identify_peer(source, save, port, peer, seconds):
     print("TIMEOUT", flush=True)
     return 1
 
+def files(torrent):
+    """Prints the torrent's name, then each file's path but padding, as
+    libtorrent names them after making them safe and telling duplicates
+    apart: one per line, as hex of the UTF-8 bytes."""
+    info = lt.torrent_info(torrent)
+    storage = info.files()
+    print(info.name().encode().hex())
+    for index in range(storage.num_files()):
+        if storage.file_flags(index) & lt.file_storage.flag_pad_file:
+            continue
+        print(storage.file_path(index).encode().hex())
+
+
 if __name__ == "__main__":
     command, args = sys.argv[1], sys.argv[2:]
     if command == "version":
@@ -247,5 +261,7 @@ if __name__ == "__main__":
         sys.exit(download(*args))
     elif command == "identify-peer":
         sys.exit(identify_peer(*args))
+    elif command == "files":
+        files(*args)
     else:
         sys.exit(f"unknown command {command!r}")

@@ -486,6 +486,10 @@ Software Foundation, either version 3 of the License, or (at your option)
 any later version. It is distributed in the hope that it will be useful,
 but without any warranty; see [LICENSE](LICENSE) for the full terms.
 
+Parts are ported from libtorrent, under the BSD 3-Clause license; its
+notice is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), which the
+release archives and the Docker image (`/usr/share/doc/empirebt/`) carry.
+
 The country database it downloads is DB-IP's IP to Country Lite, under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); the web UI and
 dashboard credit it.

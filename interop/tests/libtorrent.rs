@@ -1485,3 +1485,142 @@ fn serves_libtorrent_over_ipv6() {
         .download(path(&torrent), &scratch.join("get"), seeder.address);
     assert_same_files(&scratch.join("source/album"), &scratch.join("get/album"));
 }
+
+/// libtorrent's name for each file of `torrent` (and the torrent's name
+/// first), as `lt_peer.py files` prints them.
+fn libtorrent_names(lt: &Libtorrent, torrent: &Path) -> Vec<String> {
+    lt.run(&["files", path(torrent)])
+        .lines()
+        .map(|line| {
+            let bytes: Vec<u8> = (0..line.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&line[at..at + 2], 16).expect("hex"))
+                .collect();
+            String::from_utf8(bytes).expect("libtorrent names are UTF-8")
+        })
+        .collect()
+}
+
+/// A multi-file v1 torrent of one-byte files, with raw info entries for the
+/// name (and anything else) and each file's raw bencoded dictionary.
+fn raw_names_torrent(name_entries: &[u8], files: &[Vec<u8>]) -> Vec<u8> {
+    let mut info = b"d5:filesl".to_vec();
+    for file in files {
+        info.extend(file);
+    }
+    info.extend(b"e");
+    info.extend(name_entries);
+    info.extend(b"12:piece lengthi16384e6:pieces20:");
+    info.extend([7; 20]);
+    info.extend(b"e");
+    let mut torrent = b"d4:info".to_vec();
+    torrent.extend(info);
+    torrent.extend(b"e");
+    torrent
+}
+
+fn raw_file(elements: &[&[u8]]) -> Vec<u8> {
+    let mut entry = b"d6:lengthi1e4:pathl".to_vec();
+    for element in elements {
+        entry.extend(format!("{}:", element.len()).as_bytes());
+        entry.extend(*element);
+    }
+    entry.extend(b"ee");
+    entry
+}
+
+/// Torrents with names that are not UTF-8, unsafe, disguised, too long, or
+/// colliding get exactly the file names libtorrent gives them, so files
+/// qBittorrent saved are found where it put them.
+#[test]
+fn names_files_exactly_as_libtorrent_does() {
+    let Some(lt) = libtorrent() else { return };
+    let scratch = Scratch::new("names");
+    let long = format!("{}.mkv", "l".repeat(300));
+    let long_cut = format!("{}xyz", "m".repeat(250));
+    let torrents: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "legacy encodings and broken UTF-8",
+            raw_names_torrent(
+                b"4:name5:Caf\xe9!",
+                &[
+                    raw_file(&[b"r\xe9sum\xe9.txt"]),
+                    raw_file(&[b"\xd6\xd0\xce\xc4", b"\x82\xa0\x82\xa2.txt"]),
+                    raw_file(&[b"a\x80b"]),
+                    raw_file(&[b"ab\xe6\x97"]),
+                    raw_file(&[b"a\xc0\xafb"]),
+                    raw_file(&[b"\xed\xa0\x80x"]),
+                    raw_file(&[b"\xf8\x88\x80\x80\x80five"]),
+                    raw_file(&[b"\xfcsix"]),
+                    raw_file(&[b"\xf4\x90\x80\x80big"]),
+                ],
+            ),
+        ),
+        (
+            "unsafe, disguised, and long names",
+            raw_names_torrent(
+                b"4:name1:t",
+                &[
+                    raw_file(&[b"..", b"..", b"etc", b"pass/wd"]),
+                    raw_file(&[b".", b"", b"back\\slash", b"nul\0byte"]),
+                    raw_file(&[b"ctrl\n\x7f\xc2\x85chars"]),
+                    raw_file(&["evil\u{202e}vkm.exe".as_bytes()]),
+                    raw_file(&["zero\u{200b}width\u{feff}".as_bytes()]),
+                    raw_file(&[long.as_bytes()]),
+                    raw_file(&[long_cut.as_bytes()]),
+                    raw_file(&["日本語.mkv".as_bytes()]),
+                ],
+            ),
+        ),
+        (
+            "colliding names",
+            raw_names_torrent(
+                b"4:name1:t",
+                &[
+                    raw_file(&[b"Movie.mkv"]),
+                    raw_file(&[b"movie.mkv"]),
+                    raw_file(&[b"MOVIE.MKV"]),
+                    raw_file(&[b"movie.1.mkv"]),
+                    raw_file(&[b"a\x80"]),
+                    raw_file(&[b"a\x81"]),
+                    raw_file(&[b"sub"]),
+                    raw_file(&[b"sub", b"inner.txt"]),
+                    raw_file(&[b"archive.tar.gz"]),
+                    raw_file(&[b"Archive.tar.gz"]),
+                ],
+            ),
+        ),
+        (
+            "name.utf-8 and path.utf-8",
+            raw_names_torrent(
+                b"4:name4:\xb2\xe2\xca\xd410:name.utf-86:\xe6\xb5\x8b\xe8\xaf\x95",
+                &[b"d6:lengthi1e4:pathl2:\xce\xc4e10:path.utf-8l7:\xe6\x96\x87.txtee".to_vec()],
+            ),
+        ),
+        (
+            "a name of dots",
+            raw_names_torrent(b"4:name3:...", &[raw_file(&[b"f"])]),
+        ),
+    ];
+    for (case, bytes) in torrents {
+        let file = scratch.join("names.torrent");
+        std::fs::write(&file, &bytes).unwrap();
+        let theirs = libtorrent_names(&lt, &file);
+        let info = empirebt_backend::TorrentInfo::from_bytes(&bytes)
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        let mut ours = vec![info.name().to_owned()];
+        ours.extend(
+            info.files()
+                .iter()
+                .filter(|file| !file.is_padding())
+                .map(|file| {
+                    file.path()
+                        .iter()
+                        .map(|part| part.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                }),
+        );
+        assert_eq!(ours, theirs, "{case}");
+    }
+}

@@ -20,6 +20,7 @@ mod magnet;
 mod metadata;
 mod metainfo;
 mod mse;
+mod names;
 mod net;
 mod peer_manager;
 mod pex;

@@ -177,7 +177,17 @@ impl TorrentInfo {
         let info_end = info.end;
         let info_dict = info.as_dict()?;
 
-        let name = text(required(info_dict, b"name")?, "name")?;
+        // `name.utf-8` first: torrent makers that wrote `name` in a legacy
+        // encoding add it in UTF-8 there. Either way the name is made safe
+        // rather than refused (see [`crate::names`]).
+        let raw_name = match find(info_dict, b"name.utf-8") {
+            Some(value) => bytes_value(value, "name.utf-8")?,
+            None => bytes_value(required(info_dict, b"name")?, "name")?,
+        };
+        let name = Some(raw_name)
+            .filter(|raw| !raw.is_empty())
+            .and_then(|raw| crate::names::sanitize_element(raw, false))
+            .ok_or_else(|| invalid("torrent has no usable name"))?;
         let piece_length = integer(required(info_dict, b"piece length")?, "piece length")?;
         let meta_version = find(info_dict, b"meta version")
             .map(|value| integer_u64(value, "meta version"))
@@ -240,6 +250,10 @@ impl TorrentInfo {
             return Err(invalid("torrent has no v1 files or v2 file tree"));
         };
         validate_fields(&name, piece_length, &files)?;
+        // Paths that came out the same (or differ only in ASCII case) are
+        // told apart, in both file lists alike.
+        let (mut files, mut v2_files) = (files, v2_files);
+        rename_duplicates(&mut files, &mut v2_files)?;
         let v2_pieces = v2_files
             .iter()
             .map(|file| file.length.div_ceil(u64::from(piece_length.max(1))).max(1))
@@ -251,9 +265,9 @@ impl TorrentInfo {
             v2_pieces,
         )?;
 
-        let announce = find(root_dict, b"announce")
-            .map(|value| text(value, "announce"))
-            .transpose()?;
+        // A tracker URL that is not UTF-8 cannot be used; it is left out
+        // rather than refusing the torrent.
+        let announce = find(root_dict, b"announce").and_then(|value| text(value, "announce").ok());
         // BEP 12: `announce-list`, when there is one, replaces `announce`.
         let mut tracker_urls: Vec<String> = Vec::new();
         let mut tracker_tiers = Vec::new();
@@ -261,7 +275,9 @@ impl TorrentInfo {
             for tier in announce_list.as_list()? {
                 let mut urls = Vec::new();
                 for tracker in tier.as_list()? {
-                    let url = text(tracker, "announce-list tracker")?;
+                    let Ok(url) = text(tracker, "announce-list tracker") else {
+                        continue;
+                    };
                     if !tracker_urls.contains(&url) {
                         tracker_urls.push(url.clone());
                         urls.push(url);
@@ -595,15 +611,11 @@ impl TorrentInfo {
                     pieces_root,
                 });
             } else {
-                let component = String::from_utf8(name.to_vec())
-                    .map_err(|_| invalid("v2 file-tree path is not UTF-8"))?;
-                if component.is_empty()
-                    || component == "."
-                    || component == ".."
-                    || Path::new(&component).is_absolute()
-                {
-                    return Err(invalid("torrent contains an unsafe v2 file-tree path"));
+                if prefix.iter().count() >= crate::names::MAX_DIRECTORY_DEPTH {
+                    return Err(invalid("torrent has a file more than 100 folders deep"));
                 }
+                let component =
+                    crate::names::sanitize_element(name, true).unwrap_or_else(|| "_".to_owned());
                 let mut next = prefix.to_path_buf();
                 next.push(component);
                 files.extend(Self::parse_v2_tree(child, &next)?);
@@ -669,22 +681,16 @@ fn parse_multi_file(
         .map(|file| {
             let dict = file.as_dict()?;
             let length = integer_u64(required(dict, b"length")?, "file length")?;
-            let path_list = required(dict, b"path")?.as_list()?;
-            let mut path = PathBuf::from(root_name);
-            for component in path_list {
-                let component = text(component, "file path")?;
-                let component_path = Path::new(&component);
-                if component.is_empty()
-                    || component_path.is_absolute()
-                    || component_path
-                        .components()
-                        .any(|part| matches!(part, std::path::Component::ParentDir))
-                {
-                    return Err(invalid("torrent contains an unsafe file path"));
-                }
-
-                path.push(component);
-            }
+            // `path.utf-8` first, as for the name.
+            let path_list = match find(dict, b"path.utf-8") {
+                Some(value) => value.as_list()?,
+                None => required(dict, b"path")?.as_list()?,
+            };
+            let elements = path_list
+                .iter()
+                .map(|element| bytes_value(element, "file path"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let path = PathBuf::from(root_name).join(crate::names::sanitize_path(elements)?);
             let padding = find(dict, b"attr")
                 .and_then(|attr| bytes_value(attr, "attr").ok())
                 .is_some_and(|attr| attr.contains(&b'p'));
@@ -695,6 +701,45 @@ fn parse_multi_file(
             })
         })
         .collect()
+}
+
+/// Gives files whose paths collide new names, as [`crate::names`]
+/// describes, in `files` and the same files of `v2_files`: all of them for
+/// a v2 torrent, whose `files` mirror them, or the files other than padding,
+/// in order, for a hybrid one.
+fn rename_duplicates(
+    files: &mut [TorrentFile],
+    v2_files: &mut [V2File],
+) -> Result<(), crate::BackendError> {
+    let named: Vec<crate::names::Named> = files
+        .iter()
+        .map(|file| crate::names::Named {
+            path: &file.path,
+            padding: file.padding.then_some(file.length),
+        })
+        .collect();
+    let renamed = crate::names::resolve_duplicates(&named)?;
+    if renamed.is_empty() {
+        return Ok(());
+    }
+    // Which v2 file each of `files` is: the n-th file that is not padding.
+    let mut v2_index = Vec::with_capacity(files.len());
+    let mut next = 0;
+    for file in files.iter() {
+        if file.padding {
+            v2_index.push(None);
+        } else {
+            v2_index.push(Some(next));
+            next += 1;
+        }
+    }
+    for (index, path) in renamed {
+        if let Some(v2) = v2_index[index].and_then(|v2| v2_files.get_mut(v2)) {
+            v2.path = path.clone();
+        }
+        files[index].path = path;
+    }
+    Ok(())
 }
 
 fn validate_piece_layers(
@@ -972,6 +1017,120 @@ fn integer_u64(value: &ValueSpan<'_>, field: &str) -> Result<u64, crate::Backend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multi-file torrent from raw `info` entries (`name`, then `files`
+    /// entries as raw bencoded dictionaries), with `announce`.
+    fn raw_torrent(announce: &[u8], name_entries: &[u8], files: &[&[u8]]) -> Vec<u8> {
+        let mut info = b"d5:filesl".to_vec();
+        for file in files {
+            info.extend(*file);
+        }
+        info.extend(b"e");
+        info.extend(name_entries);
+        info.extend(b"12:piece lengthi16384e6:pieces20:");
+        info.extend([0; 20]);
+        info.extend(b"e");
+        let mut torrent = format!("d8:announce{}:", announce.len()).into_bytes();
+        torrent.extend(announce);
+        torrent.extend(b"4:info");
+        torrent.extend(&info);
+        torrent.extend(b"e");
+        torrent
+    }
+
+    fn file_entry(path_key: &[u8], elements: &[&[u8]]) -> Vec<u8> {
+        let mut entry = b"d6:lengthi1e".to_vec();
+        entry.extend(format!("{}:", path_key.len()).as_bytes());
+        entry.extend(path_key);
+        entry.extend(b"l");
+        for element in elements {
+            entry.extend(format!("{}:", element.len()).as_bytes());
+            entry.extend(*element);
+        }
+        entry.extend(b"ee");
+        entry
+    }
+
+    #[test]
+    fn accepts_names_that_are_not_utf_8_as_libtorrent_does() {
+        // Latin-1, as older Windows tools wrote it: "Café" and "résumé.txt".
+        let torrent = raw_torrent(
+            b"http://tracker.example/announce",
+            b"4:name4:Caf\xe9",
+            &[&file_entry(b"path", &[b"r\xe9sum\xe9.txt"])],
+        );
+        let info = TorrentInfo::from_bytes(&torrent).unwrap();
+        assert_eq!(info.name(), "Caf_");
+        // 0xe9 starts a three-byte sequence, so libtorrent takes it and the
+        // next two bytes as one bad character, one `_`: "su" and ".t" go
+        // too. Odd, but it is the name qBittorrent gave the file on disk.
+        assert_eq!(info.files()[0].path(), Path::new("Caf_/r_m_xt"));
+        // The info hash is of the original bytes.
+        let start = torrent.windows(6).position(|w| w == b"4:info").unwrap() + 6;
+        let expected: [u8; 20] = Sha1::digest(&torrent[start..torrent.len() - 1]).into();
+        assert_eq!(info.info_hash(), &expected);
+    }
+
+    #[test]
+    fn prefers_the_utf_8_names_some_makers_add() {
+        let torrent = raw_torrent(
+            b"http://tracker.example/announce",
+            b"4:name4:\xb2\xe2\xca\xd410:name.utf-86:\xe6\xb5\x8b\xe8\xaf\x95",
+            // GBK "文" in `path`, UTF-8 "文.txt" in `path.utf-8`.
+            &[b"d6:lengthi1e4:pathl2:\xce\xc4e10:path.utf-8l7:\xe6\x96\x87.txtee"],
+        );
+        let info = TorrentInfo::from_bytes(&torrent).unwrap();
+        assert_eq!(info.name(), "测试");
+        assert_eq!(info.files()[0].path(), Path::new("测试/文.txt"));
+    }
+
+    #[test]
+    fn makes_paths_that_climb_out_safe_instead_of_refusing_them() {
+        let torrent = raw_torrent(
+            b"http://tracker.example/announce",
+            b"4:name1:t",
+            &[&file_entry(b"path", &[b"..", b"..", b"etc", b"pass/wd"])],
+        );
+        let info = TorrentInfo::from_bytes(&torrent).unwrap();
+        assert_eq!(info.files()[0].path(), Path::new("t/_/_/etc/passwd"));
+    }
+
+    #[test]
+    fn renames_files_whose_names_collide() {
+        let torrent = raw_torrent(
+            b"http://tracker.example/announce",
+            b"4:name1:t",
+            &[
+                &file_entry(b"path", &[b"Movie.mkv"]),
+                &file_entry(b"path", &[b"movie.mkv"]),
+                // The same after cleaning: "a\x80" and "a\x81".
+                &file_entry(b"path", &[b"a\x80"]),
+                &file_entry(b"path", &[b"a\x81"]),
+            ],
+        );
+        let info = TorrentInfo::from_bytes(&torrent).unwrap();
+        let paths: Vec<&Path> = info.files().iter().map(TorrentFile::path).collect();
+        assert_eq!(
+            paths,
+            [
+                Path::new("t/Movie.mkv"),
+                Path::new("t/movie.1.mkv"),
+                Path::new("t/a_"),
+                Path::new("t/a_.1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_out_tracker_urls_that_are_not_utf_8() {
+        let torrent = raw_torrent(
+            b"http://tracker.example/\xff",
+            b"4:name1:t",
+            &[&file_entry(b"path", &[b"f"])],
+        );
+        let info = TorrentInfo::from_bytes(&torrent).unwrap();
+        assert!(info.tracker_urls().is_empty());
+    }
 
     #[test]
     fn torrents_built_in_code_hash_like_their_torrent_files() {

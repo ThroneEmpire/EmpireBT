@@ -114,7 +114,7 @@ jobs:
         run: |
           package="empirebt-$VERSION-linux-${{ matrix.name }}"
           mkdir -p "$package" binary
-          cp target/release/empirebt LICENSE README.md "$package/"
+          cp target/release/empirebt LICENSE THIRD_PARTY_NOTICES.md README.md "$package/"
           tar czf "$package.tar.gz" "$package"
           cp target/release/empirebt binary/
       - uses: actions/upload-artifact@v4

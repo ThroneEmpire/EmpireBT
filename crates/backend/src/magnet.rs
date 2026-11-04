@@ -35,22 +35,31 @@ impl MagnetLink {
             let key = key.split('.').next().unwrap_or(key);
             match key {
                 "xt" => {
-                    let value = percent_decode(value, false)?;
+                    let value = percent_decode_text(value)?;
                     if let Some(hash) = value.strip_prefix("urn:btih:") {
                         info_hash = Some(parse_btih(hash)?);
                     } else if let Some(hash) = value.strip_prefix("urn:btmh:") {
                         v2_hash = Some(parse_btmh(hash)?);
                     }
                 }
-                "dn" => name = Some(percent_decode(value, true)?).filter(|name| !name.is_empty()),
+                // Only shown until the metadata names the torrent, so a name
+                // that is not UTF-8 is shown as well as it can be, not
+                // refused.
+                "dn" => {
+                    let raw = percent_decode(value, true)?;
+                    name = Some(String::from_utf8_lossy(&raw).into_owned())
+                        .filter(|name| !name.is_empty());
+                }
+                // A tracker that is not UTF-8 cannot be used: left out.
                 "tr" => {
-                    let tracker = percent_decode(value, false)?;
-                    if crate::Tracker::new(tracker.clone()).is_ok() && !trackers.contains(&tracker)
+                    if let Ok(tracker) = percent_decode_text(value)
+                        && crate::Tracker::new(tracker.clone()).is_ok()
+                        && !trackers.contains(&tracker)
                     {
                         trackers.push(tracker);
                     }
                 }
-                "x" if pair.starts_with("x.pe=") => peers.push(percent_decode(value, false)?),
+                "x" if pair.starts_with("x.pe=") => peers.push(percent_decode_text(value)?),
                 _ => {}
             }
         }
@@ -182,7 +191,13 @@ fn base32_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn percent_decode(text: &str, plus_is_space: bool) -> Result<String, crate::BackendError> {
+/// A percent-encoded value that must be UTF-8 text.
+fn percent_decode_text(text: &str) -> Result<String, crate::BackendError> {
+    String::from_utf8(percent_decode(text, false)?)
+        .map_err(|_| invalid("magnet link text is not valid UTF-8"))
+}
+
+fn percent_decode(text: &str, plus_is_space: bool) -> Result<Vec<u8>, crate::BackendError> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -206,7 +221,7 @@ fn percent_decode(text: &str, plus_is_space: bool) -> Result<String, crate::Back
             }
         }
     }
-    String::from_utf8(out).map_err(|_| invalid("magnet link text is not valid UTF-8"))
+    Ok(out)
 }
 
 fn percent_encode(text: &str) -> String {
@@ -227,6 +242,17 @@ fn invalid(message: &str) -> crate::BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_names_and_trackers_that_are_not_utf_8() {
+        let link = MagnetLink::parse(
+            "magnet:?xt=urn:btih:0101010101010101010101010101010101010101&dn=Caf%E9\
+             &tr=http%3A%2F%2Fbad%FF%2Fannounce&tr=http%3A%2F%2Fgood%2Fannounce",
+        )
+        .unwrap();
+        assert_eq!(link.name(), Some("Caf\u{fffd}"));
+        assert_eq!(link.trackers(), ["http://good/announce"]);
+    }
 
     #[test]
     fn parses_hex_magnets_with_name_and_trackers() {

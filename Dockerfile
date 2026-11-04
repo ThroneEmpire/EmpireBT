@@ -20,7 +20,8 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p empirebt-console \
- && install -D target/release/empirebt /out/usr/local/bin/empirebt
+ && install -D target/release/empirebt /out/usr/local/bin/empirebt \
+ && install -D -m 0644 -t /out/usr/share/doc/empirebt LICENSE THIRD_PARTY_NOTICES.md
 
 # Where settings, the session, and downloads go: writable by whichever user
 # the container runs as (see `user:` in docker-compose.yml).
@@ -30,6 +31,7 @@ RUN mkdir -p /out/data /out/downloads && chmod 0777 /out/data /out/downloads
 FROM busybox:1.37 AS prebuilt
 ARG TARGETARCH
 COPY dist/${TARGETARCH}/empirebt /out/usr/local/bin/empirebt
+COPY LICENSE THIRD_PARTY_NOTICES.md /out/usr/share/doc/empirebt/
 RUN chmod 0755 /out/usr/local/bin/empirebt \
  && mkdir -p /out/data /out/downloads && chmod 0777 /out/data /out/downloads
 
