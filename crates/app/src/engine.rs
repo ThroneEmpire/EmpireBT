@@ -26,6 +26,11 @@ const NOTICES_KEPT: usize = 20;
 /// How long quitting waits for transfers to stop and for best-effort
 /// `stopped` announces to reach trackers.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// How long quitting waits for transfers to stop and trackers to hear
+/// `stopped`: the seed announcer gives trackers 5 s (libtorrent's
+/// `stop_tracker_timeout`), and a little more covers the rest. Docker
+/// allows 30 s before it kills the process.
+const EXIT_GRACE: Duration = Duration::from_secs(6);
 /// How long a port change waits on the spot for the old sockets to close,
 /// so it usually shows when the command returns; past that, the engine
 /// finishes it in the background and keeps answering meanwhile.
@@ -1398,7 +1403,7 @@ impl Engine {
         if let Some(rebind) = self.rebinding.take() {
             services.extend(rebind.services);
         }
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        let deadline = Instant::now() + EXIT_GRACE;
         while Instant::now() < deadline
             && (jobs
                 .iter()
@@ -1417,10 +1422,9 @@ impl Engine {
         // Removed torrents' files go even if a transfer is slow to stop.
         self.delete_removed_files(true);
         self.save();
-        // Saves known nodes so the next run joins the DHT quickly.
-        if let Some(dht) = self.client.dht() {
-            dht.stop();
-        }
+        // Last, the sockets: the DHT saves its known nodes so the next run
+        // joins quickly.
+        self.stop_networking();
         tracing::info!(target: "engine", "stopped");
     }
 
@@ -1595,18 +1599,7 @@ impl Engine {
             return;
         };
         self.client.set_runtime(None);
-        if let Some(lsd) = self.client.lsd() {
-            lsd.stop();
-        }
-        self.client.set_lsd(None);
-        if let Some(utp) = self.client.utp() {
-            utp.stop();
-        }
-        self.client.set_utp(None);
-        if let Some(dht) = self.client.dht() {
-            dht.stop();
-        }
-        self.client.set_dht(None);
+        self.stop_networking();
 
         tracing::debug!(
             target: "port",
@@ -1628,6 +1621,23 @@ impl Engine {
         self.seeding.left_out = left_out;
         self.session_dirty = true;
         self.notify(Level::Info, notice);
+    }
+
+    /// Stops local discovery, uTP, and the DHT, and lets go of them: on a
+    /// port move before starting them again, and when quitting.
+    fn stop_networking(&mut self) {
+        if let Some(lsd) = self.client.lsd() {
+            lsd.stop();
+        }
+        self.client.set_lsd(None);
+        if let Some(utp) = self.client.utp() {
+            utp.stop();
+        }
+        self.client.set_utp(None);
+        if let Some(dht) = self.client.dht() {
+            dht.stop();
+        }
+        self.client.set_dht(None);
     }
 
     /// Logs the seeding listener and the network interface when their

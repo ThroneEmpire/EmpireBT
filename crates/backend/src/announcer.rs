@@ -17,6 +17,9 @@ const DHT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Tracker announces running at once. Each can wait the full timeout on a
 /// dead tracker, so many must overlap to keep thousands of torrents current.
 const TRACKER_WORKERS: usize = 32;
+/// How long quitting gives trackers to hear `stopped`, all of them:
+/// libtorrent's `stop_tracker_timeout`.
+const STOP_DEADLINE: Duration = Duration::from_secs(5);
 /// DHT lookups running at once; each takes seconds on the public network.
 const DHT_WORKERS: usize = 16;
 
@@ -298,15 +301,32 @@ impl AnnounceLoop {
             self.announce_due();
             std::thread::sleep(POLL);
         }
-        // Leave every swarm; stop announces go out concurrently.
+        // Leave every swarm: `stopped` to the trackers that know us, a
+        // few dozen at a time (not a thread per torrent, which with
+        // thousands of seeds would open thousands of connections to the
+        // same trackers at once), and for a few seconds at most.
+        let deadline = Instant::now() + STOP_DEADLINE;
         let leaving: Vec<[u8; 20]> = self.entries.keys().copied().collect();
-        let mut senders = Vec::new();
-        for key in leaving {
-            senders.extend(self.remove(&key));
-        }
-        for sender in senders {
-            let _ = sender.join();
-        }
+        let stops: Vec<Stopped> = leaving.iter().filter_map(|key| self.leave(key)).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let timeout = self.timeout;
+        std::thread::scope(|scope| {
+            for _ in 0..TRACKER_WORKERS.min(stops.len()) {
+                scope.spawn(|| {
+                    while let Some((trackers, requests)) =
+                        stops.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        for request in requests {
+                            let left = deadline.saturating_duration_since(Instant::now());
+                            if left.is_zero() {
+                                return;
+                            }
+                            let _ = trackers.announce_all(request, timeout.min(left));
+                        }
+                    }
+                });
+            }
+        });
     }
 
     /// Mirrors the runtime's torrents into announce entries.
@@ -525,7 +545,21 @@ impl AnnounceLoop {
 
     /// Forgets a torrent and, if trackers knew about it, tells them we left
     /// on a background thread, which is returned.
+    /// Stops announcing a torrent that left the runtime, telling its
+    /// trackers in the background.
     fn remove(&mut self, key: &[u8; 20]) -> Option<JoinHandle<()>> {
+        let (trackers, requests) = self.leave(key)?;
+        let timeout = self.timeout;
+        Some(std::thread::spawn(move || {
+            for request in &requests {
+                let _ = trackers.announce_all(request, timeout);
+            }
+        }))
+    }
+
+    /// Forgets a torrent; returns the `stopped` announces its trackers
+    /// should get, if any heard `started`.
+    fn leave(&mut self, key: &[u8; 20]) -> Option<Stopped> {
         if let Ok(mut statuses) = self.shared.status.lock() {
             statuses.remove(key);
         }
@@ -546,14 +580,12 @@ impl AnnounceLoop {
                 )
             })
             .collect();
-        let timeout = self.timeout;
-        Some(std::thread::spawn(move || {
-            for request in &requests {
-                let _ = entry.trackers.announce_all(request, timeout);
-            }
-        }))
+        Some((entry.trackers, requests))
     }
 }
+
+/// A torrent's trackers and the `stopped` announces for them.
+type Stopped = (Arc<TrackerClient>, Vec<AnnounceRequest>);
 
 /// Announces every public seeded torrent to the DHT on a fixed interval,
 /// several lookups at a time.
@@ -910,6 +942,108 @@ mod tests {
         if let Some(thread) = announcer.stop() {
             thread.join().unwrap();
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Quitting with many seeds: `stopped` goes out a few dozen at a time,
+    /// never a thread and connection per torrent at once, and a tracker
+    /// that never answers holds the stop up for the deadline at most.
+    #[test]
+    fn leaves_many_swarms_a_few_at_a_time_and_within_the_deadline() {
+        use std::sync::atomic::AtomicUsize;
+        const TORRENTS: usize = 100;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/announce", listener.local_addr().unwrap());
+        let (started, stopping, peak) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        {
+            let (started, stopping, peak) = (
+                Arc::clone(&started),
+                Arc::clone(&stopping),
+                Arc::clone(&peak),
+            );
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let (started, stopping, peak) = (
+                        Arc::clone(&started),
+                        Arc::clone(&stopping),
+                        Arc::clone(&peak),
+                    );
+                    std::thread::spawn(move || {
+                        let mut request = [0; 2048];
+                        let size = stream.read(&mut request).unwrap_or(0);
+                        let line = String::from_utf8_lossy(&request[..size]).into_owned();
+                        if line.contains("event=stopped") {
+                            // Never answered: the announcer must not wait.
+                            let now = stopping.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_secs(30));
+                            return;
+                        }
+                        let body = b"d8:intervali900e5:peers0:e";
+                        let _ = stream.write_all(
+                            format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                                .as_bytes(),
+                        );
+                        let _ = stream.write_all(body);
+                        started.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+        let root =
+            std::env::temp_dir().join(format!("empirebt-announcer-many-{}", std::process::id()));
+        let storage = crate::Storage::new(&root).unwrap();
+        let seeders: Vec<crate::Seeder> = (0..TORRENTS)
+            .map(|index| {
+                let data = format!("seeded {index:04}").into_bytes();
+                let hash: [u8; 20] = {
+                    use sha1::{Digest, Sha1};
+                    Sha1::digest(&data).into()
+                };
+                let name = format!("seeded-{index:04}");
+                let metainfo = format!(
+                    "d8:announce{}:{url}4:infod6:lengthi{}e4:name{}:{name}12:piece lengthi16384e6:pieces20:",
+                    url.len(),
+                    data.len(),
+                    name.len()
+                );
+                let mut bytes = metainfo.into_bytes();
+                bytes.extend(hash);
+                bytes.extend(b"ee");
+                let info = crate::TorrentInfo::from_bytes(&bytes).unwrap();
+                storage.write_piece(&info, 0, &data).unwrap();
+                crate::Seeder::new(info, storage.clone(), [9; 20], Duration::from_secs(1)).unwrap()
+            })
+            .collect();
+        let runtime = Arc::new(Runtime::new(seeders, 1).unwrap());
+        // A long tracker timeout: only the deadline can end the stop early.
+        let mut announcer = SeedAnnouncer::start(7777, Duration::from_secs(30), None);
+        announcer.track(runtime);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while started.load(Ordering::SeqCst) < TORRENTS {
+            assert!(Instant::now() < deadline, "not every torrent was announced");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let stopping_at = Instant::now();
+        if let Some(thread) = announcer.stop() {
+            thread.join().unwrap();
+        }
+        let took = stopping_at.elapsed();
+        assert!(
+            took < STOP_DEADLINE + Duration::from_secs(2),
+            "took {took:?}"
+        );
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            (1..=TRACKER_WORKERS).contains(&peak),
+            "{peak} stopped announces at once"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

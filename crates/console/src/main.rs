@@ -285,7 +285,7 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             let engine = Handle::start(store.clone(), config_file, config, overridden)?;
             let mut app = App::new(engine.clone());
-            let _web = match web_settings {
+            let web = match web_settings {
                 Some(settings) => {
                     match empirebt_web::Web::start(engine.clone(), &store, settings) {
                         Ok(web) => {
@@ -300,7 +300,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
                 None => None,
             };
-            return run_dashboard(app);
+            return run_dashboard(app, web);
         }
         Command::Serve => {
             let settings = empirebt_web::WebSettings::from_config(&config_file)?;
@@ -316,7 +316,9 @@ fn run(cli: Cli) -> Result<(), String> {
             print_web_access(&web);
             println!("Press Ctrl-C to stop.");
             empirebt_web::wait_for_interrupt();
-            println!("Stopping…");
+            println!("Stopping… (press Ctrl-C again to quit at once)");
+            empirebt_web::exit_on_next_interrupt();
+            // The web UI first, so no command arrives mid-shutdown.
             web.stop();
             engine.shutdown();
             return Ok(());
@@ -906,12 +908,19 @@ fn read_secret(prompt: &str) -> Result<String, String> {
     result.map(|()| secret)
 }
 
-fn run_dashboard(mut app: App) -> Result<(), String> {
+/// Runs the dashboard until it quits, then stops the web UI (if it runs)
+/// before the engine, so no command arrives mid-shutdown.
+fn run_dashboard(mut app: App, web: Option<empirebt_web::Web>) -> Result<(), String> {
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = event_loop(&mut terminal, &mut app);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
+    println!("Stopping… (press Ctrl-C again to quit at once)");
+    empirebt_web::exit_on_next_interrupt();
+    if let Some(mut web) = web {
+        web.stop();
+    }
     app.shutdown();
     result
 }

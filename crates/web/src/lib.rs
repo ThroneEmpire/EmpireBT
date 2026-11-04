@@ -266,6 +266,18 @@ pub fn revoke_tokens(store: &Store) -> Result<usize, String> {
     Ok(count)
 }
 
+/// While a stop is under way, quits at once if asked to stop again: a
+/// second Ctrl-C ends a shutdown that takes too long, as people expect.
+/// The session was saved at the last change and its files are written
+/// atomically, so nothing breaks; trackers may just miss `stopped`.
+pub fn exit_on_next_interrupt() {
+    std::thread::spawn(|| {
+        wait_for_interrupt();
+        eprintln!("Stopped at once.");
+        std::process::exit(130);
+    });
+}
+
 /// Waits until the process is asked to stop (Ctrl-C, or SIGTERM on Unix).
 pub fn wait_for_interrupt() {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
