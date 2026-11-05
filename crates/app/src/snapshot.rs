@@ -28,9 +28,12 @@ pub struct Snapshot {
     pub network: Network,
     pub download_dir: PathBuf,
     /// Folders the web UI may save torrents in (and folders inside them):
-    /// the download directory, `storage.allowed_dirs`, and category
-    /// folders.
+    /// the download directory, `storage.allowed_dirs`, category folders,
+    /// and `storage.incomplete_dir`.
     pub allowed_dirs: Vec<PathBuf>,
+    /// `storage.incomplete_dir`, when set: where new torrents download
+    /// unless told otherwise.
+    pub incomplete_dir: Option<PathBuf>,
     /// The folder each category saves new torrents in, where it has one.
     pub category_folders: std::collections::BTreeMap<String, PathBuf>,
     /// The latest notices, oldest first.

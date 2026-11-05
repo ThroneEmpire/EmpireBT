@@ -28,8 +28,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use empirebt_app::{
-    AddRequest, AddSource, Command, ContentLayout, InfoHash, Reply, SeedStatus, Snapshot, Status,
-    TorrentView,
+    AddRequest, AddSource, Command, ContentLayout, DownloadDir, InfoHash, Reply, SeedStatus,
+    Snapshot, Status, TorrentView,
 };
 use serde_json::{Map, Value, json};
 
@@ -1366,6 +1366,18 @@ async fn add(State(state): State<Shared>, request: Request) -> Response {
         Ok(save_dir) => save_dir,
         Err(response) => return response,
     };
+    // As qBittorrent 4.4+: useDownloadPath=false downloads straight into
+    // the save folder; a downloadPath downloads there first.
+    let download_dir = match (params.get("useDownloadPath"), params.get("downloadPath")) {
+        (Some("false"), _) => DownloadDir::SaveDir,
+        (_, Some(path)) if !path.trim().is_empty() => {
+            match api::allowed_download_dir(&snapshot, Some(path)) {
+                Ok(dir) => dir,
+                Err(response) => return response,
+            }
+        }
+        _ => DownloadDir::Default,
+    };
     let start = if params.flag("stopped") || params.flag("paused") {
         Some(false)
     } else if params.get("stopped") == Some("false") || params.get("paused") == Some("false") {
@@ -1416,6 +1428,7 @@ async fn add(State(state): State<Shared>, request: Request) -> Response {
                 tags: tags.clone(),
                 start,
                 layout,
+                download_dir: download_dir.clone(),
                 ..AddRequest::new(source)
             })
         })

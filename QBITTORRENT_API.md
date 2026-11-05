@@ -38,7 +38,7 @@ refresh.
 | Transfer | `transfer/info`, `transfer/downloadLimit`, `transfer/uploadLimit`, `transfer/setDownloadLimit`, `transfer/setUploadLimit`, `transfer/speedLimitsMode` (always 0) |
 | Sync | `sync/maindata` (incremental by `rid`), `sync/torrentPeers` |
 | Torrents | `torrents/info` (with `filter`, `category`, `tag`, `hashes`, `sort`, `reverse`, `limit`, `offset`, `includeTrackers`), `properties`, `files`, `trackers`, `webseeds` |
-| Changing torrents | `add` (links, URLs, `.torrent` uploads; `savepath`, `category`, `tags`, `stopped`/`paused`, `contentLayout`), `delete` (with `deleteFiles`), `stop`/`pause`, `start`/`resume`, `recheck`, `reannounce`, `rename`, `renameFile`, `renameFolder`, `setLocation`, `setSavePath` |
+| Changing torrents | `add` (links, URLs, `.torrent` uploads; `savepath`, `category`, `tags`, `stopped`/`paused`, `contentLayout`, `useDownloadPath`, `downloadPath`), `delete` (with `deleteFiles`), `stop`/`pause`, `start`/`resume`, `recheck`, `reannounce`, `rename`, `renameFile`, `renameFolder`, `setLocation`, `setSavePath` |
 | Categories and tags | `categories`, `createCategory`, `editCategory`, `removeCategories`, `setCategory`, `tags`, `createTags`, `deleteTags`, `addTags`, `removeTags`, `setTags` |
 
 `app/setPreferences` changes the settings EmpireBT has: `listen_port`, `dht`,
@@ -64,7 +64,10 @@ incomplete folder stays there and goes to the new folder once complete, as
 in qBittorrent. `temp_path_enabled` and `temp_path` in `app/preferences`
 show `storage.incomplete_dir`, and each torrent's `download_path` shows
 where it is downloading. As with other storage settings, they can't be
-changed from here, nor can a torrent's `setDownloadPath`.
+changed from here, nor can a torrent's `setDownloadPath`. When adding,
+`useDownloadPath=false` downloads straight into the save folder, and a
+`downloadPath` (a folder the web UI may save in) downloads there first,
+whatever the setting says.
 
 Each torrent's history is real: when it was added and completed, downloaded
 and uploaded over every run and this run, ratio, time active and seeding,

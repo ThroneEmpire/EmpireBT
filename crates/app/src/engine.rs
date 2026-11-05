@@ -178,6 +178,22 @@ pub struct AddRequest {
     pub start: Option<bool>,
     /// How its files are laid out in the folder.
     pub layout: ContentLayout,
+    /// Where it downloads before going to its save folder.
+    pub download_dir: DownloadDir,
+}
+
+/// Where a torrent being added downloads, as qBittorrent's "use another
+/// path for incomplete torrents".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DownloadDir {
+    /// As `storage.incomplete_dir` says.
+    #[default]
+    Default,
+    /// Straight into its save folder.
+    SaveDir,
+    /// In this folder (a full path; `~` is expanded), moved to its save
+    /// folder once complete.
+    At(PathBuf),
 }
 
 impl AddRequest {
@@ -190,6 +206,7 @@ impl AddRequest {
             tags: Vec::new(),
             start: None,
             layout: ContentLayout::Original,
+            download_dir: DownloadDir::Default,
         }
     }
 }
@@ -202,6 +219,7 @@ struct Placement {
     tags: BTreeSet<String>,
     start: Option<bool>,
     layout: ContentLayout,
+    download_dir: DownloadDir,
 }
 
 /// What [`AddRequest`] adds.
@@ -1083,6 +1101,10 @@ impl Engine {
                         .collect::<Result<_, _>>()?,
                     start: request.start,
                     layout: request.layout,
+                    download_dir: match request.download_dir {
+                        DownloadDir::At(dir) => DownloadDir::At(save_folder(dir)?),
+                        other => other,
+                    },
                 };
                 match request.source {
                     AddSource::Link(source) => self.add(&source, placement),
@@ -1586,8 +1608,18 @@ impl Engine {
     /// Where a torrent being added downloads: in `storage.incomplete_dir`
     /// when set, unless its files are already in its save folder (it is
     /// there to seed). It goes to its save folder once complete.
-    fn place_incomplete(&mut self, index: usize, hash: InfoHash) -> Result<(), Failure> {
-        let Some(incomplete) = self.incomplete_dir() else {
+    fn place_incomplete(
+        &mut self,
+        index: usize,
+        hash: InfoHash,
+        choice: &DownloadDir,
+    ) -> Result<(), Failure> {
+        let incomplete = match choice {
+            DownloadDir::Default => self.incomplete_dir(),
+            DownloadDir::SaveDir => None,
+            DownloadDir::At(dir) => Some(dir.clone()),
+        };
+        let Some(incomplete) = incomplete else {
             return Ok(());
         };
         let (save_dir, files) = self.relative_files(index);
@@ -1706,7 +1738,9 @@ impl Engine {
             allowed_dirs: std::iter::once(self.client.config().download_directory().to_owned())
                 .chain(self.config.allowed_dirs())
                 .chain(self.labels.folders.values().cloned())
+                .chain(self.incomplete_dir())
                 .collect(),
+            incomplete_dir: self.incomplete_dir(),
             category_folders: self.labels.folders.clone(),
             notices: self.notices.iter().cloned().collect(),
             settings,
@@ -2463,7 +2497,7 @@ impl Engine {
                 .set_content_layout(index, placement.layout)
                 .map_err(|error| Failure::new(error.to_string()))?;
         }
-        self.place_incomplete(index, hash)?;
+        self.place_incomplete(index, hash, &placement.download_dir)?;
         self.session_dirty = true;
         self.stats.added(hash, crate::stats::now());
         self.save_stats();
@@ -4907,6 +4941,65 @@ mod tests {
         );
         leech.shutdown();
         seed.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Each torrent can choose where it downloads: as the setting says,
+    /// straight into its save folder, or a folder of its own.
+    #[test]
+    fn a_torrent_added_can_choose_where_it_downloads() {
+        let (handle, root) = engine("download-dir");
+        let incomplete = root.join("incomplete");
+        handle_ok(
+            &handle,
+            Command::ChangeSetting {
+                key: "storage.incomplete_dir".to_owned(),
+                value: incomplete.display().to_string(),
+            },
+        );
+        let add = |byte: u8, choice: DownloadDir| {
+            let (link, hash) = magnet(byte);
+            let mut request = AddRequest::new(AddSource::Link(link));
+            request.save_dir = Some(root.join("done"));
+            request.download_dir = choice;
+            handle_ok(&handle, Command::AddWith(request));
+            handle.snapshot().torrent(&hash).unwrap().clone()
+        };
+        let default = add(21, DownloadDir::Default);
+        assert_eq!(
+            (default.save_dir, default.complete_dir),
+            (incomplete.clone(), Some(root.join("done")))
+        );
+        let straight = add(22, DownloadDir::SaveDir);
+        assert_eq!(
+            (straight.save_dir, straight.complete_dir),
+            (root.join("done"), None)
+        );
+        let own = add(23, DownloadDir::At(root.join("scratch")));
+        assert_eq!(
+            (own.save_dir, own.complete_dir),
+            (root.join("scratch"), Some(root.join("done")))
+        );
+        // Without the setting, a folder of its own still works.
+        handle_ok(
+            &handle,
+            Command::ChangeSetting {
+                key: "storage.incomplete_dir".to_owned(),
+                value: String::new(),
+            },
+        );
+        let plain = add(24, DownloadDir::Default);
+        assert_eq!(
+            (plain.save_dir, plain.complete_dir),
+            (root.join("done"), None)
+        );
+        let own = add(25, DownloadDir::At(root.join("scratch")));
+        assert_eq!(own.save_dir, root.join("scratch"));
+        let (link, _) = magnet(26);
+        let mut request = AddRequest::new(AddSource::Link(link));
+        request.download_dir = DownloadDir::At(PathBuf::from("relative"));
+        assert!(handle.call(Command::AddWith(request)).is_err());
+        handle.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }
 }

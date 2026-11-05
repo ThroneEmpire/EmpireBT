@@ -33,8 +33,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use empirebt_app::{
-    AddRequest, AddSource, Command, ContentLayout, Handle, InfoHash, Level, SeedStatus, Snapshot,
-    TorrentView,
+    AddRequest, AddSource, Command, ContentLayout, DownloadDir, Handle, InfoHash, Level,
+    SeedStatus, Snapshot, TorrentView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -627,6 +627,8 @@ fn lists_json(snapshot: &Snapshot) -> serde_json::Value {
             .iter()
             .map(|dir| dir.to_string_lossy())
             .collect::<Vec<_>>(),
+        // Where new torrents download first unless told otherwise.
+        "incompleteDir": snapshot.incomplete_dir.as_ref().map(|dir| dir.to_string_lossy()),
     })
 }
 
@@ -972,6 +974,10 @@ struct Add {
     #[serde(default)]
     tags: Vec<String>,
     layout: Option<String>,
+    /// Where it downloads first: missing or null follows
+    /// `storage.incomplete_dir`, empty is straight into its save folder.
+    #[serde(rename = "downloadPath")]
+    download_path: Option<String>,
 }
 
 /// `original` (or nothing), `subfolder`, or `nosubfolder`.
@@ -997,6 +1003,26 @@ struct UploadOptions {
     category: Option<String>,
     tags: Option<String>,
     layout: Option<String>,
+    #[serde(rename = "downloadPath")]
+    download_path: Option<String>,
+}
+
+/// Where a browser asked a torrent to download before its save folder:
+/// unset follows `storage.incomplete_dir`, empty is straight into the
+/// save folder, else a folder it may save in.
+#[allow(clippy::result_large_err)]
+pub(crate) fn allowed_download_dir(
+    snapshot: &Snapshot,
+    text: Option<&str>,
+) -> Result<DownloadDir, Response> {
+    match text.map(str::trim) {
+        None => Ok(DownloadDir::Default),
+        Some("") => Ok(DownloadDir::SaveDir),
+        Some(text) => {
+            Ok(allowed_save_dir(snapshot, Some(text))?
+                .map_or(DownloadDir::SaveDir, DownloadDir::At))
+        }
+    }
 }
 
 /// The folder a browser asked to save a torrent in, if it may: the
@@ -1040,10 +1066,12 @@ async fn add_to(
     category: Option<String>,
     tags: Vec<String>,
     layout: ContentLayout,
+    download_dir: DownloadDir,
 ) -> Response {
     let request = AddRequest {
         save_dir,
         layout,
+        download_dir,
         category: category.filter(|name| !name.trim().is_empty()),
         tags: tags
             .into_iter()
@@ -1074,6 +1102,11 @@ async fn add(State(state): State<Shared>, axum::Json(add): axum::Json<Add>) -> R
         Ok(layout) => layout,
         Err(response) => return response,
     };
+    let download_dir =
+        match allowed_download_dir(&state.engine.snapshot(), add.download_path.as_deref()) {
+            Ok(dir) => dir,
+            Err(response) => return response,
+        };
     add_to(
         &state,
         AddSource::Link(source.to_owned()),
@@ -1081,6 +1114,7 @@ async fn add(State(state): State<Shared>, axum::Json(add): axum::Json<Add>) -> R
         add.category,
         add.tags,
         layout,
+        download_dir,
     )
     .await
 }
@@ -1098,6 +1132,11 @@ async fn upload(
         Ok(layout) => layout,
         Err(response) => return response,
     };
+    let download_dir =
+        match allowed_download_dir(&state.engine.snapshot(), options.download_path.as_deref()) {
+            Ok(dir) => dir,
+            Err(response) => return response,
+        };
     let tags = options
         .tags
         .unwrap_or_default()
@@ -1111,6 +1150,7 @@ async fn upload(
         options.category,
         tags,
         layout,
+        download_dir,
     )
     .await
 }
@@ -1417,6 +1457,7 @@ mod tests {
             },
             download_dir: "/data".into(),
             allowed_dirs: vec!["/data".into(), "/media/films".into()],
+            incomplete_dir: None,
             category_folders: Default::default(),
             notices: Vec::new(),
             settings: Vec::new(),

@@ -1171,6 +1171,44 @@ fn answers_programs_made_for_qbittorrent() {
     assert_eq!(list[0]["name"], "a.txt", "sorted by name");
     assert_eq!(files_of(&uploaded)[0]["name"], "a.txt");
 
+    // A download folder of its own, as qui's add dialog sends it: only one
+    // the web UI may save in.
+    let refused = qbit(
+        &running,
+        &cookie,
+        "/api/v2/torrents/add",
+        "urls=magnet:?xt=urn:btih:0202020202020202020202020202020202020202%26dn=elsewhere&useDownloadPath=true&downloadPath=/etc&stopped=true",
+    );
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    let scratch = running.root.join("downloads/scratch");
+    let added = qbit(
+        &running,
+        &cookie,
+        "/api/v2/torrents/add",
+        &format!(
+            "urls=magnet:?xt=urn:btih:0202020202020202020202020202020202020202%26dn=elsewhere&useDownloadPath=true&downloadPath={}&stopped=true",
+            scratch.display()
+        ),
+    );
+    assert_eq!((added.status, added.body.as_str()), (200, "Ok."));
+    let info = qbit_get(
+        &running,
+        &cookie,
+        "/api/v2/torrents/info?hashes=0202020202020202020202020202020202020202",
+    )
+    .json();
+    assert_eq!(info[0]["download_path"], scratch.display().to_string());
+    assert_eq!(
+        info[0]["save_path"],
+        running.root.join("downloads").display().to_string()
+    );
+    qbit(
+        &running,
+        &cookie,
+        "/api/v2/torrents/delete",
+        "hashes=0202020202020202020202020202020202020202&deleteFiles=false",
+    );
+
     // Set location: only to folders the web UI may save in.
     let elsewhere = running.root.join("downloads/elsewhere");
     let moved = qbit(

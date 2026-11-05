@@ -72,8 +72,8 @@ for the right password.
 | `GET /api/session` | | `{"signedIn": true}`, or `401` |
 | `GET /api/state` | | Everything, see [State](#state) |
 | `GET /api/events` | | Live updates, see [Live updates](#live-updates) |
-| `POST /api/torrents` | `{"source": "magnet:…"}` or an `http(s)://` URL of a `.torrent` file; optionally `"savePath"`, `"category"`, `"tags": [...]`, `"layout"` | `{"added": hash}`, or `202 {"fetching": true}` for URLs |
-| `POST /api/torrents/upload?savePath=…&category=…&tags=a,b&layout=…` | the `.torrent` file's bytes (each query value optional, URL-encoded) | `{"added": hash}` |
+| `POST /api/torrents` | `{"source": "magnet:…"}` or an `http(s)://` URL of a `.torrent` file; optionally `"savePath"`, `"category"`, `"tags": [...]`, `"layout"`, `"downloadPath"` | `{"added": hash}`, or `202 {"fetching": true}` for URLs |
+| `POST /api/torrents/upload?savePath=…&category=…&tags=a,b&layout=…&downloadPath=…` | the `.torrent` file's bytes (each query value optional, URL-encoded) | `{"added": hash}` |
 | `GET /api/torrents/{hash}` | | [Details](#details) |
 | `GET /api/torrents/{hash}/peers` | | [Peers](#peers) |
 | `POST /api/torrents/{hash}/start` | | `204` |
@@ -107,6 +107,12 @@ and answers `403` for anything else, including paths with `..`:
 - category folders (all of these appear as `lists.saveDirs` in the
   state);
 - any folder inside one of those.
+
+`downloadPath` picks where a new torrent downloads before it moves to
+its save folder once complete. Leave it out to follow
+`storage.incomplete_dir` (`lists.incompleteDir` in the state), give `""`
+to download straight into the save folder, or a folder, which must be
+one the API may save in (the incomplete folder counts as one).
 
 `layout` places a new torrent's files: `original` (the default, as the
 torrent has them), `subfolder` (a single file goes in a folder named after

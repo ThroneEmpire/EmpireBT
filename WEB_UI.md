@@ -4,7 +4,9 @@ A browser interface to the same engine the terminal dashboard drives,
 served from inside EmpireBT. The code is in `crates/web`; the browser files
 (`crates/web/assets`) are built into the binary.
 
-When adding torrents you can choose their category, tags and folder.
+When adding torrents you can choose their category, tags and folder, and
+whether they download in another folder first (moved to their folder once
+complete): on, in `storage.incomplete_dir`, when that is set.
 Categories can have a folder of their own: give one when creating the
 category, or with ✎ next to it. New torrents in that category are then
 saved there unless you pick another folder. The web UI saves only in the

@@ -18,7 +18,7 @@ mod stats;
 pub mod store;
 
 pub use empirebt_backend::ContentLayout;
-pub use engine::{AddRequest, AddSource, Command, Failure, Handle, Reply};
+pub use engine::{AddRequest, AddSource, Command, DownloadDir, Failure, Handle, Reply};
 pub use geoip::ATTRIBUTION as GEOIP_ATTRIBUTION;
 
 /// The program's copyright notice, shown in its interfaces (the GPL's

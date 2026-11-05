@@ -1560,6 +1560,27 @@ function addDialog() {
   const categories = element("datalist", { attrs: { id: "add-categories" } },
     ui.lists.categories.map((name) => element("option", { attrs: { value: name } })));
   const tags = element("input", { attrs: { type: "text", placeholder: "none, or several separated by commas" } });
+  // Downloading in another folder first, moved to "Save in" once complete;
+  // on, and in storage.incomplete_dir, when that is set.
+  const incompleteDir = ui.lists.incompleteDir || "";
+  const useDownloadDir = element("input", { class: "switch on-accent", attrs: { type: "checkbox" } });
+  useDownloadDir.checked = Boolean(incompleteDir);
+  const downloadTo = element("input", {
+    attrs: {
+      type: "text",
+      list: "save-folders",
+      value: incompleteDir,
+      placeholder: "a folder to download in",
+      spellcheck: "false",
+      autocapitalize: "off",
+      autocorrect: "off",
+    },
+  });
+  downloadTo.hidden = !useDownloadDir.checked;
+  useDownloadDir.addEventListener("change", () => {
+    downloadTo.hidden = !useDownloadDir.checked;
+    if (useDownloadDir.checked && !narrow.matches) downloadTo.focus();
+  });
   const layout = element("select", {}, [
     ["original", "As the torrent has it"],
     ["subfolder", "In a folder of its own"],
@@ -1585,6 +1606,8 @@ function addDialog() {
     saveTo,
     suggestions,
     element("p", { class: "muted", text: "The download folder, a folder inside it, a category's folder, or one set in storage.allowed_dirs." }),
+    element("label", { class: "switch-row" }, [element("span", { text: "Download in another folder first" }), useDownloadDir]),
+    downloadTo,
     element("label", { text: "Content layout" }),
     layout,
     element("p", { class: "muted", text: "A single file can go in a folder named after it; a torrent's files can go straight in the save folder." }),
@@ -1596,10 +1619,13 @@ function addDialog() {
     const chosenCategory = category.value.trim() || undefined;
     const chosenTags = tags.value.split(",").map((tag) => tag.trim()).filter(Boolean);
     const chosenLayout = layout.value === "original" ? undefined : layout.value;
+    // "" downloads straight into the save folder; unset follows the setting.
+    const downloadPath = useDownloadDir.checked ? (downloadTo.value.trim() || undefined) : "";
     for (const line of lines) {
-      await api("/api/torrents", { method: "POST", body: { source: line, savePath, category: chosenCategory, tags: chosenTags, layout: chosenLayout } });
+      await api("/api/torrents", { method: "POST", body: { source: line, savePath, category: chosenCategory, tags: chosenTags, layout: chosenLayout, downloadPath } });
     }
     const query = new URLSearchParams();
+    if (downloadPath !== undefined) query.set("downloadPath", downloadPath);
     if (chosenLayout) query.set("layout", chosenLayout);
     if (savePath) query.set("savePath", savePath);
     if (chosenCategory) query.set("category", chosenCategory);

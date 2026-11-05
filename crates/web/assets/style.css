@@ -790,6 +790,7 @@ input.switch::after {
 input.switch:checked::after { transform: translateX(18px); }
 /* Deleting files is the dangerous choice, so its switch turns red. */
 input.switch:checked { background: var(--bad); }
+input.switch.on-accent:checked { background: var(--accent); }
 /* The whole row toggles, a large target for a finger. */
 .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; cursor: pointer; font-size: 15px; color: var(--text); }
 
