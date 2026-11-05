@@ -1438,6 +1438,39 @@ mod tests {
             .join("\n")
     }
 
+    /// In a window too short for every setting, the list scrolls with the
+    /// selection: the last one can be reached and seen, and the first again.
+    #[test]
+    fn settings_scroll_in_a_short_window() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-console-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = dashboard(&root);
+        press(&mut app, "c");
+        assert!(matches!(app.mode, Mode::Settings { .. }));
+        let keys: Vec<&str> = app.settings().iter().map(|item| item.setting.key).collect();
+        let (first, last) = (keys[0].to_owned(), keys[keys.len() - 1].to_owned());
+        assert!(keys.len() > 12, "enough settings to need scrolling");
+
+        let drawn = screen(&mut app, 100, 20);
+        assert!(drawn.contains(&first), "{drawn}");
+        assert!(!drawn.contains(&last), "it does not all fit: {drawn}");
+        press(&mut app, "G");
+        let drawn = screen(&mut app, 100, 20);
+        assert!(
+            drawn.contains(&last),
+            "the last setting comes into view: {drawn}"
+        );
+        assert!(!drawn.contains(&first), "{drawn}");
+        press(&mut app, "g");
+        let drawn = screen(&mut app, 100, 20);
+        assert!(drawn.contains(&first), "{drawn}");
+        // Tall enough, everything shows.
+        let drawn = screen(&mut app, 100, 60);
+        assert!(drawn.contains(&first) && drawn.contains(&last), "{drawn}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn tags_categories_and_filters_from_the_keyboard() {
         let root =

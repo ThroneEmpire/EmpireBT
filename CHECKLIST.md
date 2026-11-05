@@ -371,6 +371,7 @@ This checklist tracks backend, console, and web UI work.
 - [x] Add a full-screen dashboard with detail tabs and dialogs
 - [x] Add download directory and listen-port flags
 - [x] Add clear exit codes and command help
+- [x] The settings dialog scrolls (2026-11-05, reported: in a window shorter than the list, settings at the bottom could not be seen or reached): the list takes the room left, keeps the selection in view (near the middle), and shows a scrollbar when it does not all fit. Test: a 100×20 terminal shows the first setting, `G` brings the last into view, `g` the first again
 
 ## Quality and release
 

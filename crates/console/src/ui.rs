@@ -10,7 +10,10 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Clear, Padding, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Cell, Clear, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, Wrap,
+};
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
@@ -1582,8 +1585,9 @@ fn draw_settings(frame: &mut Frame, app: &App) {
     let field_height = if editing.is_some() { 3 } else { 0 };
     let height = settings.len() as u16 + 10 + field_height + u16::from(error.is_some());
     let inner = dialog(frame, "Settings", 92, height);
+    // The list takes the room left over; in a short window it scrolls.
     let [list, _, about, field, error_area, hint] = Layout::vertical([
-        Constraint::Length(settings.len() as u16),
+        Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Length(field_height),
@@ -1631,7 +1635,29 @@ fn draw_settings(frame: &mut Frame, app: &App) {
             }
         })
         .collect();
-    frame.render_widget(Paragraph::new(rows), list);
+    // The selected setting stays in view, near the middle when it can.
+    let visible = list.height as usize;
+    let offset = if settings.len() > visible {
+        selected
+            .saturating_sub(visible / 2)
+            .min(settings.len() - visible)
+    } else {
+        0
+    };
+    let shown: Vec<Line> = rows.into_iter().skip(offset).take(visible).collect();
+    frame.render_widget(Paragraph::new(shown), list);
+    if settings.len() > visible {
+        let mut state = ScrollbarState::new(settings.len() - visible).position(offset);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::new().fg(ACCENT))
+                .track_style(Style::new().fg(MUTED)),
+            list,
+            &mut state,
+        );
+    }
 
     let mut description = vec![Span::raw(setting.description)];
     if setting.needs_restart {
