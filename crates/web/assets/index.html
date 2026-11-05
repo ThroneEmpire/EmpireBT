@@ -38,6 +38,7 @@
     <symbol id="i-empty" viewBox="0 0 24 24"><path d="M3 13h5l1 3h6l1-3h5M5.5 5h13L21 13v6H3v-6z"/></symbol>
     <symbol id="i-rename" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6.2 7.6V19l-3.6 1.6v-8z"/></symbol>
     <symbol id="i-cards" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="7" rx="2"/><rect x="3.5" y="13" width="17" height="7" rx="2"/></symbol>
     <symbol id="i-table" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
   </svg>
@@ -69,8 +70,19 @@
       </div>
     </header>
 
-    <aside class="side">
-      <nav class="filters" id="side" aria-label="Filters"></nav>
+    <div class="scrim" id="scrim"></div>
+    <aside class="side" id="drawer">
+      <div class="side-head">
+        <h2>Filters</h2>
+        <button type="button" class="icon-button" id="drawer-close" aria-label="Close filters" title="Close"><svg class="icon"><use href="#i-close"/></svg></button>
+      </div>
+      <nav class="filters" aria-label="Filters">
+        <label class="filter-search">
+          <svg class="icon"><use href="#i-search"/></svg>
+          <input id="filter-search" type="search" placeholder="Find a category or tag" aria-label="Find a category or tag" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+        </label>
+        <div id="side"></div>
+      </nav>
       <section class="transfer" aria-label="Transfer">
         <div class="transfer-rates">
           <div><span class="transfer-label">Download</span><strong class="down" id="graph-down">0 B/s</strong></div>
@@ -92,6 +104,7 @@
 
     <section class="list">
       <div class="toolbar">
+        <button type="button" class="filters-button" id="filters-button" aria-label="Filters"><svg class="icon"><use href="#i-filter"/></svg><span>Filters</span><span class="badge" id="filters-badge"></span></button>
         <label class="search">
           <svg class="icon"><use href="#i-search"/></svg>
           <input id="search" type="search" placeholder="Search" aria-label="Search names" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
@@ -117,6 +130,7 @@
           <button type="button" data-view="table" title="Table" aria-label="Show as a table"><svg class="icon"><use href="#i-table"/></svg></button>
         </div>
       </div>
+      <div id="filter-bar" class="filter-bar" role="status" hidden></div>
       <div class="table-wrap" id="table-wrap">
         <div class="rows-head" role="row">
           <button class="cell name" data-sort="name">Name</button>

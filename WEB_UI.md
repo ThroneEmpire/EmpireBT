@@ -15,12 +15,18 @@ session can't write outside those folders.
 It shows every torrent with live progress and speeds, as cards (name and
 status, a progress bar, then size, speeds, time left, peers and ratio) or,
 with the switch above the list, as a compact table sorted by any column.
-It filters by status, category, and tag, and has detail tabs for the
-overview, files, peers, and trackers. Under the filters, a transfer panel
+It filters by status, category, and tag: click one to show only those
+(✓), again to hide them (−, struck through), again to clear it. Several
+can be on at once: within a group a torrent needs any one of those shown
+(ISOs or Films), across groups all of them (ISOs or Films, tagged linux,
+not tagged old), and "All" clears every filter. While any is on, a bar above the list names each one, with an × to drop it, says how many torrents match, and has a Clear filters button. The box above the filters
+finds a category or tag by name. It has detail tabs for the overview,
+files, peers, and trackers. Under the filters, a transfer panel
 shows the current speeds, a graph of the last three minutes, and what
 moved this run and over all time, with the overall ratio. It works on
-phones: torrents are always cards there, filters a row of chips, and
-details a full-screen sheet.
+phones: torrents are always cards there; the Filters button above the
+list (with a count of filters on) opens the filters and the transfer panel
+in a drawer from the left; and details are a full-screen sheet.
 Under Settings → Appearance you choose the theme (system, dark, or light)
 and an accent color (indigo by default, plain, a preset, or any color);
 the choice, like cards or table, is saved in that browser only.

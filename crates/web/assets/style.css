@@ -288,13 +288,23 @@ code { background: var(--surface-3); padding: 1px 6px; border-radius: 5px; font-
   color: var(--faint);
   margin: 16px 4px 4px 10px;
 }
+/* Typing narrows the category and tag lists. */
+.filter-search { position: sticky; top: -8px; z-index: 1; display: flex; align-items: center; margin: -8px -8px 4px; padding: 8px 8px 6px; background: var(--surface); }
+.filter-search .icon { position: absolute; left: 19px; width: 15px; height: 15px; color: var(--faint); pointer-events: none; }
+.filter-search input { padding: 7px 10px 7px 31px; font-size: 13px; border-radius: 9px; }
 .filters ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
 .filters li { display: flex; align-items: center; border-radius: 9px; transition: background-color 0.15s; }
-.filters li.active { background: var(--accent-soft); }
+/* Shown only (✓), or hidden (−, struck through, in red). */
+.filters li.included { background: var(--accent-soft); }
+.filters li.excluded { background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.filters .mark { width: 12px; flex: none; font-weight: 700; text-align: center; }
+.filters li.included .mark { color: var(--accent); }
+.filters li.excluded .mark, .filters li.excluded .filter { color: var(--bad); }
+.filters li.excluded .label { text-decoration: line-through; text-decoration-thickness: 1.5px; }
 .filters .filter {
   flex: 1;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: flex-start;
+  gap: 6px;
   background: none;
   text-align: left;
   padding: 8px 10px;
@@ -305,8 +315,9 @@ code { background: var(--surface-3); padding: 1px 6px; border-radius: 5px; font-
   color: var(--muted);
 }
 .filters .filter:active:not(:disabled) { transform: none; background: var(--surface-3); }
-.filters .filter .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.filters li.active .filter { color: var(--accent); font-weight: 600; }
+.filters .filter .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; text-align: left; }
+.filters li.included .filter { color: var(--accent); font-weight: 600; }
+.filters li.excluded .filter { font-weight: 600; }
 .filters .count {
   color: var(--faint);
   font-size: 11px;
@@ -318,12 +329,13 @@ code { background: var(--surface-3); padding: 1px 6px; border-radius: 5px; font-
   min-width: 22px;
   text-align: center;
 }
-.filters li.active .count { color: var(--accent-text); background: var(--accent); }
+.filters li.included .count { color: var(--accent-text); background: var(--accent); }
+.filters li.excluded .count { color: #fff; background: var(--bad); }
 .filters .add, .filters .remove, .filters .edit { background: none; color: var(--faint); padding: 2px 6px; font-size: 15px; }
 .filters .remove, .filters .edit { opacity: 0; }
-.filters li.active .remove, .filters .remove:focus-visible, .filters li.active .edit, .filters .edit:focus-visible { opacity: 1; }
+.filters li.included .remove, .filters .remove:focus-visible, .filters li.included .edit, .filters .edit:focus-visible { opacity: 1; }
 @media (hover: hover) {
-  .filters li:not(.active):hover { background: var(--surface-2); }
+  .filters li:not(.included):not(.excluded):hover { background: var(--surface-2); }
   .filters .filter:hover:not(:disabled), .filters .add:hover, .filters .remove:hover, .filters .edit:hover { background: none; color: var(--text); }
   .filters li:hover .remove, .filters li:hover .edit { opacity: 1; }
 }
@@ -363,9 +375,50 @@ code { background: var(--surface-3); padding: 1px 6px; border-radius: 5px; font-
 .sort select { appearance: none; -webkit-appearance: none; padding-left: 34px; padding-right: 14px; width: auto; background: var(--surface); box-shadow: var(--card-shadow); border-radius: 999px; }
 .shown { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; margin-left: auto; white-space: nowrap; }
 .view-toggle { flex: none; background: var(--surface); box-shadow: var(--card-shadow); }
+/* Phones only: the drawer's button, heading and backdrop. */
+.filters-button, .side-head, .scrim { display: none; }
 .view-toggle button { padding: 5px 9px; }
 .view-toggle .icon { width: 16px; height: 16px; }
 .table-wrap { overflow: auto; flex: 1; overscroll-behavior: contain; padding: 2px 2px 8px; }
+
+/* Which filters are on, above the list, with a way out. */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+  margin: 0 2px 10px;
+  padding: 8px 8px 8px 14px;
+  border-radius: var(--radius-big);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
+  animation: fade 0.2s ease-out;
+}
+.filter-bar-title { font-weight: 600; font-size: 13px; color: var(--accent); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.filter-chips { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; min-width: 0; }
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 3px 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--surface);
+  color: var(--accent);
+  max-width: 100%;
+}
+.filter-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filter-chip.excluded { color: var(--bad); }
+.filter-chip.excluded span { text-decoration: line-through; text-decoration-thickness: 1.5px; }
+.chip-close { padding: 3px; border-radius: 50%; background: none; color: inherit; }
+.chip-close .icon { width: 13px; height: 13px; stroke-width: 2.6; }
+.filter-clear { flex: none; padding: 6px 12px 6px 9px; border-radius: 999px; background: var(--accent); color: var(--accent-text); font-size: 13px; font-weight: 600; }
+.filter-clear .icon { width: 15px; height: 15px; stroke-width: 2.6; }
+@media (hover: hover) {
+  .chip-close:hover:not(:disabled) { background: var(--surface-2); }
+  .filter-clear:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 86%, white); }
+}
 
 /* ----- the list as a table ----- */
 
@@ -784,8 +837,8 @@ input.switch:checked { background: var(--bad); }
 
   .app {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto auto minmax(0, 1fr);
-    grid-template-areas: "top" "side" "list";
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-areas: "top" "list";
     gap: 0;
     padding: 0;
   }
@@ -810,41 +863,58 @@ input.switch:checked { background: var(--bad); }
     color: var(--faint);
   }
 
-  /* Filters become a row of chips that scrolls sideways; the speeds are
-     in the header, so the transfer panel stays on bigger screens. */
-  .side { display: block; }
-  .transfer { display: none; }
-  .filters {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    overflow-x: auto;
-    overflow-y: hidden;
-    padding: 2px max(14px, env(safe-area-inset-left)) 8px;
-    background: none;
-    box-shadow: none;
-    border-radius: 0;
-    scrollbar-width: none;
+  /* Filters and the transfer panel live in a drawer that slides in from
+     the left, opened by the Filters button above the list. */
+  .side {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 6;
+    width: min(88vw, 360px);
+    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+    background: var(--bg);
+    box-shadow: 10px 0 40px rgb(0 0 0 / 0.35);
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition: transform 0.36s var(--spring), visibility 0s linear 0.36s;
   }
-  .filters::-webkit-scrollbar, .network::-webkit-scrollbar { display: none; }
-  .filters h2 { display: contents; }
-  .filters h2 > span { display: none; }
-  .filters ul { display: contents; }
-  .filters li { flex: none; border-radius: 999px; background: var(--surface); box-shadow: var(--card-shadow); }
-  .filters li.active { background: var(--accent); }
-  .filters li.active .filter, .filters li.active .remove { color: var(--accent-text); }
-  .filters li.active .count { color: var(--accent); background: var(--accent-text); }
-  .filters .filter { padding: 7px 12px 7px 14px; border-radius: 999px; gap: 6px; color: var(--text); font-size: 14px; }
-  .filters .remove, .filters .edit { display: none; padding: 0 10px 0 0; }
-  .filters li.active .remove, .filters li.active .edit { display: inline-flex; }
-  .filters li.active .edit { color: var(--accent-text); }
-  .filters .add { flex: none; width: 34px; height: 34px; padding: 0; border-radius: 50%; background: var(--surface); color: var(--muted); }
-  .filters .group li:last-child:not(.active) { display: none; }
+  .app.side-open .side { transform: none; visibility: visible; transition: transform 0.36s var(--spring), visibility 0s; }
+  .side-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 4px 0 6px; }
+  .side-head h2 { margin: 0; font-size: 20px; letter-spacing: -0.02em; }
+  .scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 5;
+    background: rgb(0 0 0 / 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s;
+  }
+  .app.side-open .scrim { opacity: 1; pointer-events: auto; }
+  .filters .filter { padding: 10px 10px; font-size: 15px; }
+  .filter-search input { font-size: 16px; }
+  .filters .remove, .filters .edit { opacity: 1; padding: 6px 10px; }
+  .filters-button { display: inline-flex; flex: none; position: relative; padding: 8px 12px 8px 10px; border-radius: 999px; background: var(--surface); box-shadow: var(--card-shadow); color: var(--text); }
+  .filters-button .icon { width: 17px; height: 17px; }
+  .filters-button .badge {
+    min-width: 18px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 18px;
+    text-align: center;
+  }
+  .filters-button .badge:empty { display: none; }
+  @media (max-width: 380px) { .filters-button > span:not(.badge) { display: none; } }
 
   .toolbar { padding: 4px max(14px, env(safe-area-inset-right)) 10px max(14px, env(safe-area-inset-left)); gap: 8px; }
   .search { flex: 1; }
   .sort { display: flex; flex: none; max-width: 42%; }
   .shown, .view-toggle { display: none; }
+  .filter-bar { margin: 0 max(12px, env(safe-area-inset-right)) 10px max(12px, env(safe-area-inset-left)); }
   .table-wrap { padding: 0 max(12px, env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); }
 
   /* Cards, tighter: the name over two lines, then progress, then speeds. */

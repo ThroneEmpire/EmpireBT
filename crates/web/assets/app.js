@@ -13,7 +13,10 @@ const ui = {
   order: [], // hashes, in the order they were added
   header: null,
   lists: { categories: [], tags: [], settings: [], saveDirs: [], categoryFolders: {} },
-  filter: { kind: "all" },
+  // Per group, what to include (any of) and exclude; groups combine.
+  filters: newFilters(),
+  filterSearch: "",
+  filterBarShape: "",
   search: "",
   sort: { key: "", desc: false },
   selected: null,
@@ -33,6 +36,11 @@ const ui = {
 };
 
 const narrow = window.matchMedia("(max-width: 760px)");
+
+function newFilters() {
+  const group = () => ({ include: new Set(), exclude: new Set() });
+  return { status: group(), category: group(), tag: group() };
+}
 
 // ----- API --------------------------------------------------------------------
 
@@ -303,21 +311,30 @@ function schedule() {
 
 const ACTIVE = ["downloading", "metadata", "announcing", "checking", "waiting", "retrying", "moving"];
 
-function matches(torrent, filter) {
-  switch (filter.kind) {
-    case "status":
-      return filter.value === "active" ? ACTIVE.includes(torrent.status) : torrent.status === filter.value;
-    case "category":
-      return torrent.category === filter.value;
-    case "uncategorized":
-      return !torrent.category;
-    case "tag":
-      return torrent.tags.includes(filter.value);
-    case "untagged":
-      return torrent.tags.length === 0;
-    default:
-      return true;
+// What a torrent is, per filter group. "" stands for no category, or no
+// tags.
+function filterValues(torrent) {
+  return {
+    status: ACTIVE.includes(torrent.status) ? [torrent.status, "active"] : [torrent.status],
+    category: [torrent.category || ""],
+    tag: torrent.tags.length ? torrent.tags : [""],
+  };
+}
+
+// In every group: one of the included values, if any are, and none of the
+// excluded ones.
+function matches(torrent) {
+  const values = filterValues(torrent);
+  for (const [group, { include, exclude }] of Object.entries(ui.filters)) {
+    const own = values[group];
+    if (include.size && !own.some((value) => include.has(value))) return false;
+    if (own.some((value) => exclude.has(value))) return false;
   }
+  return true;
+}
+
+function filtering() {
+  return Object.values(ui.filters).some(({ include, exclude }) => include.size || exclude.size);
 }
 
 function render() {
@@ -331,6 +348,7 @@ function render() {
   renderHeader(ui.header);
   renderSide();
   renderRows();
+  renderFilterBar();
   renderActions();
   renderDetail(false);
 }
@@ -395,7 +413,7 @@ function sampleGraph() {
   graph.up.push(ui.header.totals.up);
   if (graph.down.length > GRAPH_POINTS) graph.down.shift();
   if (graph.up.length > GRAPH_POINTS) graph.up.shift();
-  if (!visible() || narrow.matches) return;
+  if (!visible()) return;
   // Shared scale, at least 64 KiB/s so a trickle stays a trickle.
   const top = Math.max(65536, ...graph.down, ...graph.up) * 1.1;
   const [width, height] = [180, 48];
@@ -418,16 +436,12 @@ function sampleGraph() {
 
 setInterval(sampleGraph, 1000);
 
-function filterKey(filter) {
-  return filter.value === undefined ? filter.kind : `${filter.kind}:${filter.value}`;
-}
-
 const STATUS_FILTERS = [
-  ["All", { kind: "all" }],
-  ["Active", { kind: "status", value: "active" }],
-  ["Seeding", { kind: "status", value: "seeding" }],
-  ["Paused", { kind: "status", value: "paused" }],
-  ["Errors", { kind: "status", value: "error" }],
+  ["Active", "active"],
+  ["Downloading", "downloading"],
+  ["Seeding", "seeding"],
+  ["Paused", "paused"],
+  ["Errors", "error"],
 ];
 
 // Every filter's count in one pass over the torrents.
@@ -436,46 +450,63 @@ function countFilters() {
   const bump = (key) => counts.set(key, (counts.get(key) || 0) + 1);
   for (const torrent of ui.torrents.values()) {
     bump("all");
-    if (ACTIVE.includes(torrent.status)) bump("status:active");
-    bump(`status:${torrent.status}`);
-    bump(torrent.category ? `category:${torrent.category}` : "uncategorized");
-    if (torrent.tags.length === 0) bump("untagged");
-    for (const tag of torrent.tags) bump(`tag:${tag}`);
+    for (const [group, values] of Object.entries(filterValues(torrent))) {
+      for (const value of values) bump(`${group}:${value}`);
+    }
   }
   return counts;
 }
 
+function filterState(group, value) {
+  const { include, exclude } = ui.filters[group];
+  return include.has(value) ? "included" : exclude.has(value) ? "excluded" : "";
+}
+
 function renderSide() {
   const { categories, tags } = ui.lists;
-  // A filter on something removed falls back to everything.
-  if ((ui.filter.kind === "category" && !categories.includes(ui.filter.value))
-      || (ui.filter.kind === "tag" && !tags.includes(ui.filter.value))) {
-    ui.filter = { kind: "all" };
+  // Filters on something removed go.
+  for (const [group, known] of [["category", categories], ["tag", tags]]) {
+    for (const set of Object.values(ui.filters[group])) {
+      for (const value of set) if (value !== "" && !known.includes(value)) set.delete(value);
+    }
   }
-  const shape = JSON.stringify([categories, tags, ui.lists.categoryFolders, filterKey(ui.filter)]);
+  const state = Object.entries(ui.filters).map(([group, { include, exclude }]) => [group, [...include], [...exclude]]);
+  const shape = JSON.stringify([categories, tags, ui.lists.categoryFolders, state]);
   if (shape !== ui.sideShape) {
     ui.sideShape = shape;
     buildSide(categories, tags);
+    applyFilterSearch();
   }
   const counts = countFilters();
   for (const [key, node] of ui.sideCounts) setText(node, String(counts.get(key) || 0));
 }
 
+const FILTER_HINT = "Click to show only these; again to hide them; again to clear";
+
 function buildSide(categories, tags) {
   ui.sideCounts.clear();
-  const item = (label, filter, extras = [], title = undefined) => {
+  const item = (label, group, value, extras = [], title = undefined) => {
     const count = element("span", { class: "count" });
-    ui.sideCounts.set(filterKey(filter), count);
-    const active = filterKey(filter) === filterKey(ui.filter);
-    return element("li", { class: active ? "active" : "" }, [
-      element("button", {
-        class: active ? "filter active" : "filter",
-        attrs: { "aria-pressed": String(active) },
-        on: { click: () => setFilter(filter) },
-        title,
-      }, [element("span", { class: "label", text: label }), count]),
-      ...extras,
+    const key = group ? `${group}:${value}` : "all";
+    ui.sideCounts.set(key, count);
+    const state = group ? filterState(group, value) : (filtering() ? "" : "included");
+    const mark = state === "included" ? "✓" : state === "excluded" ? "−" : "";
+    const button = element("button", {
+      class: "filter",
+      attrs: {
+        "aria-pressed": state === "included" ? "true" : state === "excluded" ? "mixed" : "false",
+        "aria-label": `${label}${state === "excluded" ? ", hidden" : state === "included" ? ", shown" : ""}`,
+      },
+      on: { click: () => (group ? cycleFilter(group, value) : clearFilters()) },
+      title: title || (group ? FILTER_HINT : "Show every torrent"),
+    }, [
+      element("span", { class: "mark", text: mark, attrs: { "aria-hidden": "true" } }),
+      element("span", { class: "label", text: label }),
+      count,
     ]);
+    const node = element("li", { class: state }, [button, ...extras]);
+    if (group === "category" || group === "tag") node.dataset.name = label.toLowerCase();
+    return node;
   };
   const folders = ui.lists.categoryFolders || {};
   const editor = (name) => element("button", {
@@ -508,26 +539,108 @@ function buildSide(categories, tags) {
   });
   const heading = (text, kind) => element("h2", {}, [element("span", { text }), adder(kind)]);
   $("#side").replaceChildren(
-    element("ul", {}, STATUS_FILTERS.map(([label, filter]) => item(label, filter))),
+    element("ul", {}, [
+      item("All", null, null),
+      ...STATUS_FILTERS.map(([label, value]) => item(label, "status", value)),
+    ]),
     heading("Categories", "category"),
     element("ul", { class: "group" }, [
-      ...categories.map((name) => item(name, { kind: "category", value: name },
+      ...categories.map((name) => item(name, "category", name,
         [editor(name), remover("category", name)],
-        folders[name] ? `Saves in ${folders[name]}` : undefined)),
-      item("No category", { kind: "uncategorized" }),
+        folders[name] ? `Saves in ${folders[name]}. ${FILTER_HINT}` : undefined)),
+      item("No category", "category", ""),
     ]),
     heading("Tags", "tag"),
     element("ul", { class: "group" }, [
-      ...tags.map((name) => item(`#${name}`, { kind: "tag", value: name }, [remover("tag", name)])),
-      item("No tags", { kind: "untagged" }),
+      ...tags.map((name) => item(`#${name}`, "tag", name, [remover("tag", name)])),
+      item("No tags", "tag", ""),
     ]),
   );
 }
 
-function setFilter(filter) {
-  ui.filter = filter;
+// Above the list while any filter is on: what each one does, each with an
+// × to drop it, how many match, and a way to clear them all.
+function renderFilterBar() {
+  const bar = $("#filter-bar");
+  const statusLabels = Object.fromEntries(STATUS_FILTERS.map(([label, value]) => [value, label]));
+  const name = (group, value) => {
+    if (group === "status") return statusLabels[value] || value;
+    if (group === "category") return value || "No category";
+    return value ? `#${value}` : "No tags";
+  };
+  const chips = [];
+  for (const [group, { include, exclude }] of Object.entries(ui.filters)) {
+    for (const value of include) chips.push([group, value, "included", name(group, value)]);
+    for (const value of exclude) chips.push([group, value, "excluded", name(group, value)]);
+  }
+  setText($("#filters-badge"), chips.length ? String(chips.length) : "");
+  const shape = JSON.stringify([chips, ui.shown.length, ui.torrents.size]);
+  if (shape === ui.filterBarShape) return;
+  ui.filterBarShape = shape;
+  bar.hidden = chips.length === 0;
+  if (!chips.length) {
+    bar.replaceChildren();
+    return;
+  }
+  const drop = (group, value) => {
+    ui.filters[group].include.delete(value);
+    ui.filters[group].exclude.delete(value);
+    schedule();
+  };
+  bar.replaceChildren(
+    element("span", { class: "filter-bar-title", text: `Filtered: ${ui.shown.length} of ${ui.torrents.size}` }),
+    element("div", { class: "filter-chips" }, chips.map(([group, value, state, label]) =>
+      element("span", { class: `filter-chip ${state}` }, [
+        element("span", { text: `${state === "included" ? "✓" : "−"} ${label}` }),
+        element("button", {
+          class: "chip-close",
+          title: `Stop filtering by ${label}`,
+          attrs: { type: "button", "aria-label": `Stop filtering by ${label}` },
+          on: { click: () => drop(group, value) },
+        }, [icon("close")]),
+      ]))),
+    element("button", {
+      class: "filter-clear",
+      attrs: { type: "button" },
+      title: "Show every torrent",
+      on: { click: clearFilters },
+    }, [icon("close"), element("span", { text: "Clear filters" })]),
+  );
+}
+
+// Off → shown only → hidden → off.
+function cycleFilter(group, value) {
+  const { include, exclude } = ui.filters[group];
+  if (include.has(value)) {
+    include.delete(value);
+    exclude.add(value);
+  } else if (exclude.has(value)) {
+    exclude.delete(value);
+  } else {
+    include.add(value);
+  }
   schedule();
 }
+
+function clearFilters() {
+  ui.filters = newFilters();
+  schedule();
+}
+
+// Narrows the category and tag lists to names containing what was typed;
+// ones in use stay, so a filter is never out of sight.
+function applyFilterSearch() {
+  const search = ui.filterSearch;
+  for (const node of document.querySelectorAll("#side li[data-name]")) {
+    const inUse = node.classList.contains("included") || node.classList.contains("excluded");
+    node.hidden = Boolean(search) && !inUse && !node.dataset.name.includes(search);
+  }
+}
+
+$("#filter-search").addEventListener("input", (event) => {
+  ui.filterSearch = event.target.value.trim().toLowerCase();
+  applyFilterSearch();
+});
 
 // One row per torrent, made once and then updated in place.
 function makeRow(hash) {
@@ -606,7 +719,7 @@ function visibleHashes() {
   let hashes = ui.order.filter((hash) => {
     const torrent = ui.torrents.get(hash);
     return torrent
-      && matches(torrent, ui.filter)
+      && matches(torrent)
       && (!search || torrent.name.toLowerCase().includes(search));
   });
   const key = SORT_KEYS[ui.sort.key];
@@ -639,7 +752,7 @@ function renderRows() {
     setText($("#empty-text"), "No torrents yet. Add one with the + button, or drop a .torrent file here.");
     empty.hidden = false;
   } else if (hashes.length === 0) {
-    setText($("#empty-text"), "Nothing matches this filter.");
+    setText($("#empty-text"), "Nothing matches these filters.");
     empty.hidden = false;
   } else {
     empty.hidden = true;
@@ -770,7 +883,28 @@ function closeDetail() {
   if (history.state && history.state.detail) history.back();
 }
 
-window.addEventListener("popstate", () => $("#app").classList.remove("detail-open"));
+// On a phone the filters are a drawer from the left; tapping outside it,
+// ×, or Back closes it.
+function openDrawer() {
+  if (!narrow.matches || $("#app").classList.contains("side-open")) return;
+  $("#app").classList.add("side-open");
+  history.pushState({ drawer: true }, "");
+}
+
+function closeDrawer() {
+  if (!$("#app").classList.contains("side-open")) return;
+  $("#app").classList.remove("side-open");
+  if (history.state && history.state.drawer) history.back();
+}
+
+$("#filters-button").addEventListener("click", openDrawer);
+$("#drawer-close").addEventListener("click", closeDrawer);
+$("#scrim").addEventListener("click", closeDrawer);
+
+window.addEventListener("popstate", () => {
+  $("#app").classList.remove("detail-open");
+  $("#app").classList.remove("side-open");
+});
 $("#detail-back").addEventListener("click", closeDetail);
 
 // Follows a finger dragging `node` along one axis; past `distance`, or
@@ -825,7 +959,10 @@ draggable($("#detail"), {
   dismiss: closeDetail,
 });
 narrow.addEventListener("change", () => {
-  if (!narrow.matches) closeDetail();
+  if (!narrow.matches) {
+    closeDetail();
+    closeDrawer();
+  }
 });
 
 async function loadDetails() {
