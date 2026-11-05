@@ -443,14 +443,22 @@ impl ActiveTorrent {
         if !self.layout.verify(&self.info, index, data) {
             return Ok(Checked::Corrupt);
         }
-        if let Some(claim) = &mut download.claim {
-            claim.settle();
-        }
         if self.has_piece(index) {
+            if let Some(claim) = &mut download.claim {
+                claim.settle();
+            }
             return Ok(Checked::AlreadyHad);
         }
         // Write before marking complete, so complete always means on disk.
+        // The claim is settled only once written: a failed write (a full
+        // disk, a passing I/O error) drops it unsettled, so the piece is
+        // downloaded again, not left claimed by a closed connection for the
+        // rest of the transfer (libtorrent's 7bd6044 fixes its own version
+        // of this: requests lost when a failed write resets a piece).
         self.write_piece(index, data)?;
+        if let Some(claim) = &mut download.claim {
+            claim.settle();
+        }
         let mut pieces = self.pieces()?;
         if pieces.state(index) == Some(crate::PieceState::Complete) {
             return Ok(Checked::AlreadyHad);
@@ -554,4 +562,63 @@ pub(crate) fn has_bit(bits: &[u8], index: usize) -> bool {
 
 pub(crate) fn invalid_peer(message: impl Into<String>) -> crate::BackendError {
     crate::BackendError::InvalidPeerMessage(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A piece whose write fails is released for downloading again; one
+    /// written is not.
+    #[test]
+    fn a_piece_that_fails_to_write_is_downloaded_again() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-active-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let data = vec![5u8; 16384];
+        let info = {
+            use sha1::Digest;
+            let mut bytes =
+                b"d4:infod6:lengthi16384e4:name9:piece.bin12:piece lengthi16384e6:pieces20:"
+                    .to_vec();
+            bytes.extend(sha1::Sha1::digest(&data));
+            bytes.extend(b"ee");
+            TorrentInfo::from_bytes(&bytes).unwrap()
+        };
+        // A folder where the file goes: no write can succeed.
+        std::fs::create_dir_all(root.join("piece.bin")).unwrap();
+        let storage = Storage::new(&root).unwrap();
+        let progress = Arc::new(crate::TransferProgress::new());
+        let swarm = Arc::new(crate::swarm::Swarm::new(crate::swarm::DEFAULT_UPLOAD_SLOTS));
+        let torrent = ActiveTorrent::new(
+            info,
+            storage,
+            [1; 20],
+            Duration::from_secs(5),
+            progress,
+            swarm,
+            PieceManager::new(1),
+        );
+        let mut download = torrent.pick_piece(&[0x80], 0, &[], false).unwrap().unwrap();
+        assert!(torrent.check_piece(&mut download, &data).is_err());
+        drop(download);
+        assert_eq!(
+            torrent.pieces().unwrap().state(0),
+            Some(crate::PieceState::Missing)
+        );
+
+        std::fs::remove_dir(root.join("piece.bin")).unwrap();
+        let mut download = torrent.pick_piece(&[0x80], 0, &[], false).unwrap().unwrap();
+        assert!(matches!(
+            torrent.check_piece(&mut download, &data),
+            Ok(Checked::Stored)
+        ));
+        drop(download);
+        assert_eq!(
+            torrent.pieces().unwrap().state(0),
+            Some(crate::PieceState::Complete)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
