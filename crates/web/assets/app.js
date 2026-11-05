@@ -137,6 +137,11 @@ function eta(remaining, speed) {
   return `${seconds}s`;
 }
 
+function ratioText(ratio) {
+  if (ratio === null || ratio === undefined) return "—";
+  return ratio >= 9999 ? "∞" : ratio.toFixed(2);
+}
+
 function percent(progress) {
   return progress === null ? "—" : `${(progress * 100).toFixed(1)}%`;
 }
@@ -334,6 +339,7 @@ function renderHeader(header) {
   const limit = (value) => (value ? ` / ${rate(value)}` : "");
   setText($("#rate-down"), `${rate(header.totals.down) || "0 B/s"}${limit(header.limits.down)}`);
   setText($("#rate-up"), `${rate(header.totals.up) || "0 B/s"}${limit(header.limits.up)}`);
+  renderTransfer(header);
   const network = header.network;
   const parts = [];
   if (network.interface && !network.interfaceUp) {
@@ -364,6 +370,53 @@ function renderHeader(header) {
     $("#network").replaceChildren(...parts.map(([kind, text]) => element("span", { class: kind, text })));
   }
 }
+
+// ----- the transfer panel: speeds, a graph of the last minutes, totals -----
+
+const GRAPH_POINTS = 180; // one a second: three minutes
+const graph = { down: [], up: [] };
+
+function renderTransfer(header) {
+  setText($("#graph-down"), rate(header.totals.down) || "0 B/s");
+  setText($("#graph-up"), rate(header.totals.up) || "0 B/s");
+  const moved = header.transferred;
+  if (!moved) return;
+  setText($("#totals-session"), `↓ ${bytes(moved.downloadedSession)}  ↑ ${bytes(moved.uploadedSession)}`);
+  setText($("#totals-all"), `↓ ${bytes(moved.downloaded)}  ↑ ${bytes(moved.uploaded)}`);
+  const ratio = moved.downloaded ? moved.uploaded / moved.downloaded : (moved.uploaded ? Infinity : 0);
+  setText($("#totals-ratio"), ratio === Infinity ? "∞" : ratio.toFixed(2));
+}
+
+// Samples the speeds every second, so an idle stretch (when no updates
+// arrive) still moves the graph along.
+function sampleGraph() {
+  if (!ui.header) return;
+  graph.down.push(ui.header.totals.down);
+  graph.up.push(ui.header.totals.up);
+  if (graph.down.length > GRAPH_POINTS) graph.down.shift();
+  if (graph.up.length > GRAPH_POINTS) graph.up.shift();
+  if (!visible() || narrow.matches) return;
+  // Shared scale, at least 64 KiB/s so a trickle stays a trickle.
+  const top = Math.max(65536, ...graph.down, ...graph.up) * 1.1;
+  const [width, height] = [180, 48];
+  const paths = (values) => {
+    const offset = GRAPH_POINTS - values.length;
+    const points = values.map((value, index) =>
+      `${(((offset + index) / (GRAPH_POINTS - 1)) * width).toFixed(1)},${(height - (value / top) * height).toFixed(1)}`);
+    if (points.length < 2) return ["", ""];
+    const line = `M${points.join("L")}`;
+    const first = (offset / (GRAPH_POINTS - 1)) * width;
+    return [line, `${line}L${width},${height}L${first.toFixed(1)},${height}Z`];
+  };
+  const [downLine, downArea] = paths(graph.down);
+  const [upLine, upArea] = paths(graph.up);
+  $("#graph-down-line").setAttribute("d", downLine);
+  $("#graph-down-area").setAttribute("d", downArea);
+  $("#graph-up-line").setAttribute("d", upLine);
+  $("#graph-up-area").setAttribute("d", upArea);
+}
+
+setInterval(sampleGraph, 1000);
 
 function filterKey(filter) {
   return filter.value === undefined ? filter.kind : `${filter.kind}:${filter.value}`;
@@ -490,11 +543,11 @@ function makeRow(hash) {
   const node = element("div", {
     class: "row",
     attrs: { role: "row", tabindex: "0", "data-hash": hash },
-  }, [name, cell("num size"), progress, cell("status"), cell("num down"), cell("num up"), cell("num peers"), cell("num eta")]);
-  const [, size, , statusCell, down, up, peers, etaCell] = node.children;
+  }, [name, cell("num size"), progress, cell("status"), cell("num down"), cell("num up"), cell("num peers"), cell("num eta"), cell("num ratio")]);
+  const [, size, , statusCell, down, up, peers, etaCell, ratio] = node.children;
   const status = element("span", { class: "pill" });
   statusCell.append(status);
-  return { node, title, labels, fill, percentText, size, status, down, up, peers, eta: etaCell, labelShape: "" };
+  return { node, title, labels, fill, percentText, size, status, down, up, peers, eta: etaCell, ratio, labelShape: "" };
 }
 
 function fillRow(row, torrent) {
@@ -520,6 +573,7 @@ function fillRow(row, torrent) {
   setText(row.up, rate(torrent.up));
   setText(row.peers, torrent.peers === null ? "" : String(torrent.peers));
   setText(row.eta, eta(torrent.remaining, torrent.down));
+  setText(row.ratio, ratioText(torrent.ratio));
 }
 
 function rowFor(hash) {
@@ -541,7 +595,11 @@ const SORT_KEYS = {
   up: (torrent) => torrent.up,
   peers: (torrent) => torrent.peers ?? -1,
   eta: etaSeconds,
+  ratio: (torrent) => torrent.ratio ?? 0,
 };
+
+// Largest first is the natural order for these.
+const DESCENDING = ["size", "progress", "down", "up", "peers", "ratio"];
 
 function visibleHashes() {
   const search = ui.search;
@@ -619,8 +677,8 @@ $("#rows").addEventListener("keydown", (event) => {
 for (const button of document.querySelectorAll(".rows-head button")) {
   button.addEventListener("click", () => {
     const key = button.dataset.sort;
-    if (ui.sort.key !== key) ui.sort = { key, desc: ["size", "progress", "down", "up", "peers"].includes(key) };
-    else if (ui.sort.desc === ["size", "progress", "down", "up", "peers"].includes(key)) ui.sort = { key, desc: !ui.sort.desc };
+    if (ui.sort.key !== key) ui.sort = { key, desc: DESCENDING.includes(key) };
+    else if (ui.sort.desc === DESCENDING.includes(key)) ui.sort = { key, desc: !ui.sort.desc };
     else ui.sort = { key: "", desc: false };
     $("#sort").value = ui.sort.key;
     schedule();
@@ -629,9 +687,48 @@ for (const button of document.querySelectorAll(".rows-head button")) {
 
 $("#sort").addEventListener("change", (event) => {
   const key = event.target.value;
-  ui.sort = { key, desc: ["size", "progress", "down", "up", "peers"].includes(key) };
+  ui.sort = { key, desc: DESCENDING.includes(key) };
   schedule();
 });
+
+// ----- cards or a table --------------------------------------------------------
+//
+// Per browser, as the appearance is. Phones always get cards.
+
+const VIEW_KEY = "empirebt.view";
+let viewChoice = "cards";
+try {
+  if (localStorage.getItem(VIEW_KEY) === "table") viewChoice = "table";
+} catch {
+  // Storage blocked: cards.
+}
+
+function applyView() {
+  const view = narrow.matches ? "cards" : viewChoice;
+  const wrap = $("#table-wrap");
+  wrap.classList.toggle("cards", view === "cards");
+  wrap.classList.toggle("table", view === "table");
+  $(".list").classList.toggle("cards", view === "cards");
+  for (const button of document.querySelectorAll(".view-toggle button")) {
+    const active = button.dataset.view === viewChoice;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+}
+
+for (const button of document.querySelectorAll(".view-toggle button")) {
+  button.addEventListener("click", () => {
+    viewChoice = button.dataset.view;
+    try {
+      localStorage.setItem(VIEW_KEY, viewChoice);
+    } catch {
+      // Applies to this page anyway.
+    }
+    applyView();
+  });
+}
+narrow.addEventListener("change", applyView);
+applyView();
 
 function selectedTorrent() {
   return ui.selected ? ui.torrents.get(ui.selected) : undefined;
@@ -879,6 +976,12 @@ function renameButton(label, onClick) {
   return element("button", { class: "rename", title: label, attrs: { type: "button", "aria-label": label }, on: { click: onClick } }, [icon("rename")]);
 }
 
+// Through the CSSOM: the page's security policy refuses style attributes.
+function indented(node, depth) {
+  node.style.setProperty("--depth", String(depth));
+  return node;
+}
+
 function filesView() {
   const details = ui.details;
   if (!details) return [element("p", { class: "muted", text: "Loading…" })];
@@ -890,7 +993,7 @@ function filesView() {
   const walk = (folder, depth) => {
     for (const child of [...folder.folders.values()].sort(byName)) {
       rows.push(element("tr", { class: "folder" }, [
-        element("td", { class: "path", attrs: { style: `--depth: ${depth}` } }, [icon("category"), element("span", { text: child.name })]),
+        indented(element("td", { class: "path" }, [icon("category"), element("span", { text: child.name })]), depth),
         element("td", { class: "num", text: bytes(child.size) }),
         element("td", { class: "act" }, [renameButton(`Rename the folder ${child.name}`, () => renamePathDialog(torrent, child.path, true))]),
       ]));
@@ -898,10 +1001,10 @@ function filesView() {
     }
     for (const file of folder.files.sort(byName)) {
       rows.push(element("tr", {}, [
-        element("td", { class: "path", attrs: { style: `--depth: ${depth}` }, title: file.original ? `Renamed from ${file.original}` : "" }, [
+        indented(element("td", { class: "path", title: file.original ? `Renamed from ${file.original}` : "" }, [
           element("span", { text: file.name }),
           file.original ? element("span", { class: "renamed", text: "renamed" }) : null,
-        ]),
+        ]), depth),
         element("td", { class: "num", text: bytes(file.size) }),
         element("td", { class: "act" }, [renameButton(`Rename ${file.name}`, () => renamePathDialog(torrent, file.path, false))]),
       ]));
@@ -1068,13 +1171,38 @@ function peersView() {
   return [summary, element("table", { class: "peers" }, [head, element("tbody", {}, rows)]), credit].filter(Boolean);
 }
 
+// The last notice this tab showed, kept across reloads (per tab), so a
+// refresh does not show it again.
+const SEEN_KEY = "empirebt.seenNotice";
+
+function shownBefore() {
+  try {
+    return Number(sessionStorage.getItem(SEEN_KEY)) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 function renderNotices(notices) {
+  if (!notices.length) return;
+  const first = ui.seenNotice === 0;
+  if (first) {
+    // Numbers start again when EmpireBT restarts: one this tab showed
+    // before then is not this one.
+    const before = shownBefore();
+    const newest = Math.max(...notices.map((notice) => notice.id));
+    ui.seenNotice = before <= newest ? before : 0;
+  }
   for (const notice of notices) {
-    // Only new ones, and not ones from before this page loaded.
-    if (notice.id > ui.seenNotice) {
-      if (ui.seenNotice !== 0 || notice.ageMs < 10000) toast(notice.level, notice.text);
-      ui.seenNotice = notice.id;
-    }
+    if (notice.id <= ui.seenNotice) continue;
+    // A page just opened shows only what happened a moment ago.
+    if (!first || notice.ageMs < 10000) toast(notice.level, notice.text);
+    ui.seenNotice = notice.id;
+  }
+  try {
+    sessionStorage.setItem(SEEN_KEY, String(ui.seenNotice));
+  } catch {
+    // Storage blocked: a refresh may repeat a recent notice.
   }
 }
 
@@ -1507,6 +1635,7 @@ function aboutSection() {
 // Theme and accent color are per browser: saved here, never on the server.
 
 const ACCENTS = [
+  ["indigo", "Indigo", "#7c8cff"],
   ["mono", "Plain", null],
   ["blue", "Blue", "#4c8dff"],
   ["teal", "Teal", "#2cc5db"],
@@ -1518,7 +1647,7 @@ const ACCENTS = [
   ["purple", "Purple", "#a78bfa"],
 ];
 
-const appearance = { theme: "system", accent: "mono" };
+const appearance = { theme: "system", accent: "indigo" };
 const APPEARANCE_KEY = "empirebt.appearance";
 
 function loadAppearance() {
@@ -1553,20 +1682,28 @@ function applyAppearance() {
   if (appearance.theme === "system") delete root.dataset.theme;
   else root.dataset.theme = appearance.theme;
   const color = accentColor(appearance.accent);
-  if (color) {
+  if (appearance.accent === "indigo") {
+    // The default: the stylesheet's own, a shade per theme.
+    for (const name of ["--accent", "--accent-text", "--accent-soft"]) root.style.removeProperty(name);
+  } else if (color) {
     const [r, g, b] = [1, 3, 5].map((index) => parseInt(color.slice(index, index + 2), 16));
     // Dark text on light colors, white on dark ones.
     const light = (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6;
     root.style.setProperty("--accent", color);
-    root.style.setProperty("--accent-text", light ? "#0b0b0c" : "#ffffff");
+    root.style.setProperty("--accent-text", light ? "#0c111d" : "#ffffff");
     root.style.setProperty("--accent-soft", `rgb(${r} ${g} ${b} / 0.15)`);
+  } else if (appearance.accent === "mono") {
+    // Plain: the text color itself.
+    root.style.setProperty("--accent", "var(--text)");
+    root.style.setProperty("--accent-text", "var(--bg)");
+    root.style.setProperty("--accent-soft", "color-mix(in srgb, var(--text) 9%, transparent)");
   } else {
     for (const name of ["--accent", "--accent-text", "--accent-soft"]) root.style.removeProperty(name);
   }
   // The browser's own bar follows the page.
   const background = getComputedStyle(root).getPropertyValue("--bg").trim();
   for (const meta of document.querySelectorAll('meta[name="theme-color"]')) {
-    if (appearance.theme === "system") meta.content = meta.media.includes("light") ? "#f4f4f5" : "#0b0b0c";
+    if (appearance.theme === "system") meta.content = meta.media.includes("light") ? "#f2f4f9" : "#0c111d";
     else meta.content = background;
   }
 }

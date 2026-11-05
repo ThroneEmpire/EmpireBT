@@ -570,6 +570,13 @@ fn header_json(snapshot: &Snapshot) -> serde_json::Value {
         "limits": { "down": snapshot.rate_limits.0, "up": snapshot.rate_limits.1 },
         "activeCount": snapshot.active_count,
         "seedingCount": snapshot.seeding_count,
+        // Payload over every run (removed torrents too), and this run.
+        "transferred": {
+            "downloaded": snapshot.transferred.downloaded,
+            "uploaded": snapshot.transferred.uploaded,
+            "downloadedSession": snapshot.transferred.downloaded_session,
+            "uploadedSession": snapshot.transferred.uploaded_session,
+        },
         "network": {
             "port": network.listen_port,
             "seeding": seeding,

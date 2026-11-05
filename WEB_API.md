@@ -132,6 +132,7 @@ shape.
     "limits": { "down": 0, "up": 307200 },
     "activeCount": 1,
     "seedingCount": 12,
+    "transferred": { "downloaded": 53687091200, "uploaded": 107374182400, "downloadedSession": 1073741824, "uploadedSession": 2147483648 },
     "network": {
       "port": 6881,
       "seeding": { "state": "listening", "torrents": 12 },

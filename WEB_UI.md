@@ -12,13 +12,18 @@ download folder, a category's folder, one listed in
 `storage.allowed_dirs`, or a folder inside one of those. The web UI can't save anywhere else, so a browser
 session can't write outside those folders.
 
-It shows every torrent with live progress and speeds, filters by status,
-category, and tag, sorts by any column, and has detail tabs for the
-overview, files, peers, and trackers. It works on phones: torrents become
-cards, filters a row of chips, and details a full-screen sheet.
+It shows every torrent with live progress and speeds, as cards (name and
+status, a progress bar, then size, speeds, time left, peers and ratio) or,
+with the switch above the list, as a compact table sorted by any column.
+It filters by status, category, and tag, and has detail tabs for the
+overview, files, peers, and trackers. Under the filters, a transfer panel
+shows the current speeds, a graph of the last three minutes, and what
+moved this run and over all time, with the overall ratio. It works on
+phones: torrents are always cards there, filters a row of chips, and
+details a full-screen sheet.
 Under Settings → Appearance you choose the theme (system, dark, or light)
-and an accent color (plain, a preset, or any color); the choice is saved in
-that browser only.
+and an accent color (indigo by default, plain, a preset, or any color);
+the choice, like cards or table, is saved in that browser only.
 
 The **Peers** tab lists each connected peer with its country flag, address,
 client, how it is connected (`in`/`out`, `uTP`/`TCP`, `enc` when

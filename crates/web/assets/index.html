@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="referrer" content="no-referrer">
-  <meta name="theme-color" content="#0b0b0c" media="(prefers-color-scheme: dark)">
-  <meta name="theme-color" content="#f4f4f5" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0c111d" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f2f4f9" media="(prefers-color-scheme: light)">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -38,6 +38,8 @@
     <symbol id="i-empty" viewBox="0 0 24 24"><path d="M3 13h5l1 3h6l1-3h5M5.5 5h13L21 13v6H3v-6z"/></symbol>
     <symbol id="i-rename" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-cards" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="7" rx="2"/><rect x="3.5" y="13" width="17" height="7" rx="2"/></symbol>
+    <symbol id="i-table" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
   </svg>
 
   <main id="login" class="login" hidden>
@@ -67,7 +69,26 @@
       </div>
     </header>
 
-    <nav class="side" id="side" aria-label="Filters"></nav>
+    <aside class="side">
+      <nav class="filters" id="side" aria-label="Filters"></nav>
+      <section class="transfer" aria-label="Transfer">
+        <div class="transfer-rates">
+          <div><span class="transfer-label">Download</span><strong class="down" id="graph-down">0 B/s</strong></div>
+          <div><span class="transfer-label">Upload</span><strong class="up" id="graph-up">0 B/s</strong></div>
+        </div>
+        <svg class="graph" id="graph" viewBox="0 0 180 48" preserveAspectRatio="none" aria-hidden="true">
+          <path class="area down" id="graph-down-area"/>
+          <path class="area up" id="graph-up-area"/>
+          <path class="line down" id="graph-down-line"/>
+          <path class="line up" id="graph-up-line"/>
+        </svg>
+        <dl class="transfer-totals">
+          <dt>This run</dt><dd id="totals-session">—</dd>
+          <dt>All time</dt><dd id="totals-all">—</dd>
+          <dt>Ratio</dt><dd id="totals-ratio">—</dd>
+        </dl>
+      </section>
+    </aside>
 
     <section class="list">
       <div class="toolbar">
@@ -87,9 +108,14 @@
             <option value="up">Upload speed</option>
             <option value="peers">Peers</option>
             <option value="eta">Time left</option>
+            <option value="ratio">Ratio</option>
           </select>
         </label>
         <span id="shown" class="shown"></span>
+        <div class="view-toggle segments" role="group" aria-label="List style">
+          <button type="button" data-view="cards" title="Cards" aria-label="Show as cards"><svg class="icon"><use href="#i-cards"/></svg></button>
+          <button type="button" data-view="table" title="Table" aria-label="Show as a table"><svg class="icon"><use href="#i-table"/></svg></button>
+        </div>
       </div>
       <div class="table-wrap" id="table-wrap">
         <div class="rows-head" role="row">
@@ -101,6 +127,7 @@
           <button class="cell num" data-sort="up">Up</button>
           <button class="cell num" data-sort="peers">Peers</button>
           <button class="cell num" data-sort="eta">ETA</button>
+          <button class="cell num" data-sort="ratio">Ratio</button>
         </div>
         <div id="rows" class="rows" role="rowgroup"></div>
         <div id="empty" class="empty" hidden>
