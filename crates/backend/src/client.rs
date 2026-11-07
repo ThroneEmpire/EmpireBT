@@ -1204,6 +1204,46 @@ impl Client {
         }
     }
 
+    /// Finds files kept under the names EmpireBT 0.1.1 gave them, before
+    /// names were cleaned (see [`TorrentInfo::legacy_paths`]): a file not
+    /// on disk under its cleaned name, but there under its old one, is
+    /// used where it is, as a renamed file. Files already renamed, and
+    /// ones on disk under the new name, are left alone. Returns how many
+    /// were found.
+    pub fn adopt_legacy_names(&mut self, index: usize) -> usize {
+        let Some(torrent) = self.torrents.get(index) else {
+            return 0;
+        };
+        let Some(info) = torrent.info() else {
+            return 0;
+        };
+        let Some(legacy) = info.legacy_paths() else {
+            return 0;
+        };
+        let root = self.storage_for(torrent).root().to_owned();
+        let current = torrent.renames().table();
+        let mut table = (*current).clone();
+        let mut found = 0;
+        for (file, old) in info.files().iter().zip(legacy) {
+            if file.is_padding() || file.path() == old || current.contains_key(file.path()) {
+                continue;
+            }
+            if !root.join(file.path()).exists() && root.join(&old).is_file() {
+                table.insert(file.path().to_owned(), old);
+                found += 1;
+            }
+        }
+        if found > 0 {
+            torrent.renames().replace(table);
+            if let Some(hash) = torrent.info_hash().copied()
+                && let Ok(mut dirty) = self.resume_dirty.lock()
+            {
+                dirty.insert(hash);
+            }
+        }
+        found
+    }
+
     /// Keeps a torrent out of the shared runtime (`true`), whatever its
     /// state, from the next [`Client::sync_runtime`] on, until released
     /// (`false`). For a seed whose files are about to move.
@@ -1658,6 +1698,9 @@ impl Client {
             return Err(BackendError::InvalidConfiguration(
                 "session index has trailing data".to_owned(),
             ));
+        }
+        for position in 0..client.torrents.len() {
+            client.adopt_legacy_names(position);
         }
         Ok((client, warnings))
     }
@@ -2323,6 +2366,81 @@ mod tests {
             client.torrents()[index].state(),
             crate::TransferState::Seeding
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Files EmpireBT 0.1.1 saved under the torrent's own names, before
+    /// names were cleaned (here a C1 control character, U+0092, as a
+    /// Windows-1252 apostrophe read as Latin-1 makes), are found where they
+    /// are, after an upgrade and when added again: the torrent is complete,
+    /// with nothing downloaded again (libtorrent's issue 9115).
+    #[test]
+    fn finds_files_saved_under_names_from_before_cleaning() {
+        use sha1::Digest;
+        let root =
+            std::env::temp_dir().join(format!("empirebt-client-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let downloads = root.join("downloads");
+        let old_name = "It Ain\u{92}t So.flac";
+        let first: Vec<u8> = (0..20_000u32).map(|byte| byte as u8).collect();
+        let second: Vec<u8> = (0..12_000u32).map(|byte| (byte * 7) as u8).collect();
+        let joined = [first.clone(), second.clone()].concat();
+        let mut torrent = format!(
+            "d4:infod5:filesld6:lengthi{}e4:pathl{}:{}eed6:lengthi{}e4:pathl7:ok.flaceee4:name5:album12:piece lengthi16384e6:pieces{}:",
+            first.len(),
+            old_name.len(),
+            old_name,
+            second.len(),
+            joined.len().div_ceil(16384) * 20
+        )
+        .into_bytes();
+        for piece in joined.chunks(16384) {
+            torrent.extend(sha1::Sha1::digest(piece));
+        }
+        torrent.extend(b"ee");
+        let info = TorrentInfo::from_bytes(&torrent).unwrap();
+        assert_eq!(
+            info.files()[0].path(),
+            std::path::Path::new("album/It Ain_t So.flac"),
+            "cleaned as libtorrent 2.1 does"
+        );
+        // On disk as 0.1.1 saved them.
+        std::fs::create_dir_all(downloads.join("album")).unwrap();
+        std::fs::write(downloads.join("album").join(old_name), &first).unwrap();
+        std::fs::write(downloads.join("album/ok.flac"), &second).unwrap();
+
+        let config = ClientConfig::new().with_download_directory(&downloads);
+        let mut client = Client::with_config(config.clone()).unwrap();
+        let index = client.add_torrent(info.clone());
+        assert_eq!(client.adopt_legacy_names(index), 1);
+        assert_eq!(client.adopt_legacy_names(index), 0, "once is enough");
+        let (_, paths) = client.file_paths(index);
+        assert_eq!(paths[0], downloads.join("album").join(old_name));
+        client.start_torrent(index).unwrap();
+        assert_eq!(
+            client.torrents()[index].state(),
+            crate::TransferState::Seeding,
+            "complete where it is"
+        );
+
+        // A session saved before the names were found (as 0.1.1 left it)
+        // finds them again as it loads.
+        let session = root.join("session");
+        let mut plain = Client::with_config(config.clone()).unwrap();
+        plain.add_torrent(info.clone());
+        plain.save_session_dir(&session).unwrap();
+        let (loaded, warnings) = Client::load_session_dir(config.clone(), &session).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            loaded.file_paths(0).1[0],
+            downloads.join("album").join(old_name)
+        );
+
+        // A file there under its cleaned name is the one used.
+        std::fs::write(downloads.join("album/It Ain_t So.flac"), &first).unwrap();
+        let mut fresh = Client::with_config(config).unwrap();
+        let index = fresh.add_torrent(info);
+        assert_eq!(fresh.adopt_legacy_names(index), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 

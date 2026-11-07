@@ -2497,6 +2497,9 @@ impl Engine {
                 .set_content_layout(index, placement.layout)
                 .map_err(|error| Failure::new(error.to_string()))?;
         }
+        // Data already there under the names an older EmpireBT (or another
+        // client) used is seeded where it is.
+        self.client.adopt_legacy_names(index);
         self.place_incomplete(index, hash, &placement.download_dir)?;
         self.session_dirty = true;
         self.stats.added(hash, crate::stats::now());
@@ -3052,7 +3055,11 @@ impl Engine {
                 (_, Err(BackendError::TorrentNotFound(_))) => None,
                 (_, Err(BackendError::Cancelled)) if moving => None,
                 (TransferKind::Metadata, Ok(_)) => {
-                    // The magnet is now a full torrent; download it.
+                    // The magnet is now a full torrent; download it, into
+                    // files already there under older names if there are.
+                    if let Some(index) = self.client.torrent_index(&hash) {
+                        self.client.adopt_legacy_names(index);
+                    }
                     start_next = true;
                     Some((
                         Level::Success,

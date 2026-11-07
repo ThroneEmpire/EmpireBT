@@ -395,6 +395,90 @@ impl TorrentInfo {
             .filter(|bytes| !bytes.is_empty())
     }
 
+    /// The paths EmpireBT 0.1.1 and earlier gave this torrent's files, in
+    /// the order of [`TorrentInfo::files`]: names exactly as the torrent
+    /// wrote them, before [`crate::names`] cleaned them (control
+    /// characters, invisible ones, overlong names, duplicates). Files
+    /// downloaded then are on disk under these names (as libtorrent 2.0
+    /// left them too, before 2.1 cleaned C1 controls: its issue 9115).
+    /// `None` when that version could not have added the torrent (a name
+    /// not in UTF-8, or unsafe), or without the raw metadata.
+    pub fn legacy_paths(&self) -> Option<Vec<PathBuf>> {
+        use crate::bencode::Value;
+        let info = crate::bencode::decode(self.info_bytes()?).ok()?;
+        let text = |value: &Value| {
+            std::str::from_utf8(value.as_bytes()?)
+                .ok()
+                .map(str::to_owned)
+        };
+        let safe = |component: &str| {
+            let path = Path::new(component);
+            !component.is_empty()
+                && !path.is_absolute()
+                && !path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+        };
+        let name = text(info.get(b"name")?)?;
+        fn tree(
+            value: &Value,
+            prefix: &Path,
+            safe: &dyn Fn(&str) -> bool,
+            out: &mut Vec<PathBuf>,
+        ) -> Option<()> {
+            let Value::Dict(entries) = value else {
+                return None;
+            };
+            for (key, child) in entries {
+                if key.is_empty() {
+                    out.push(prefix.to_path_buf());
+                } else {
+                    let component = std::str::from_utf8(key).ok()?;
+                    if !safe(component) || component == "." {
+                        return None;
+                    }
+                    tree(child, &prefix.join(component), safe, out)?;
+                }
+            }
+            Some(())
+        }
+        let v2 = || {
+            let mut files = Vec::new();
+            tree(info.get(b"file tree")?, Path::new(""), &safe, &mut files)?;
+            let single = files.len() == 1 && files[0] == Path::new(&name);
+            if !single {
+                files = files
+                    .into_iter()
+                    .map(|path| Path::new(&name).join(path))
+                    .collect();
+            }
+            Some(files)
+        };
+        let paths = if info.get(b"file tree").is_some() && info.get(b"pieces").is_none() {
+            v2()?
+        } else if let Some(list) = info.get(b"files") {
+            list.as_list()?
+                .iter()
+                .map(|file| {
+                    let mut path = PathBuf::from(&name);
+                    for component in file.get(b"path")?.as_list()? {
+                        let component = text(component)?;
+                        if !safe(&component) {
+                            return None;
+                        }
+                        path.push(component);
+                    }
+                    Some(path)
+                })
+                .collect::<Option<Vec<_>>>()?
+        } else if info.get(b"length").is_some() {
+            vec![PathBuf::from(&name)]
+        } else {
+            v2()?
+        };
+        (paths.len() == self.files.len()).then_some(paths)
+    }
+
     /// Parses a `.torrent` file from disk.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, crate::BackendError> {
         let bytes =
