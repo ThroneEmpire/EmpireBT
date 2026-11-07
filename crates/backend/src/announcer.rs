@@ -8,9 +8,6 @@ use std::time::{Duration, Instant};
 
 use crate::{AnnounceEvent, AnnounceRequest, Dht, Runtime, TrackerClient};
 
-/// First retry delay after every tracker failed; doubles up to the maximum.
-const FAILURE_BACKOFF: Duration = Duration::from_secs(60);
-const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
 const POLL: Duration = Duration::from_millis(250);
 /// DHT peers expire after about 30 minutes, so announces repeat sooner.
 const DHT_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -209,13 +206,13 @@ struct Entry {
     announce_hashes: Vec<[u8; 20]>,
     /// The peer ID the torrent uses in the runtime.
     peer_id: [u8; 20],
-    trackers: Arc<TrackerClient>,
+    /// Each tier of trackers (BEP 12) on a schedule of its own, as
+    /// libtorrent keeps one per tracker: one that answers is asked again
+    /// on its interval, one that fails sooner, on libtorrent's backoff,
+    /// whatever the others do.
+    tiers: Vec<Tier>,
     /// A private torrent (BEP 27).
     private: bool,
-    next_announce: Instant,
-    started: bool,
-    in_flight: bool,
-    failures: u32,
     /// Bytes uploaded by runtimes that have since been replaced.
     uploaded_before: u64,
     /// Latest counter value from the current runtime.
@@ -227,6 +224,47 @@ struct Entry {
     uploaded_base: u64,
 }
 
+/// One tier of a seeded torrent's trackers.
+struct Tier {
+    trackers: Arc<TrackerClient>,
+    next_announce: Instant,
+    /// It accepted an announce, so it heard `started`: later ones carry no
+    /// event, and it hears `stopped` when we leave. One that never
+    /// answered gets `started` with its first announce that works.
+    started: bool,
+    in_flight: bool,
+    failures: u32,
+    /// Its latest answer: the swarm's size, or why not.
+    last: Option<Result<SwarmCount, String>>,
+}
+
+/// Seeders and leechers, as a tracker reported them.
+type SwarmCount = (Option<u64>, Option<u64>);
+
+impl Tier {
+    fn new(trackers: TrackerClient) -> Self {
+        Self {
+            trackers: Arc::new(trackers),
+            next_announce: Instant::now(),
+            started: false,
+            in_flight: false,
+            failures: 0,
+            last: None,
+        }
+    }
+}
+
+/// How long a tier that failed `failures` times in a row waits:
+/// libtorrent's backoff (see [`crate::tracker::retry_delay`]), quicker in
+/// tests.
+fn tier_retry(failures: u32) -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(300)
+    } else {
+        crate::tracker::retry_delay(failures)
+    }
+}
+
 impl Entry {
     /// Bytes uploaded since this entry's `started` announce.
     fn uploaded(&self) -> u64 {
@@ -234,10 +272,16 @@ impl Entry {
     }
 }
 
-/// One finished tracker announce, sent back from a worker thread.
-struct Outcome {
-    key: [u8; 20],
-    results: Vec<Result<crate::TrackerResponse, crate::BackendError>>,
+/// What a worker thread sends back.
+enum Outcome {
+    /// One finished announce to one tier.
+    Tier {
+        key: [u8; 20],
+        tier: usize,
+        result: Result<crate::TrackerResponse, crate::BackendError>,
+    },
+    /// Every tier it took has answered: its slot is free.
+    Done,
 }
 
 /// A seeded torrent as the announce loops see it.
@@ -323,7 +367,7 @@ impl AnnounceLoop {
                             if left.is_zero() {
                                 return;
                             }
-                            let _ = trackers.announce_all(request, timeout.min(left));
+                            announce_tiers(trackers, request, timeout.min(left));
                         }
                     }
                 });
@@ -391,12 +435,8 @@ impl AnnounceLoop {
                     Entry {
                         announce_hashes: target.announce_hashes,
                         peer_id: target.peer_id,
-                        trackers: Arc::new(trackers),
+                        tiers: trackers.tiers().into_iter().map(Tier::new).collect(),
                         private: target.private,
-                        next_announce: Instant::now(),
-                        started: false,
-                        in_flight: false,
-                        failures: 0,
                         uploaded_before: 0,
                         uploaded_now: counter,
                         uploaded_base: counter,
@@ -417,7 +457,7 @@ impl AnnounceLoop {
         }
     }
 
-    /// Starts announces for due torrents, up to the worker limit.
+    /// Starts announces for due tiers, up to the worker limit.
     fn announce_due(&mut self) {
         let now = Instant::now();
         let forced = self
@@ -428,124 +468,145 @@ impl AnnounceLoop {
             .unwrap_or_default();
         for key in forced {
             if let Some(entry) = self.entries.get_mut(&key) {
-                entry.next_announce = entry.next_announce.min(now);
+                for tier in &mut entry.tiers {
+                    tier.next_announce = tier.next_announce.min(now);
+                }
             }
         }
-        let mut due: Vec<([u8; 20], Instant)> = self
+        // A torrent's due tiers go out together, in one worker slot, so a
+        // dead tracker beside a working one costs no extra slot.
+        let mut due: Vec<([u8; 20], Vec<usize>, Instant)> = self
             .entries
             .iter()
-            .filter(|(_, entry)| !entry.in_flight && entry.next_announce <= now)
-            .map(|(key, entry)| (*key, entry.next_announce))
+            .filter_map(|(key, entry)| {
+                let tiers: Vec<(usize, Instant)> = entry
+                    .tiers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tier)| !tier.in_flight && tier.next_announce <= now)
+                    .map(|(index, tier)| (index, tier.next_announce))
+                    .collect();
+                let oldest = tiers.iter().map(|(_, at)| *at).min()?;
+                Some((
+                    *key,
+                    tiers.into_iter().map(|(index, _)| index).collect(),
+                    oldest,
+                ))
+            })
             .collect();
         // Longest-waiting first, so no torrent starves behind others.
-        due.sort_by_key(|(_, at)| *at);
-        for (key, _) in due {
+        due.sort_by_key(|(_, _, at)| *at);
+        for (key, indexes, _) in due {
             if self.in_flight >= TRACKER_WORKERS {
                 return;
             }
             let Some(entry) = self.entries.get_mut(&key) else {
                 continue;
             };
-            let event = if entry.started {
-                AnnounceEvent::None
-            } else {
-                AnnounceEvent::Started
-            };
-            let requests: Vec<AnnounceRequest> = entry
-                .announce_hashes
-                .iter()
-                .map(|hash| {
-                    request(
-                        *hash,
-                        entry.peer_id,
-                        self.port,
-                        entry.uploaded(),
-                        event,
-                        entry.private,
-                    )
-                })
-                .collect();
-            let (trackers, timeout, sender) = (
-                Arc::clone(&entry.trackers),
-                self.timeout,
-                self.outcomes.0.clone(),
-            );
-            entry.in_flight = true;
+            let uploaded = entry.uploaded();
+            let (peer_id, private, port) = (entry.peer_id, entry.private, self.port);
+            let hashes = entry.announce_hashes.clone();
+            let mut work = Vec::new();
+            for index in indexes {
+                let Some(tier) = entry.tiers.get_mut(index) else {
+                    continue;
+                };
+                let event = if tier.started {
+                    AnnounceEvent::None
+                } else {
+                    AnnounceEvent::Started
+                };
+                let requests: Vec<AnnounceRequest> = hashes
+                    .iter()
+                    .map(|hash| request(*hash, peer_id, port, uploaded, event, private))
+                    .collect();
+                tier.in_flight = true;
+                work.push((index, Arc::clone(&tier.trackers), requests));
+            }
+            let (timeout, sender) = (self.timeout, self.outcomes.0.clone());
             self.in_flight += 1;
             std::thread::spawn(move || {
-                let results = trackers.announce_all(&requests[0], timeout);
-                // A hybrid's other hash, so peers searching by it find us.
-                for request in &requests[1..] {
-                    let _ = trackers.announce_all(request, timeout);
-                }
-                let _ = sender.send(Outcome { key, results });
+                std::thread::scope(|scope| {
+                    for (index, trackers, requests) in &work {
+                        let sender = sender.clone();
+                        scope.spawn(move || {
+                            let result = trackers.announce(&requests[0], timeout);
+                            // A hybrid's other hash, so peers searching by
+                            // it find us.
+                            for request in &requests[1..] {
+                                let _ = trackers.announce(request, timeout);
+                            }
+                            let _ = sender.send(Outcome::Tier {
+                                key,
+                                tier: *index,
+                                result,
+                            });
+                        });
+                    }
+                });
+                // The slot is free once every tier has answered.
+                let _ = sender.send(Outcome::Done);
             });
         }
     }
 
     fn collect_outcomes(&mut self) {
-        while let Ok(Outcome { key, results }) = self.outcomes.1.try_recv() {
-            self.in_flight = self.in_flight.saturating_sub(1);
+        while let Ok(outcome) = self.outcomes.1.try_recv() {
+            let (key, tier, result) = match outcome {
+                Outcome::Done => {
+                    self.in_flight = self.in_flight.saturating_sub(1);
+                    continue;
+                }
+                Outcome::Tier { key, tier, result } => (key, tier, result),
+            };
             // The torrent may have stopped seeding while the announce ran.
             let Some(entry) = self.entries.get_mut(&key) else {
                 continue;
             };
-            entry.in_flight = false;
-            let accepted: Vec<_> = results
-                .iter()
-                .filter_map(|result| result.as_ref().ok())
-                .collect();
-            let last_error = results
-                .iter()
-                .find_map(|result| result.as_ref().err())
-                .map(ToString::to_string);
-            if accepted.is_empty() {
-                let backoff = FAILURE_BACKOFF
-                    .saturating_mul(2_u32.saturating_pow(entry.failures))
-                    .min(MAX_FAILURE_BACKOFF);
-                entry.failures = entry.failures.saturating_add(1);
-                entry.next_announce = Instant::now() + jittered(backoff);
-            } else {
-                entry.started = true;
-                entry.failures = 0;
-                // Downloaders that cannot reach us (we may be behind a NAT
-                // or a VPN without a forwarded port) still get the data if
-                // we connect to them, as libtorrent's seeds do.
-                if let Some((runtime, _)) = &self.tracked_runtime {
-                    dial_peers(
-                        runtime,
-                        &key,
-                        accepted.iter().flat_map(|response| response.peers()),
+            let Some(state) = entry.tiers.get_mut(tier) else {
+                continue;
+            };
+            state.in_flight = false;
+            let now = Instant::now();
+            match result {
+                Ok(response) => {
+                    state.started = true;
+                    state.failures = 0;
+                    // Its interval, but never sooner than it allows.
+                    let interval = response.next_announce_in().max(
+                        response
+                            .min_interval()
+                            .map_or(Duration::ZERO, Duration::from_secs),
                     );
+                    state.next_announce = now + jittered(interval);
+                    state.last = Some(Ok((response.seeders(), response.leechers())));
+                    // Downloaders that cannot reach us (we may be behind a
+                    // NAT or a VPN without a forwarded port) still get the
+                    // data if we connect to them, as libtorrent's seeds do.
+                    if let Some((runtime, _)) = &self.tracked_runtime {
+                        dial_peers(runtime, &key, response.peers().iter());
+                    }
                 }
-                // One schedule for every tracker: the soonest any asks,
-                // but never sooner than any allows (`min interval`).
-                let soonest_allowed = accepted
-                    .iter()
-                    .filter_map(|response| response.min_interval())
-                    .max()
-                    .map_or(Duration::ZERO, Duration::from_secs);
-                let interval = accepted
-                    .iter()
-                    .map(|response| response.next_announce_in())
-                    .min()
-                    .unwrap_or(crate::tracker::DEFAULT_ANNOUNCE_INTERVAL)
-                    .max(soonest_allowed);
-                entry.next_announce = Instant::now() + jittered(interval);
+                Err(error) => {
+                    state.failures = state.failures.saturating_add(1);
+                    state.next_announce = now + jittered(tier_retry(state.failures));
+                    state.last = Some(Err(error.to_string()));
+                }
             }
+            let answers = || entry.tiers.iter().filter_map(|tier| tier.last.as_ref());
+            let counts = || answers().filter_map(|answer| answer.as_ref().ok());
             let status = AnnounceStatus {
-                trackers_ok: accepted.len(),
-                trackers_total: results.len(),
-                seeders: accepted
+                trackers_ok: counts().count(),
+                trackers_total: entry.tiers.len(),
+                seeders: counts().filter_map(|(seeders, _)| *seeders).max(),
+                leechers: counts().filter_map(|(_, leechers)| *leechers).max(),
+                last_error: answers().find_map(|answer| answer.as_ref().err().cloned()),
+                next_announce: entry
+                    .tiers
                     .iter()
-                    .filter_map(|response| response.seeders())
-                    .max(),
-                leechers: accepted
-                    .iter()
-                    .filter_map(|response| response.leechers())
-                    .max(),
-                last_error,
-                next_announce: entry.next_announce,
+                    .map(|tier| tier.next_announce)
+                    .min()
+                    .unwrap_or(now),
                 uploaded: entry.uploaded(),
                 dht_announced: None,
             };
@@ -564,19 +625,25 @@ impl AnnounceLoop {
         let timeout = self.timeout;
         Some(std::thread::spawn(move || {
             for request in &requests {
-                let _ = trackers.announce_all(request, timeout);
+                announce_tiers(&trackers, request, timeout);
             }
         }))
     }
 
-    /// Forgets a torrent; returns the `stopped` announces its trackers
-    /// should get, if any heard `started`.
+    /// Forgets a torrent; returns the `stopped` announces for the tiers
+    /// that heard `started`, if any did.
     fn leave(&mut self, key: &[u8; 20]) -> Option<Stopped> {
         if let Ok(mut statuses) = self.shared.status.lock() {
             statuses.remove(key);
         }
         let entry = self.entries.remove(key)?;
-        if !entry.started {
+        let tiers: Vec<Arc<TrackerClient>> = entry
+            .tiers
+            .iter()
+            .filter(|tier| tier.started)
+            .map(|tier| Arc::clone(&tier.trackers))
+            .collect();
+        if tiers.is_empty() {
             return None;
         }
         let requests: Vec<AnnounceRequest> = entry
@@ -593,12 +660,24 @@ impl AnnounceLoop {
                 )
             })
             .collect();
-        Some((entry.trackers, requests))
+        Some((tiers, requests))
     }
 }
 
-/// A torrent's trackers and the `stopped` announces for them.
-type Stopped = (Arc<TrackerClient>, Vec<AnnounceRequest>);
+/// The tiers of a torrent that heard `started`, and the `stopped`
+/// announces for them.
+type Stopped = (Vec<Arc<TrackerClient>>, Vec<AnnounceRequest>);
+
+/// Sends `request` to each of `tiers` at once, and waits for them.
+fn announce_tiers(tiers: &[Arc<TrackerClient>], request: &AnnounceRequest, timeout: Duration) {
+    std::thread::scope(|scope| {
+        for tier in tiers {
+            scope.spawn(move || {
+                let _ = tier.announce(request, timeout);
+            });
+        }
+    });
+}
 
 /// Announces every public seeded torrent to the DHT on a fixed interval,
 /// several lookups at a time.
@@ -892,12 +971,8 @@ mod tests {
         let mut entry = Entry {
             announce_hashes: Vec::new(),
             peer_id: [0; 20],
-            trackers: Arc::new(TrackerClient::default()),
+            tiers: Vec::new(),
             private: false,
-            next_announce: Instant::now(),
-            started: false,
-            in_flight: false,
-            failures: 0,
             uploaded_before: 0,
             uploaded_now: 500,
             uploaded_base: 500,
@@ -909,6 +984,113 @@ mod tests {
         entry.uploaded_before += entry.uploaded_now;
         entry.uploaded_now = 50;
         assert_eq!(entry.uploaded(), 350);
+    }
+
+    /// Each tier keeps a schedule of its own, as libtorrent does (its
+    /// f969a0d fixed one shared timer): a tier that failed is asked again
+    /// soon, still with `started`, rather than when the working tier is
+    /// next due half an hour later; both then count in the status, and
+    /// both hear `stopped`.
+    #[test]
+    fn a_failing_tier_is_retried_on_its_own_schedule() {
+        use std::sync::atomic::AtomicUsize;
+        // Tier 0 refuses its first announce, then works.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let flaky = format!("http://{}/announce", listener.local_addr().unwrap());
+        let (sender, flaky_requests) = mpsc::channel::<String>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = Arc::clone(&calls);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut request = [0; 2048];
+                    let size = stream.read(&mut request).unwrap_or(0);
+                    let line = String::from_utf8_lossy(&request[..size]).into_owned();
+                    let body: &[u8] = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        b"d14:failure reason4:downe"
+                    } else {
+                        b"d8:completei5e10:incompletei2e8:intervali1800e5:peers0:e"
+                    };
+                    let _ = stream.write_all(
+                        format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                            .as_bytes(),
+                    );
+                    let _ = stream.write_all(body);
+                    if sender.send(line).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        let (steady, steady_requests) = recording_tracker();
+        let root =
+            std::env::temp_dir().join(format!("empirebt-announcer-tiers-{}", std::process::id()));
+        let storage = crate::Storage::new(&root).unwrap();
+        let data = b"seeded";
+        let hash: [u8; 20] = {
+            use sha1::{Digest, Sha1};
+            Sha1::digest(data).into()
+        };
+        let list = format!("ll{}:{flaky}el{}:{steady}ee", flaky.len(), steady.len());
+        let mut bytes = format!(
+            "d8:announce{}:{flaky}13:announce-list{list}4:infod6:lengthi6e4:name6:seeded12:piece lengthi6e6:pieces20:",
+            flaky.len()
+        )
+        .into_bytes();
+        bytes.extend(hash);
+        bytes.extend(b"ee");
+        let info = crate::TorrentInfo::from_bytes(&bytes).unwrap();
+        storage.write_piece(&info, 0, data).unwrap();
+        let seeder =
+            crate::Seeder::new(info.clone(), storage, [9; 20], Duration::from_secs(1)).unwrap();
+        let runtime = Arc::new(Runtime::new(vec![seeder], 1).unwrap());
+
+        let mut announcer = SeedAnnouncer::start(7777, Duration::from_secs(1), None);
+        announcer.track(runtime);
+        let first = steady_requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(first.contains("event=started"), "{first}");
+        let refused = flaky_requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(refused.contains("event=started"), "{refused}");
+        // The retry comes on tier 0's own backoff, and still says started:
+        // it never heard it.
+        let retried = flaky_requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the failing tier was not asked again on its own schedule");
+        assert!(retried.contains("event=started"), "{retried}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = announcer.status(info.info_hash())
+                && status.trackers_ok == 2
+            {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{:?}",
+                announcer.status(info.info_hash())
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.trackers_total, 2);
+        assert_eq!((status.seeders, status.leechers), (Some(5), Some(2)));
+        assert_eq!(status.last_error, None);
+        // The working tier was not asked again meanwhile.
+        assert!(steady_requests.try_recv().is_err());
+
+        announcer.clear();
+        let stopped = steady_requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(stopped.contains("event=stopped"), "{stopped}");
+        let stopped = flaky_requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(stopped.contains("event=stopped"), "{stopped}");
+        if let Some(thread) = announcer.stop() {
+            thread.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
