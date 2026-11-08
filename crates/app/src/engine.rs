@@ -3862,45 +3862,33 @@ mod tests {
         let (handle, root) = engine("anonymous");
         let (link, hash) = magnet(3);
         handle.call(Command::Add(link)).unwrap();
-        let change = |value: &str| {
-            handle
-                .call(Command::ChangeSetting {
-                    key: "network.anonymous".to_owned(),
-                    value: value.to_owned(),
-                })
-                .unwrap();
-            handle.snapshot()
-        };
-        let snapshot = change("true");
-        assert!(
+        // A switch moves every connection to new peer IDs; its notice comes
+        // once that is done, which a slow machine takes a moment for.
+        let count = |snapshot: &Snapshot, prefix: &str| {
             snapshot
                 .notices
                 .iter()
-                .any(|notice| notice.text.starts_with("Anonymous mode is on")),
-            "{:?}",
-            snapshot.notices
-        );
-        assert!(snapshot.torrent(&hash).is_some(), "torrents stay");
+                .filter(|notice| notice.text.starts_with(prefix))
+                .count()
+        };
+        let set = |key: &str, value: &str, notice: &str, times: usize| {
+            handle
+                .call(Command::ChangeSetting {
+                    key: key.to_owned(),
+                    value: value.to_owned(),
+                })
+                .unwrap();
+            assert!(
+                wait_for(&handle, 10, |snapshot| count(snapshot, notice) >= times),
+                "no \"{notice}\" after {key} = {value}: {:?}",
+                handle.snapshot().notices
+            );
+        };
+        set("network.anonymous", "true", "Anonymous mode is on", 1);
+        assert!(handle.snapshot().torrent(&hash).is_some(), "torrents stay");
         // The disguise takes precedence, and switching it off leaves
         // anonymous mode as it was.
-        let disguise = |value: &str| {
-            handle
-                .call(Command::ChangeSetting {
-                    key: "network.disguise".to_owned(),
-                    value: value.to_owned(),
-                })
-                .unwrap();
-            handle.snapshot()
-        };
-        let snapshot = disguise("qbittorrent");
-        assert!(
-            snapshot
-                .notices
-                .iter()
-                .any(|notice| notice.text.starts_with("Disguised")),
-            "{:?}",
-            snapshot.notices
-        );
+        set("network.disguise", "qbittorrent", "Disguised", 1);
         assert!(
             handle
                 .call(Command::ChangeSetting {
@@ -3910,23 +3898,12 @@ mod tests {
                 .is_err(),
             "only qBittorrent, or off"
         );
-        let snapshot = disguise("off");
-        assert_eq!(
-            snapshot
-                .notices
-                .iter()
-                .filter(|notice| notice.text.starts_with("Anonymous mode is on"))
-                .count(),
-            2,
-            "back to anonymous: {:?}",
-            snapshot.notices
-        );
-        let snapshot = change("false");
-        assert!(
-            snapshot
-                .notices
-                .iter()
-                .any(|notice| notice.text == "Public torrents say they are EmpireBT again")
+        set("network.disguise", "off", "Anonymous mode is on", 2);
+        set(
+            "network.anonymous",
+            "false",
+            "Public torrents say they are EmpireBT again",
+            1,
         );
         handle.shutdown();
         let _ = std::fs::remove_dir_all(root);
