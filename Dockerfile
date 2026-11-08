@@ -1,4 +1,4 @@
-# EmpireBT, serving the web UI. See DOCKER.md.
+# EmpireBT, serving the web UI. See docs/DOCKER.md.
 #
 #   docker build -t empirebt .
 #

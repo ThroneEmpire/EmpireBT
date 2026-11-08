@@ -5,6 +5,7 @@ interop/.libtorrent/
 data/
 downloads/
 *.md
+docs/
 !crates/**/*.md
 # Shipped in the image, as their licenses ask.
 !THIRD_PARTY_NOTICES.md

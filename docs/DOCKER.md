@@ -79,7 +79,7 @@ that port, TCP and UDP, on your router so peers can connect to you.
 Every setting can be set with an environment variable named
 `EMPIREBT_<SECTION>_<NAME>`: for example, `network.upload_limit` is
 `EMPIREBT_NETWORK_UPLOAD_LIMIT`. The full list is in the
-[README](README.md#settings) and [WEB_UI.md](WEB_UI.md#settings).
+[README](../README.md#settings) and [WEB_UI.md](WEB_UI.md#settings).
 
 Environment variables apply on every start and override `config.toml`
 without changing it. The web UI shows them as overridden. Settings you
@@ -108,7 +108,7 @@ Commonly set:
 | `EMPIREBT_NETWORK_DOWNLOAD_LIMIT` | `0` | Download speed limit, KiB/s |
 | `EMPIREBT_NETWORK_MAX_CONNECTIONS` | `500` | Peer connections across all torrents |
 | `EMPIREBT_NETWORK_INTERFACE` | `tun0` | Use only this network interface (see [VPN](#vpn)) |
-| `EMPIREBT_NETWORK_ANONYMOUS` | `true` | Don't tell peers and trackers this is EmpireBT (see [Privacy](README.md#privacy)) |
+| `EMPIREBT_NETWORK_ANONYMOUS` | `true` | Don't tell peers and trackers this is EmpireBT (see [Privacy](../README.md#privacy)) |
 | `EMPIREBT_STORAGE_ALLOWED_DIRS` | `/media/films,/media/shows` | More folders the web UI may save torrents in; mount them as volumes too |
 | `EMPIREBT_STORAGE_INCOMPLETE_DIR` | `/downloads/incomplete` | Download here, then move to the save folder once complete. Inside `/downloads`, moves are instant renames; a separate volume (a fast SSD) means each finished torrent is copied over |
 
@@ -229,7 +229,7 @@ docker compose start empirebt
 `--url` is qBittorrent's address as this container sees it: a service
 name on the same Docker network, or `http://host.docker.internal:8080`.
 `--map` rewrites qBittorrent's paths to the ones this container has. See
-the [README](README.md#moving-from-qbittorrent) for what comes over.
+the [README](../README.md#moving-from-qbittorrent) for what comes over.
 
 ## Stopping and updating
 

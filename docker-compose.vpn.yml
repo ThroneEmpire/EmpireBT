@@ -2,7 +2,7 @@
 # All of EmpireBT's traffic goes through the VPN, and EmpireBT is bound to
 # the VPN's interface, so nothing leaks if the VPN drops. With a provider
 # that forwards a port (ProtonVPN here), peers can connect in, and EmpireBT
-# follows the port whenever the VPN hands out a new one. See DOCKER.md.
+# follows the port whenever the VPN hands out a new one. See docs/DOCKER.md.
 #
 #   mkdir -p data downloads forwarded
 #   docker compose -f docker-compose.vpn.yml up -d

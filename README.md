@@ -141,10 +141,10 @@ switches to a touch layout.
 Signing in is always required. Any address other than loopback is served
 over HTTPS only, and a browser session can't reach the file system.
 
-- [WEB_UI.md](WEB_UI.md) covers remote access, passwords, and how the web
+- [WEB_UI.md](docs/WEB_UI.md) covers remote access, passwords, and how the web
   UI is protected.
-- [WEB_API.md](WEB_API.md) is the JSON API, for scripts with an API token.
-- [QBITTORRENT_API.md](QBITTORRENT_API.md): EmpireBT also answers
+- [WEB_API.md](docs/WEB_API.md) is the JSON API, for scripts with an API token.
+- [QBITTORRENT_API.md](docs/QBITTORRENT_API.md): EmpireBT also answers
   qBittorrent's Web API, so qBittorrent front ends such as qui and other
   qBittorrent tools work with it.
 
@@ -161,7 +161,7 @@ non-root user) and checks its own health. Any setting can be passed as an
 environment variable, such as `EMPIREBT_NETWORK_UPLOAD_LIMIT=500`. There's
 also a ready-made setup for running behind a VPN with gluetun, which
 follows the VPN's forwarded port. See
-[DOCKER.md](DOCKER.md) for ports, folders, reverse proxies and the VPN.
+[DOCKER.md](docs/DOCKER.md) for ports, folders, reverse proxies and the VPN.
 
 ## Settings
 
@@ -179,7 +179,7 @@ with comments on first run. Change settings in any of three ways:
 | `storage.allowed_dirs` | empty | Extra folders the web UI may save torrents in (comma-separated); the dashboard can save anywhere |
 | `storage.incomplete_dir` | empty | A folder new torrents download in; each moves to its save folder once complete (qBittorrent's incomplete folder). Empty downloads straight into the save folder |
 | `network.port` | `6881` | Incoming peer port, over TCP and UDP (uTP and the DHT); changes apply at once |
-| `network.port_file` | empty | A file holding the port to use instead, followed while running, such as a VPN's forwarded port ([DOCKER.md](DOCKER.md#port-forwarding)) |
+| `network.port_file` | empty | A file holding the port to use instead, followed while running, such as a VPN's forwarded port ([DOCKER.md](docs/DOCKER.md#port-forwarding)) |
 | `network.max_peers` | `50` | Peers to download one torrent from at once |
 | `network.max_connections` | `500` | Peer connections across all torrents, downloading and seeding (applies live) |
 | `network.upload_limit` | `0` | Total upload speed in KiB/s; `0` is unlimited (applies live) |
@@ -195,7 +195,7 @@ with comments on first run. Change settings in any of three ways:
 | `peers.countries` | `true` | Show peers' countries, from the free DB-IP Lite database, downloaded monthly (applies after restart) |
 | `console.start_on_add` | `true` | Start downloading as soon as a torrent is added |
 | `log.level` | `info` | How much to log: `error`, `warn`, `info`, `debug`, `trace`, or per area such as `info,tracker=debug`. The dashboard logs to `empirebt.log` in the data directory (10 MiB, then it starts over, keeping one old file); `empirebt serve` to its output |
-| `web.*` | | Web UI address, port, HTTPS, certificate, and host names; see [WEB_UI.md](WEB_UI.md#settings) |
+| `web.*` | | Web UI address, port, HTTPS, certificate, and host names; see [WEB_UI.md](docs/WEB_UI.md#settings) |
 
 Network and storage changes apply after a restart, unless marked live.
 
@@ -208,7 +208,7 @@ Command-line flags override settings for one run without saving them:
 
 Environment variables named `EMPIREBT_<SECTION>_<NAME>` override settings
 the same way, for example `EMPIREBT_NETWORK_UPLOAD_LIMIT=500`. This is
-mainly for [Docker](DOCKER.md#settings).
+mainly for [Docker](docs/DOCKER.md#settings).
 
 `--data-dir` (or `EMPIREBT_DATA_DIR`) chooses a different data directory.
 Only one EmpireBT can use a data directory at a time.
@@ -360,7 +360,7 @@ about 33 MB/s on the same connection. Three things make the difference:
   up after 5 seconds, while spare workers dial new ones.
 
 `crates/backend/examples/download.rs` repeats the measurement (see
-[TESTING.md](TESTING.md)).
+[TESTING.md](docs/TESTING.md)).
 
 Measured over localhost with nothing else in the way
 (`crates/backend/examples/throughput.rs`), one connection moves about
@@ -433,7 +433,7 @@ python3 interop/setup_libtorrent.py   # once
 cargo test -p empirebt-interop
 ```
 
-See [TESTING.md](TESTING.md) for how testing works, and
+See [TESTING.md](docs/TESTING.md) for how testing works, and
 [interop/README.md](interop/README.md) for the interop suite.
 
 To update the Rust dependencies, then build, lint, and test everything:
@@ -457,7 +457,7 @@ scripts/update-dependencies.sh --major  # new major versions too (needs cargo-ed
   instead.
 - **Tested on Linux.** macOS and Windows builds are not regularly tested.
 
-The detailed roadmap is in [CHECKLIST.md](CHECKLIST.md).
+The detailed roadmap is in [CHECKLIST.md](docs/CHECKLIST.md).
 
 ## Releasing
 

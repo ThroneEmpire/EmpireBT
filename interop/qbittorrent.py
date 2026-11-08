@@ -14,7 +14,7 @@ here, for `--map /downloads=<downloads>`.
 
     python3 interop/qbittorrent.py [VERSION]    # default 5.3.0
 
-The tests in crates/app/tests/qbittorrent.rs run it (see TESTING.md).
+The tests in crates/app/tests/qbittorrent.rs run it (see docs/TESTING.md).
 Needs Docker, and libtorrent set up for interop (setup_libtorrent.py) to
 make the .torrent files.
 """

@@ -90,4 +90,4 @@ directory and use `free_port()` for ports, so tests can run in parallel.
 
 `qbittorrent.py` runs a real qBittorrent (the linuxserver Docker image)
 with torrents in every case the importer handles, for the opt-in tests in
-`crates/app/tests/qbittorrent.rs`; see [TESTING.md](../TESTING.md).
+`crates/app/tests/qbittorrent.rs`; see [TESTING.md](../docs/TESTING.md).

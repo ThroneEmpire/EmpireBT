@@ -1,4 +1,4 @@
-# EmpireBT with its web UI. See DOCKER.md.
+# EmpireBT with its web UI. See docs/DOCKER.md.
 #
 #   mkdir -p data downloads
 #   docker compose up -d
@@ -23,7 +23,7 @@ services:
       - ./data:/data            # settings, torrent list, web UI password
       - ./downloads:/downloads  # downloaded files
     environment:
-      # Any setting can be set as EMPIREBT_<SECTION>_<NAME>; see DOCKER.md.
+      # Any setting can be set as EMPIREBT_<SECTION>_<NAME>; see docs/DOCKER.md.
       # Optional: only these host names may reach the web UI (empty: any):
       # EMPIREBT_WEB_ALLOWED_HOSTS: "torrents.example.com"
       # The web UI is HTTPS with a generated certificate (your browser asks

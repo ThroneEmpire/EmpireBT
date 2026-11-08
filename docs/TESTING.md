@@ -191,7 +191,7 @@ python3 interop/lt_peer.py seed /tmp/t.torrent some 6881
 python3 interop/lt_peer.py download /tmp/t.torrent /tmp/get 6882 127.0.0.1:6881 60
 ```
 
-See [interop/README.md](interop/README.md) for how to add a case.
+See [interop/README.md](../interop/README.md) for how to add a case.
 
 ## Real-swarm speed check
 
@@ -303,7 +303,7 @@ not retried in time, which shows up as "connecting" failures that are not
 the server's fault.
 
 Run it after changing announcing, the session store, storage, or the
-seeding runtime, and compare with the table in [README.md](README.md#scale).
+seeding runtime, and compare with the table in [README.md](../README.md#scale).
 
 ## Docker image
 
