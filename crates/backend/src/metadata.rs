@@ -24,7 +24,7 @@ const MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
 pub(crate) fn extension_handshake(metadata_size: Option<usize>) -> PeerMessage {
     extension_handshake_with(&ExtensionOffer {
         metadata_size,
-        client_version: true,
+        client_version: crate::identity::handshake_name(&crate::generate_peer_id()),
         ..ExtensionOffer::default()
     })
 }
@@ -40,8 +40,9 @@ pub(crate) struct ExtensionOffer {
     /// Our listen port, which a peer we connected to cannot otherwise
     /// know.
     pub listen_port: Option<u16>,
-    /// Name the client and its version (`v`); not in anonymous mode.
-    pub client_version: bool,
+    /// The client name and version to give (`v`): ours, qBittorrent's
+    /// when disguised, none in anonymous mode.
+    pub client_version: Option<&'static str>,
     /// Offer to relay hole punches (BEP 55; never for private torrents).
     pub holepunch: bool,
     /// A private torrent's: no metadata exchange at all, as libtorrent
@@ -79,11 +80,8 @@ pub(crate) fn extension_handshake_with(offer: &ExtensionOffer) -> PeerMessage {
             Value::Int(crate::engine::wire::MAX_QUEUED_UPLOADS as i64),
         ),
     ];
-    if offer.client_version {
-        entries.push((
-            b"v".to_vec(),
-            Value::bytes(format!("EmpireBT {}", env!("CARGO_PKG_VERSION"))),
-        ));
+    if let Some(name) = offer.client_version {
+        entries.push((b"v".to_vec(), Value::bytes(name)));
     }
     if let Some(size) = offer.metadata_size.filter(|_| !offer.private) {
         entries.push((b"metadata_size".to_vec(), Value::Int(size as i64)));
@@ -287,7 +285,7 @@ pub fn fetch_metadata_from_peer_with(
         return Err(invalid("peer does not support the extension protocol"));
     }
     connection.send(&extension_handshake_with(&ExtensionOffer {
-        client_version: crate::identity::identifies(&peer_id),
+        client_version: crate::identity::handshake_name(&peer_id),
         ..ExtensionOffer::default()
     }))?;
 
@@ -565,11 +563,19 @@ mod tests {
             };
             parse_extension_handshake(&payload).unwrap().client
         };
-        let named = client(&ExtensionOffer {
-            client_version: true,
-            ..ExtensionOffer::default()
-        });
-        assert!(named.is_some_and(|name| name.starts_with("EmpireBT")));
+        let named = |peer_id: [u8; 20]| {
+            client(&ExtensionOffer {
+                client_version: crate::identity::handshake_name(&peer_id),
+                ..ExtensionOffer::default()
+            })
+        };
+        assert!(named(crate::generate_peer_id()).is_some_and(|name| name.starts_with("EmpireBT")));
+        assert_eq!(named(crate::generate_anonymous_peer_id()), None);
+        // Disguised: qBittorrent's name, as it sends it.
+        assert_eq!(
+            named(crate::generate_qbittorrent_peer_id()).as_deref(),
+            Some("qBittorrent/5.1.4")
+        );
         assert_eq!(client(&ExtensionOffer::default()), None);
     }
 

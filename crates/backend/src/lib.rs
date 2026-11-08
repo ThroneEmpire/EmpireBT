@@ -49,8 +49,9 @@ pub use dht::Dht;
 pub use error::BackendError;
 pub use http::{HttpResponse, download, http_request};
 pub use identity::{
-    ANONYMOUS_USER_AGENT, CLIENT_CODE, PEER_ID_PREFIX, USER_AGENT, client_name,
-    generate_anonymous_peer_id, generate_peer_id, identifies,
+    ANONYMOUS_USER_AGENT, CLIENT_CODE, Identity, PEER_ID_PREFIX, QBITTORRENT_PEER_ID_PREFIX,
+    QBITTORRENT_USER_AGENT, USER_AGENT, client_name, disguised, generate_anonymous_peer_id,
+    generate_peer_id, generate_qbittorrent_peer_id, identifies,
 };
 pub use limits::Limits;
 pub use lsd::Lsd;

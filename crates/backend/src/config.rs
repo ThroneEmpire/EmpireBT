@@ -14,6 +14,8 @@ pub struct ClientConfig {
     dht_enabled: bool,
     lsd_enabled: bool,
     anonymous: bool,
+    /// Public torrents present themselves as qBittorrent.
+    disguise: bool,
     interface: Option<String>,
     dht_bootstrap: Vec<String>,
     encryption: crate::Encryption,
@@ -33,6 +35,7 @@ impl Default for ClientConfig {
             dht_enabled: true,
             lsd_enabled: true,
             anonymous: false,
+            disguise: false,
             interface: None,
             dht_bootstrap: crate::Dht::default_bootstrap(),
             encryption: crate::Encryption::default(),
@@ -115,6 +118,28 @@ impl ClientConfig {
 
     pub fn anonymous(&self) -> bool {
         self.anonymous
+    }
+
+    /// Public torrents present themselves as qBittorrent 5.1.4.
+    pub fn with_disguise(mut self, disguise: bool) -> Self {
+        self.disguise = disguise;
+        self
+    }
+
+    pub fn disguise(&self) -> bool {
+        self.disguise
+    }
+
+    /// How public torrents present themselves: the disguise, else
+    /// anonymous mode, else as EmpireBT.
+    pub fn identity(&self) -> crate::Identity {
+        if self.disguise {
+            crate::Identity::QBittorrent
+        } else if self.anonymous {
+            crate::Identity::Anonymous
+        } else {
+            crate::Identity::EmpireBt
+        }
     }
 
     /// Uses only this network interface, by name (`wg0`) or IPv4 address,

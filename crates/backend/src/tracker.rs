@@ -2370,13 +2370,25 @@ impl TrackerResponse {
     }
 }
 
+/// Encodes as libtorrent's `escape_string` does: letters, digits and
+/// `-_!.~*()` as they are, everything else `%XX`.
+/// Trackers decode either way, but the query reads exactly as
+/// libtorrent's (qBittorrent's) do.
 fn percent_encode(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => {
-                (*byte as char).to_string()
-            }
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'!'
+            | b'.'
+            | b'~'
+            | b'*'
+            | b'('
+            | b')' => (*byte as char).to_string(),
             _ => format!("%{byte:02X}"),
         })
         .collect()

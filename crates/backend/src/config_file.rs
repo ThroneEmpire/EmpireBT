@@ -155,6 +155,16 @@ pub const BACKEND_SETTINGS: &[Setting] = &[
         needs_restart: false,
     },
     Setting {
+        key: "network.disguise",
+        kind: SettingKind::Choice(&["off", "qbittorrent"]),
+        description: "qbittorrent: public torrents present themselves as qBittorrent 5.1.4 \
+                      (its peer ID, User-Agent, client name, and DHT tag), to blend in with \
+                      its users; it takes precedence over network.anonymous. Private torrents \
+                      always say they are EmpireBT: pretending otherwise to a private tracker \
+                      is what such trackers ban. It hides the client, not your IP address.",
+        needs_restart: false,
+    },
+    Setting {
         key: "dht.enabled",
         kind: SettingKind::Bool,
         description: "Find peers without trackers. Private torrents never use the DHT.",
@@ -419,6 +429,10 @@ impl ConfigFile {
                 self.typed::<bool>("network.anonymous")?
                     .unwrap_or(defaults.anonymous()),
             )
+            .with_disguise(
+                self.typed::<String>("network.disguise")?
+                    .is_some_and(|value| value == "qbittorrent"),
+            )
             .with_interface(self.typed::<String>("network.interface")?)
             .with_dht_bootstrap(
                 self.typed::<Vec<String>>("dht.bootstrap")?
@@ -516,7 +530,7 @@ impl ConfigFile {
 
     fn fill_missing_backend_settings(&mut self, download_dir: &Path) {
         let defaults = ClientConfig::default();
-        let values: [(&str, Value); 17] = [
+        let values: [(&str, Value); 18] = [
             (
                 "storage.download_dir",
                 Value::from(download_dir.to_string_lossy().as_ref()),
@@ -552,6 +566,7 @@ impl ConfigFile {
             ("network.utp", Value::from(defaults.utp().as_str())),
             ("network.lsd", Value::from(defaults.lsd_enabled())),
             ("network.anonymous", Value::from(defaults.anonymous())),
+            ("network.disguise", Value::from("off")),
             ("network.interface", Value::from("")),
             ("network.port_file", Value::from("")),
             ("storage.allowed_dirs", Value::from("")),

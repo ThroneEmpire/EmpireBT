@@ -11,6 +11,13 @@
 //! a torrent whose peer ID does not [identify](identifies) EmpireBT also
 //! leaves the client name out of its extension handshake and announces
 //! with a generic User-Agent.
+//!
+//! Disguised as qBittorrent ([`generate_qbittorrent_peer_id`]), a torrent
+//! says everything qBittorrent 5.1.4 says instead: its peer ID, its
+//! User-Agent, its client name in handshakes, and libtorrent's tag on DHT
+//! messages. Only public torrents are ever disguised: private trackers
+//! admit the clients they approve, and pretending to be another there is
+//! what they ban.
 
 /// The two-character client code in peer IDs and DHT messages.
 pub const CLIENT_CODE: [u8; 2] = *b"EM";
@@ -49,6 +56,92 @@ pub const USER_AGENT: &str = concat!("EmpireBT/", env!("CARGO_PKG_VERSION"));
 /// anonymous mode uses, so they blend in with its users.
 pub const ANONYMOUS_USER_AGENT: &str = "curl/7.81.0";
 
+/// How public torrents present themselves (private ones always say they
+/// are EmpireBT).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Identity {
+    /// As EmpireBT.
+    #[default]
+    EmpireBt,
+    /// As no client in particular (anonymous mode).
+    Anonymous,
+    /// As qBittorrent 5.1.4.
+    QBittorrent,
+}
+
+impl Identity {
+    /// The peer ID public torrents use instead of their own, if any: a
+    /// new one each time, so runs cannot be linked.
+    pub fn public_peer_id(self) -> Option<[u8; 20]> {
+        match self {
+            Self::EmpireBt => None,
+            Self::Anonymous => Some(generate_anonymous_peer_id()),
+            Self::QBittorrent => Some(generate_qbittorrent_peer_id()),
+        }
+    }
+
+    /// The User-Agent public torrents announce and scrape with.
+    pub fn user_agent(self) -> &'static str {
+        match self {
+            Self::EmpireBt => USER_AGENT,
+            Self::Anonymous => ANONYMOUS_USER_AGENT,
+            Self::QBittorrent => QBITTORRENT_USER_AGENT,
+        }
+    }
+
+    /// The `v` key on DHT messages, if any.
+    pub(crate) fn dht_version(self) -> Option<[u8; 4]> {
+        match self {
+            Self::EmpireBt => Some(DHT_VERSION),
+            Self::Anonymous => None,
+            Self::QBittorrent => Some(QBITTORRENT_DHT_VERSION),
+        }
+    }
+}
+
+/// qBittorrent 5.1.4's peer ID prefix: libtorrent's fingerprint for `qB`
+/// 5.1.4.0.
+pub const QBITTORRENT_PEER_ID_PREFIX: [u8; 8] = *b"-qB5140-";
+
+/// qBittorrent's User-Agent and handshake client name.
+pub const QBITTORRENT_USER_AGENT: &str = "qBittorrent/5.1.4";
+
+/// The `v` key libtorrent puts on DHT messages: `LT` and its major and
+/// minor version; qBittorrent 5.1 ships with libtorrent 2.0.
+pub(crate) const QBITTORRENT_DHT_VERSION: [u8; 4] = *b"LT\x02\x00";
+
+/// A peer ID as qBittorrent 5.1.4 makes one: its prefix, then twelve
+/// characters from libtorrent's `url_random` set.
+pub fn generate_qbittorrent_peer_id() -> [u8; 20] {
+    const PRINTABLE: &[u8] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.!~*()";
+    let mut id = [0; 20];
+    id[..8].copy_from_slice(&QBITTORRENT_PEER_ID_PREFIX);
+    let random: [u8; 12] = crate::dht::random_bytes();
+    for (byte, value) in id[8..].iter_mut().zip(random) {
+        *byte = PRINTABLE[usize::from(value) % PRINTABLE.len()];
+    }
+    id
+}
+
+/// Whether a peer ID is a disguised torrent's.
+pub fn disguised(peer_id: &[u8; 20]) -> bool {
+    peer_id.starts_with(&QBITTORRENT_PEER_ID_PREFIX)
+}
+
+/// The client name a torrent with `peer_id` gives in its extension
+/// handshake (`v`): ours, qBittorrent's when disguised, none when
+/// anonymous.
+pub fn handshake_name(peer_id: &[u8; 20]) -> Option<&'static str> {
+    if identifies(peer_id) {
+        Some(concat!("EmpireBT ", env!("CARGO_PKG_VERSION")))
+    } else if disguised(peer_id) {
+        Some(QBITTORRENT_USER_AGENT)
+    } else {
+        None
+    }
+}
+
 /// Generates a peer ID: [`PEER_ID_PREFIX`] followed by twelve random
 /// lowercase letters and digits. Printable IDs keep tracker logs and
 /// clients that display peer IDs readable.
@@ -76,6 +169,8 @@ pub fn identifies(peer_id: &[u8; 20]) -> bool {
 pub fn user_agent_for(peer_id: &[u8; 20]) -> &'static str {
     if identifies(peer_id) {
         USER_AGENT
+    } else if disguised(peer_id) {
+        QBITTORRENT_USER_AGENT
     } else {
         ANONYMOUS_USER_AGENT
     }
@@ -207,6 +302,34 @@ pub fn client_name(peer_id: &[u8; 20]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Disguised as qBittorrent 5.1.4, everything says so, as it would:
+    /// the peer ID's prefix and its libtorrent-style random part, the
+    /// User-Agent, the handshake name, and libtorrent's DHT tag.
+    #[test]
+    fn a_disguise_says_what_qbittorrent_says() {
+        let id = generate_qbittorrent_peer_id();
+        assert_eq!(&id[..8], b"-qB5140-");
+        assert!(
+            id[8..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.!~*()".contains(byte))
+        );
+        assert_ne!(id, generate_qbittorrent_peer_id());
+        assert!(disguised(&id) && !identifies(&id));
+        assert_eq!(client_name(&id).as_deref(), Some("qBittorrent 5.1.4"));
+        assert_eq!(user_agent_for(&id), "qBittorrent/5.1.4");
+        assert_eq!(handshake_name(&id), Some("qBittorrent/5.1.4"));
+        assert_eq!(Identity::QBittorrent.dht_version(), Some(*b"LT\x02\x00"));
+        assert_eq!(Identity::Anonymous.dht_version(), None);
+        assert_eq!(Identity::EmpireBt.dht_version(), Some(DHT_VERSION));
+        assert!(
+            Identity::QBittorrent
+                .public_peer_id()
+                .is_some_and(|id| disguised(&id))
+        );
+        assert_eq!(Identity::EmpireBt.public_peer_id(), None);
+    }
 
     #[test]
     fn names_clients_from_their_peer_ids() {

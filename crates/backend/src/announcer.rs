@@ -862,6 +862,10 @@ mod tests {
                 crate::generate_anonymous_peer_id(),
                 crate::ANONYMOUS_USER_AGENT,
             ),
+            (
+                crate::generate_qbittorrent_peer_id(),
+                crate::QBITTORRENT_USER_AGENT,
+            ),
         ] {
             let (url, requests) = recording_tracker();
             let root = std::env::temp_dir().join(format!(

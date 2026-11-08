@@ -277,7 +277,8 @@ struct Inner {
     /// uTP connections sharing this UDP port.
     utp: std::sync::OnceLock<Arc<crate::utp::Shared>>,
     /// Leave the client's name and version (`v`) out of queries.
-    anonymous: AtomicBool,
+    /// The `v` key on our messages: 0 ours, 1 none, 2 libtorrent's.
+    tag: std::sync::atomic::AtomicU8,
 }
 
 /// A running DHT: an IPv4 node, and an IPv6 node where the system has
@@ -348,11 +349,17 @@ impl Dht {
         }))
     }
 
-    /// Leaves the client's name and version out of DHT messages, for
-    /// anonymous mode.
-    pub fn set_anonymous(&self, anonymous: bool) {
+    /// The client tag on DHT messages: ours, none (anonymous mode), or
+    /// libtorrent's (disguised as qBittorrent). The DHT carries public
+    /// torrents only, so it follows how they present themselves.
+    pub fn set_identity(&self, identity: crate::Identity) {
+        let tag = match identity {
+            crate::Identity::EmpireBt => 0,
+            crate::Identity::Anonymous => 1,
+            crate::Identity::QBittorrent => 2,
+        };
         for family in &self.families {
-            family.anonymous.store(anonymous, Ordering::Relaxed);
+            family.tag.store(tag, Ordering::Relaxed);
         }
     }
 
@@ -719,7 +726,7 @@ impl Inner {
             silent: Mutex::new(HashMap::new()),
             state_path,
             utp: std::sync::OnceLock::new(),
-            anonymous: AtomicBool::new(false),
+            tag: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -1056,10 +1063,15 @@ impl Inner {
             (b"q", Value::bytes(method)),
             (b"a", Value::Dict(arguments)),
         ]);
-        if !self.anonymous.load(Ordering::Relaxed)
+        let identity = match self.tag.load(Ordering::Relaxed) {
+            1 => crate::Identity::Anonymous,
+            2 => crate::Identity::QBittorrent,
+            _ => crate::Identity::EmpireBt,
+        };
+        if let Some(version) = identity.dht_version()
             && let Value::Dict(entries) = &mut message
         {
-            entries.insert(b"v".to_vec(), Value::bytes(crate::identity::DHT_VERSION));
+            entries.insert(b"v".to_vec(), Value::bytes(version));
         }
         match self.socket.send_to(&message.encode(), address) {
             Ok(_) => Some(transaction),

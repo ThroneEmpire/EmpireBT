@@ -318,15 +318,11 @@ impl Handle {
         let (mut client, warnings) = store.load(config.clone())?;
         let settings = Settings {
             peer_id: empirebt_backend::generate_peer_id(),
-            anonymous: config.anonymous(),
+            identity: config.identity(),
             peer_timeout: config.peer_timeout(),
             binding: config.binding(),
         };
-        client.set_anonymous_peer_id(
-            settings
-                .anonymous
-                .then(empirebt_backend::generate_anonymous_peer_id),
-        );
+        client.set_anonymous_peer_id(settings.identity.public_peer_id());
         let dht_state = start_networking(&mut client, &config, &settings, &store);
         let (labels, damaged) = match Labels::load(&store.labels_path()) {
             Ok(labels) => (labels, None),
@@ -524,7 +520,7 @@ fn start_networking(
             Some(store.dht_path()),
         ) {
             Ok(dht) => {
-                dht.set_anonymous(settings.anonymous);
+                dht.set_identity(settings.identity);
                 client.set_dht(Some(dht));
                 DhtState::Running
             }
@@ -596,8 +592,9 @@ fn publish(engine: &mut Engine, published: &Published) {
 
 struct Settings {
     peer_id: [u8; 20],
-    /// `network.anonymous`: public torrents don't say they are EmpireBT.
-    anonymous: bool,
+    /// How public torrents present themselves (`network.anonymous`,
+    /// `network.disguise`).
+    identity: empirebt_backend::Identity,
     peer_timeout: Duration,
     /// The network interface every connection uses.
     binding: empirebt_backend::Binding,
@@ -2059,17 +2056,28 @@ impl Engine {
                     self.change_port(port);
                 }
             }
-            "network.anonymous" if !overridden => {
-                let anonymous = value == "true";
-                if anonymous != self.settings.anonymous {
-                    self.settings.anonymous = anonymous;
+            "network.anonymous" | "network.disguise" if !overridden => {
+                let identity = self
+                    .config
+                    .client_config()
+                    .map_or(self.settings.identity, |config| config.identity());
+                if identity != self.settings.identity {
+                    self.settings.identity = identity;
                     // Running torrents take their new peer IDs at once.
                     self.rebind(
                         self.client.config().listen_port(),
-                        if anonymous {
-                            "Anonymous mode is on: public torrents no longer say they are EmpireBT"
-                        } else {
-                            "Anonymous mode is off"
+                        match identity {
+                            empirebt_backend::Identity::QBittorrent => {
+                                "Disguised: public torrents now present themselves as \
+                                 qBittorrent 5.1.4"
+                            }
+                            empirebt_backend::Identity::Anonymous => {
+                                "Anonymous mode is on: public torrents no longer say they \
+                                 are EmpireBT"
+                            }
+                            empirebt_backend::Identity::EmpireBt => {
+                                "Public torrents say they are EmpireBT again"
+                            }
                         }
                         .to_owned(),
                     );
@@ -2215,11 +2223,8 @@ impl Engine {
         );
         self.client.set_listen_port(port);
         self.settings.peer_id = empirebt_backend::generate_peer_id();
-        self.client.set_anonymous_peer_id(
-            self.settings
-                .anonymous
-                .then(empirebt_backend::generate_anonymous_peer_id),
-        );
+        self.client
+            .set_anonymous_peer_id(self.settings.identity.public_peer_id());
         let config = self.client.config().clone();
         self.dht_state = start_networking(&mut self.client, &config, &self.settings, &self.store);
         // Seeds already reported as left out are not reported again.
@@ -2751,10 +2756,10 @@ impl Engine {
             }) else {
                 continue;
             };
-            let user_agent = if self.settings.anonymous && !private {
-                empirebt_backend::ANONYMOUS_USER_AGENT
-            } else {
+            let user_agent = if private {
                 empirebt_backend::USER_AGENT
+            } else {
+                self.settings.identity.user_agent()
             };
             groups
                 .entry((url, user_agent))
@@ -3876,13 +3881,138 @@ mod tests {
             snapshot.notices
         );
         assert!(snapshot.torrent(&hash).is_some(), "torrents stay");
+        // The disguise takes precedence, and switching it off leaves
+        // anonymous mode as it was.
+        let disguise = |value: &str| {
+            handle
+                .call(Command::ChangeSetting {
+                    key: "network.disguise".to_owned(),
+                    value: value.to_owned(),
+                })
+                .unwrap();
+            handle.snapshot()
+        };
+        let snapshot = disguise("qbittorrent");
+        assert!(
+            snapshot
+                .notices
+                .iter()
+                .any(|notice| notice.text.starts_with("Disguised")),
+            "{:?}",
+            snapshot.notices
+        );
+        assert!(
+            handle
+                .call(Command::ChangeSetting {
+                    key: "network.disguise".to_owned(),
+                    value: "utorrent".to_owned(),
+                })
+                .is_err(),
+            "only qBittorrent, or off"
+        );
+        let snapshot = disguise("off");
+        assert_eq!(
+            snapshot
+                .notices
+                .iter()
+                .filter(|notice| notice.text.starts_with("Anonymous mode is on"))
+                .count(),
+            2,
+            "back to anonymous: {:?}",
+            snapshot.notices
+        );
         let snapshot = change("false");
         assert!(
             snapshot
                 .notices
                 .iter()
-                .any(|notice| notice.text == "Anonymous mode is off")
+                .any(|notice| notice.text == "Public torrents say they are EmpireBT again")
         );
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Disguised, a public seed announces as qBittorrent 5.1.4 (its peer
+    /// ID and User-Agent), and a private one as EmpireBT, in the same
+    /// session.
+    #[test]
+    fn a_disguise_covers_public_torrents_only() {
+        let (handle, root) = engine("disguise");
+        handle_ok(
+            &handle,
+            Command::ChangeSetting {
+                key: "network.disguise".to_owned(),
+                value: "qbittorrent".to_owned(),
+            },
+        );
+        let tracker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/announce", tracker.local_addr().unwrap());
+        let (sender, requests) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for mut stream in tracker.incoming().flatten() {
+                let mut request = [0; 4096];
+                let size = stream.read(&mut request).unwrap_or(0);
+                let _ = sender.send(String::from_utf8_lossy(&request[..size]).into_owned());
+                let body = b"d8:intervali1800e5:peers0:e";
+                let mut reply =
+                    format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                        .into_bytes();
+                reply.extend(body);
+                let _ = stream.write_all(&reply);
+            }
+        });
+        let torrent = |name: &str, content: &[u8], private: bool| {
+            use sha1::Digest;
+            let mut bytes = format!(
+                "d8:announce{}:{url}4:infod6:lengthi{}e4:name{}:{name}12:piece lengthi16384e6:pieces20:",
+                url.len(),
+                content.len(),
+                name.len()
+            )
+            .into_bytes();
+            bytes.extend(sha1::Sha1::digest(content));
+            if private {
+                bytes.extend(b"7:privatei1e");
+            }
+            bytes.extend(b"ee");
+            bytes
+        };
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(root.join("seeds/public.bin"), b"public data").unwrap();
+        std::fs::write(root.join("seeds/private.bin"), b"private data").unwrap();
+        add_started(
+            &handle,
+            torrent("public.bin", b"public data", false),
+            root.join("seeds"),
+        );
+        add_started(
+            &handle,
+            torrent("private.bin", b"private data", true),
+            root.join("seeds"),
+        );
+        let (mut public, mut private) = (None, None);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while (public.is_none() || private.is_none()) && Instant::now() < deadline {
+            let Ok(request) = requests.recv_timeout(Duration::from_millis(200)) else {
+                continue;
+            };
+            // The private torrent's hash is the other one: tell them apart
+            // by peer ID prefix.
+            if request.contains("peer_id=-qB5140-") {
+                public = Some(request);
+            } else if request.contains("peer_id=-EM") {
+                private = Some(request);
+            }
+        }
+        let public = public.expect("the public seed never announced as qBittorrent");
+        assert!(
+            public.contains("User-Agent: qBittorrent/5.1.4\r\n"),
+            "{public}"
+        );
+        let private = private.expect("the private seed never announced as EmpireBT");
+        assert!(private.contains("User-Agent: EmpireBT/"), "{private}");
+        assert!(!private.contains("qBittorrent"), "{private}");
         handle.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

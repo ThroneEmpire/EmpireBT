@@ -87,22 +87,28 @@ impl Client {
         })
     }
 
-    /// Anonymous mode: public torrents started from now on use `peer_id`
-    /// (see [`crate::generate_anonymous_peer_id`]), and with it a generic
-    /// User-Agent and no client name in their handshakes. Private
-    /// torrents keep the peer ID they are given, as private trackers
-    /// admit only clients they know. `None` ends anonymous mode.
+    /// Public torrents started from now on use `peer_id` instead of their
+    /// own: an anonymous one (see [`crate::generate_anonymous_peer_id`]),
+    /// with a generic User-Agent and no client name, or a disguise (see
+    /// [`crate::generate_qbittorrent_peer_id`]), with qBittorrent's.
+    /// Private torrents keep the peer ID they are given, as private
+    /// trackers admit only clients they know. `None` ends both.
     pub fn set_anonymous_peer_id(&mut self, peer_id: Option<[u8; 20]>) {
         self.anonymous_peer_id = peer_id;
     }
 
-    /// The peer ID a torrent uses when given `peer_id`: the anonymous one
-    /// in anonymous mode, unless the torrent is private. A magnet link
-    /// without metadata cannot say, and is fetched anonymously.
+    /// The peer ID a torrent uses when given `peer_id`: the public one, if
+    /// set, unless the torrent is private. A magnet link without metadata
+    /// cannot say whether it is, so it is fetched anonymously, never
+    /// disguised: its trackers may be a private tracker's.
     pub fn peer_id_for(&self, info: Option<&TorrentInfo>, peer_id: [u8; 20]) -> [u8; 20] {
-        match self.anonymous_peer_id {
-            Some(anonymous) if !info.is_some_and(TorrentInfo::is_private) => anonymous,
-            _ => peer_id,
+        match (self.anonymous_peer_id, info) {
+            (Some(_), Some(info)) if info.is_private() => peer_id,
+            (Some(public), None) if crate::disguised(&public) => {
+                crate::generate_anonymous_peer_id()
+            }
+            (Some(public), _) => public,
+            (None, _) => peer_id,
         }
     }
 
@@ -2198,6 +2204,15 @@ mod tests {
             own,
             "private trackers admit only clients they know"
         );
+        // Disguised: public torrents as qBittorrent, private ones as
+        // themselves, and a magnet link (which may be private) only
+        // anonymously until its metadata says.
+        let disguise = crate::generate_qbittorrent_peer_id();
+        client.set_anonymous_peer_id(Some(disguise));
+        assert_eq!(client.peer_id_for(Some(&public), own), disguise);
+        assert_eq!(client.peer_id_for(Some(&private), own), own);
+        let fetching = client.peer_id_for(None, own);
+        assert!(!crate::disguised(&fetching) && !crate::identifies(&fetching));
         client.set_anonymous_peer_id(None);
         assert_eq!(client.peer_id_for(Some(&public), own), own);
     }

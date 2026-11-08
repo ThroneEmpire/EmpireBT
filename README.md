@@ -190,6 +190,7 @@ with comments on first run. Change settings in any of three ways:
 | `network.interface` | empty (any) | Bind every connection to one interface, by name (`wg0`) or address; nothing connects while it is down |
 | `network.lsd` | `true` | Find peers on the local network (never for private torrents) |
 | `network.anonymous` | `false` | Anonymous mode: public torrents don't say they are EmpireBT ([Privacy](#privacy)); applies live |
+| `network.disguise` | `off` | `qbittorrent`: public torrents present themselves as qBittorrent 5.1.4 ([Privacy](#privacy)); takes precedence over anonymous mode; applies live |
 | `dht.enabled` | `true` | Find peers without trackers (never for private torrents) |
 | `dht.bootstrap` | public routers | Nodes used to join the DHT |
 | `peers.countries` | `true` | Show peers' countries, from the free DB-IP Lite database, downloaded monthly (applies after restart) |
@@ -329,9 +330,19 @@ making itself easy to follow:
   torrents keep saying they are EmpireBT, because private trackers allow
   only clients they know.
 
-Anonymous mode hides which client you use, not who you are. A client
-that names itself "Unknown" is still unusual, and clients can be told
-apart by how they behave.
+- **Disguise** (`network.disguise = qbittorrent`). For public torrents
+  EmpireBT says everything qBittorrent 5.1.4 says: its peer ID
+  (`-qB5140-` and libtorrent-style random characters), `qBittorrent/5.1.4`
+  as the User-Agent and handshake name, and libtorrent's tag on DHT
+  messages. In a swarm it looks like one of millions of qBittorrent users
+  rather than an "Unknown" client. It takes precedence over anonymous
+  mode. Private torrents always say they are EmpireBT: private trackers
+  admit the clients they approve, and pretending to be another there is
+  what they ban. A magnet link, which may turn out private, fetches its
+  metadata anonymously, and is disguised once known to be public.
+
+Neither hides who you are, only which client you use, and clients can
+still be told apart by the finer details of how they behave.
 
 ### Connections
 

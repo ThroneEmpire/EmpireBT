@@ -197,7 +197,7 @@ impl PeerWire {
                 pex: !self.private,
                 your_ip: Some(self.link.address.ip()),
                 listen_port: torrent.swarm.listen_port(),
-                client_version: crate::identity::identifies(&torrent.peer_id),
+                client_version: crate::identity::handshake_name(&torrent.peer_id),
                 holepunch: !self.private,
                 private: self.private,
             };
