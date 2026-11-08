@@ -181,7 +181,7 @@ with comments on first run. Change settings in any of three ways:
 | `network.port` | `6881` | Incoming peer port, over TCP and UDP (uTP and the DHT); changes apply at once |
 | `network.port_file` | empty | A file holding the port to use instead, followed while running, such as a VPN's forwarded port ([DOCKER.md](docs/DOCKER.md#port-forwarding)) |
 | `network.max_peers` | `50` | Peers to download one torrent from at once |
-| `network.max_connections` | `500` | Peer connections across all torrents, downloading and seeding (applies live) |
+| `network.max_connections` | `500` | Peer connections across all torrents, downloading and seeding (applies live); when they run short, rarely seeded torrents keep theirs ([Connections](#connections)) |
 | `network.upload_limit` | `0` | Total upload speed in KiB/s; `0` is unlimited (applies live) |
 | `network.download_limit` | `0` | Total download speed in KiB/s; `0` is unlimited (applies live) |
 | `network.peer_timeout` | `10` | Seconds before an unresponsive peer or tracker is dropped |
@@ -346,6 +346,13 @@ still be told apart by the finer details of how they behave.
 
 ### Connections
 
+- **Rarely seeded torrents come first when connections run short.** At
+  the connection limit, a peer of a torrent that few others seed (by the
+  seeders and downloaders trackers report: none else seeding first, then
+  downloaders per seed, as libtorrent ranks seeds) takes the place of the
+  least busy peer of a well-seeded one; a peer of a well-seeded torrent is the
+  one turned away. Downloads keep theirs before any seed. Every torrent
+  keeps seeding: nothing is paused.
 - **uTP (BEP 29)** runs on the same port as TCP and the DHT, so clients
   that try uTP first connect immediately. Its congestion control backs off
   as soon as it sees queuing, so seeding leaves room for everything else.

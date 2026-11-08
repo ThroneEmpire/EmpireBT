@@ -347,6 +347,7 @@ pub(crate) fn serve(
         waker,
         limits,
         throttled: Vec::new(),
+        evicted: Vec::new(),
     };
     let mut events = Events::with_capacity(1024);
     let mut last_sweep = Instant::now();
@@ -433,13 +434,99 @@ struct Server<'a> {
     limits: Arc<crate::Limits>,
     /// Connections that found a rate limit's bucket empty, to retry soon.
     throttled: Vec<usize>,
+    /// Connections to close to make room for newcomers whose torrents need
+    /// them more.
+    evicted: Vec<usize>,
+}
+
+/// Connections past the limit allowed through their handshake, so we learn
+/// which torrent each wants before keeping or closing it (libtorrent's
+/// `connections_slack`).
+const CONNECTION_SLACK: usize = 10;
+
+/// A torrent that could give up a connection: it, its least useful
+/// connection's [`PeerWire::eviction_order`], and that connection.
+type Candidate = (Arc<ActiveTorrent>, (bool, Instant), usize);
+
+/// Where a connection should be taken from when one must make room: the
+/// torrent best placed to give one up, and its least useful connection.
+struct Eviction {
+    torrent: Arc<ActiveTorrent>,
+    key: AdmissionKey,
+    victim: usize,
+}
+
+/// How readily a torrent gives up a connection, greatest first: a seed
+/// before a download (as libtorrent prefers), then the torrent least
+/// needed by its swarm (lowest seed rank: the most seeds per downloader),
+/// then the one with the most connections.
+type AdmissionKey = (bool, u32, usize);
+
+fn admission_key(torrent: &ActiveTorrent) -> AdmissionKey {
+    (
+        torrent.is_complete(),
+        u32::MAX - torrent.seed_rank(),
+        torrent.connection_count(),
+    )
 }
 
 impl Server<'_> {
-    /// Whether another connection may open, by this runtime's cap and the
-    /// limit shared by all runtimes.
-    fn has_room(&self) -> bool {
-        self.connections.len() < self.max_connections && self.limits.has_room(0)
+    /// Whether an incoming connection may open: up to the limits plus the
+    /// slack, as its handshake decides whether it stays.
+    fn has_slack(&self) -> bool {
+        self.connections.len() < self.max_connections.saturating_add(CONNECTION_SLACK)
+            && self.limits.open_connections()
+                < self
+                    .limits
+                    .max_connections()
+                    .saturating_add(CONNECTION_SLACK)
+    }
+
+    /// Past a limit: a newcomer stays only if a connection makes room.
+    fn over_limit(&self) -> bool {
+        self.connections.len() > self.max_connections
+            || self.limits.open_connections() > self.limits.max_connections()
+    }
+
+    /// The connection to close if a newcomer needs room, other than
+    /// `newcomer` itself: from the torrent that most readily gives one up
+    /// ([`AdmissionKey`]), its least useful connection
+    /// ([`PeerWire::eviction_order`]).
+    fn eviction(&self, newcomer: usize) -> Option<Eviction> {
+        let mut torrents: HashMap<*const ActiveTorrent, Candidate> = HashMap::new();
+        for (id, connection) in &self.connections {
+            if *id == newcomer {
+                continue;
+            }
+            let Phase::Active { torrent, wire } = &connection.phase else {
+                continue;
+            };
+            let order = wire.eviction_order();
+            torrents
+                .entry(Arc::as_ptr(torrent))
+                .and_modify(|best| {
+                    if order < best.1 {
+                        *best = (Arc::clone(torrent), order, *id);
+                    }
+                })
+                .or_insert_with(|| (Arc::clone(torrent), order, *id));
+        }
+        torrents
+            .into_values()
+            .map(|(torrent, _, victim)| Eviction {
+                key: admission_key(&torrent),
+                torrent,
+                victim,
+            })
+            .max_by_key(|eviction| eviction.key)
+    }
+
+    /// Closes the connections chosen to make room.
+    fn close_evicted(&mut self) {
+        for id in std::mem::take(&mut self.evicted) {
+            tracing::debug!(target: "peer", "closing a connection to make room for a peer of a torrent that needs it more");
+            self.close(id);
+        }
     }
 
     /// Within a few connections of a limit, as libtorrent checks before
@@ -475,7 +562,7 @@ impl Server<'_> {
                 Err(_) => return,
             };
             let address = crate::net::canonical(address);
-            if !self.has_room() {
+            if !self.has_slack() {
                 drop(stream);
                 continue;
             }
@@ -497,7 +584,7 @@ impl Server<'_> {
     /// them for the event loop.
     fn accept_utp(&mut self, listener: &crate::utp::UtpListener) {
         while let Some(mut stream) = listener.accept() {
-            if !self.has_room() {
+            if !self.has_slack() {
                 continue; // dropping it closes the connection
             }
             let id = self.next_id();
@@ -633,7 +720,9 @@ impl Server<'_> {
                     }
                     connection.input.extend_from_slice(&buffer[..read]);
                     connection.last_read = Instant::now();
-                    if let Err(error) = self.process(id) {
+                    let result = self.process(id);
+                    self.close_evicted();
+                    if let Err(error) = result {
                         return self.fail(id, error);
                     }
                 }
@@ -650,6 +739,18 @@ impl Server<'_> {
     fn process(&mut self, id: usize) -> Result<bool, BackendError> {
         let routes = self.routes;
         let crowded = self.crowded();
+        // A newcomer past the limit: what would make room for it, decided
+        // once its handshake names a torrent.
+        let admission = match self
+            .connections
+            .get(&id)
+            .map(|connection| &connection.phase)
+        {
+            Some(Phase::Handshake { .. } | Phase::Negotiating { .. }) if self.over_limit() => {
+                Some(self.eviction(id))
+            }
+            _ => None,
+        };
         let Some(connection) = self.connections.get_mut(&id) else {
             return Ok(false);
         };
@@ -716,6 +817,19 @@ impl Server<'_> {
             let torrent = routes
                 .route(&handshake)
                 .ok_or_else(|| invalid("peer asked for a torrent we are not sharing"))?;
+            // Past the limit, it stays only if another torrent can better
+            // spare a connection: closed before we answer, otherwise.
+            if let Some(eviction) = &admission {
+                match eviction {
+                    Some(eviction)
+                        if !Arc::ptr_eq(&eviction.torrent, &torrent)
+                            && eviction.key > admission_key(&torrent) =>
+                    {
+                        self.evicted.push(eviction.victim);
+                    }
+                    _ => return Err(invalid("too many connections")),
+                }
+            }
             let Some(key) = torrent.swarm.join(connection.address, Instant::now()) else {
                 return Err(invalid("peer is banned for sending corrupt data"));
             };
@@ -875,7 +989,9 @@ impl Server<'_> {
             if connection.paused || connection.input.is_empty() {
                 break;
             }
-            match self.process(id) {
+            let result = self.process(id);
+            self.close_evicted();
+            match result {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => return self.fail(id, error),

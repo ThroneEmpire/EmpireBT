@@ -170,6 +170,9 @@ pub(crate) struct Download {
     pub(crate) claim: Option<Claim>,
 }
 
+/// No swarm size reported yet.
+const UNKNOWN_SWARM: u64 = u64::MAX;
+
 /// Leaf (16 KiB block) hash layers by file root.
 type LeafLayer = Arc<Vec<[u8; 32]>>;
 
@@ -187,6 +190,9 @@ pub(crate) struct ActiveTorrent {
     connections: std::sync::atomic::AtomicUsize,
     /// The most connections this torrent keeps, when a download limits it.
     connection_limit: std::sync::atomic::AtomicUsize,
+    /// Seeders and leechers trackers last reported, packed in one word
+    /// (high and low half); [`UNKNOWN_SWARM`] until one did.
+    swarm_size: std::sync::atomic::AtomicU64,
     /// Why the last connection that failed did so.
     last_error: Mutex<Option<crate::BackendError>>,
     /// Computed on the first leaf-layer hash request for a file, so
@@ -224,6 +230,7 @@ impl ActiveTorrent {
             pieces: Arc::new(Mutex::new(pieces)),
             connections: std::sync::atomic::AtomicUsize::new(0),
             connection_limit: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            swarm_size: std::sync::atomic::AtomicU64::new(UNKNOWN_SWARM),
             last_error: Mutex::new(None),
             leaf_layers: Mutex::new(HashMap::new()),
         })
@@ -307,6 +314,44 @@ impl ActiveTorrent {
         self.connections
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         self.progress.remove_peer();
+    }
+
+    /// Records the swarm's size as trackers reported it.
+    pub(crate) fn set_swarm_size(&self, seeders: Option<u64>, leechers: Option<u64>) {
+        let packed = match (seeders, leechers) {
+            (None, None) => UNKNOWN_SWARM,
+            (seeders, leechers) => {
+                let half = |count: Option<u64>| count.unwrap_or(0).min(u64::from(u32::MAX - 1));
+                (half(seeders) << 32) | half(leechers)
+            }
+        };
+        self.swarm_size
+            .store(packed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How much a seed is needed, as libtorrent's `torrent::seed_rank`
+    /// works it out from scrape counts: higher is more needed. A swarm with
+    /// no other seed ranks above all others (by its downloaders); else
+    /// downloaders per seed, scaled by 1000. Ourselves are left out of the
+    /// seeds. A download, which needs every connection it can get, is 0
+    /// here; callers rank downloads above seeds anyway. Unknown counts rank
+    /// as one downloader per seed.
+    pub(crate) fn seed_rank(&self) -> u32 {
+        const NO_SEEDS: u32 = 0x2000_0000;
+        const PRIO_MASK: u32 = 0x0fff_ffff;
+        if !self.is_complete() {
+            return 0;
+        }
+        let packed = self.swarm_size.load(std::sync::atomic::Ordering::Relaxed);
+        if packed == UNKNOWN_SWARM {
+            return 1000;
+        }
+        let seeds = (packed >> 32).saturating_sub(1);
+        let downloaders = packed & u64::from(u32::MAX);
+        match (1 + downloaders).saturating_mul(1000).checked_div(seeds) {
+            Some(per_seed) => per_seed.min(u64::from(PRIO_MASK)) as u32,
+            None => NO_SEEDS | (downloaders.min(u64::from(PRIO_MASK)) as u32),
+        }
     }
 
     pub(crate) fn is_complete(&self) -> bool {

@@ -610,6 +610,9 @@ impl AnnounceLoop {
                 uploaded: entry.uploaded(),
                 dht_announced: None,
             };
+            if let Some((runtime, _)) = &self.tracked_runtime {
+                runtime.set_swarm_size(&key, status.seeders, status.leechers);
+            }
             if let Ok(mut statuses) = self.shared.status.lock() {
                 statuses.insert(key, status);
             }
@@ -1051,7 +1054,7 @@ mod tests {
         let runtime = Arc::new(Runtime::new(vec![seeder], 1).unwrap());
 
         let mut announcer = SeedAnnouncer::start(7777, Duration::from_secs(1), None);
-        announcer.track(runtime);
+        announcer.track(Arc::clone(&runtime));
         let first = steady_requests
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
@@ -1080,6 +1083,9 @@ mod tests {
         };
         assert_eq!(status.trackers_total, 2);
         assert_eq!((status.seeders, status.leechers), (Some(5), Some(2)));
+        // The swarm's size ranks the seed: (1 + 2 downloaders) * 1000 /
+        // 4 other seeds.
+        assert_eq!(runtime.seed_rank(info.info_hash()), Some(750));
         assert_eq!(status.last_error, None);
         // The working tier was not asked again meanwhile.
         assert!(steady_requests.try_recv().is_err());

@@ -221,6 +221,17 @@ impl PeerWire {
     /// uploads, timeouts, peer exchange, and keep-alives.
     /// `crowded`: connection slots are running short, so connections no
     /// one needs close sooner.
+    /// Where this connection stands when one must close for a newcomer:
+    /// busy ones (uploading to it, or downloading from it) after idle ones,
+    /// and among those, the one idle longest first.
+    pub(crate) fn eviction_order(&self) -> (bool, Instant) {
+        let busy = (!self.state.am_choking && self.state.peer_interested)
+            || !self.state.uploads.is_empty()
+            || self.reads_in_flight > 0
+            || !self.downloads.is_empty();
+        (busy, self.state.last_upload_activity)
+    }
+
     /// `sending`: bytes are still waiting to be written to the peer.
     pub(crate) fn tick(
         &mut self,

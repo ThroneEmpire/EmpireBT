@@ -443,6 +443,29 @@ impl Runtime {
         Some(torrent.swarm.peers())
     }
 
+    /// Records the swarm size trackers report for a torrent, which ranks
+    /// it when connections run short (rarely seeded ones keep theirs).
+    pub fn set_swarm_size(
+        &self,
+        info_hash: &[u8; 20],
+        seeders: Option<u64>,
+        leechers: Option<u64>,
+    ) {
+        if let Some(torrent) = self.routes.read().by_key.get(info_hash) {
+            torrent.set_swarm_size(seeders, leechers);
+        }
+    }
+
+    /// A torrent's seed rank (see `ActiveTorrent::seed_rank`).
+    #[cfg(test)]
+    pub(crate) fn seed_rank(&self, info_hash: &[u8; 20]) -> Option<u32> {
+        self.routes
+            .read()
+            .by_key
+            .get(info_hash)
+            .map(|torrent| torrent.seed_rank())
+    }
+
     /// Peers currently connected to this runtime.
     pub fn connections(&self) -> usize {
         self.connections.load(Ordering::Acquire)
@@ -1355,6 +1378,187 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Connects and sends a handshake for `info`; whether the connection
+    /// closed without an answer.
+    fn refused(address: SocketAddr, info: &crate::TorrentInfo, id: u8) -> bool {
+        use std::io::{Read, Write};
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = stream.write_all(&Handshake::new(*info.info_hash(), [id; 20]).encode());
+        matches!(stream.read(&mut [0; 1]), Ok(0) | Err(_))
+    }
+
+    /// Whether the seed closes this connection within a few seconds.
+    fn closed_soon(stream: &mut TcpStream) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        while std::time::Instant::now() < deadline {
+            if let Err(error) = read_message(stream)
+                && !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A peer downloading `info` slowly: interested, then asking for every
+    /// block once unchoked, so it stays busy under an upload limit.
+    fn busy_peer(address: SocketAddr, info: &crate::TorrentInfo, id: u8) -> TcpStream {
+        use std::io::Write;
+        let mut stream = interested_peer(address, info, id);
+        while read_message(&mut stream).unwrap() != PeerMessage::Unchoke {}
+        let mut requests = Vec::new();
+        for piece in 0..info.piece_count() as u32 {
+            requests.extend(
+                PeerMessage::Request {
+                    piece_index: piece,
+                    begin: 0,
+                    length: 16 * 1024,
+                }
+                .encode()
+                .unwrap(),
+            );
+        }
+        stream.write_all(&requests).unwrap();
+        stream
+    }
+
+    /// The seed rank, as libtorrent works it out from scrape counts.
+    #[test]
+    fn ranks_seeds_by_how_much_their_swarms_need_them() {
+        let limits = Arc::new(crate::Limits::unlimited());
+        let (info, _, shutdown, server, root) = serving("seed-rank", 16 * 1024, limits);
+        let _ = info;
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let storage = crate::Storage::new(&root).unwrap();
+        let data: Vec<u8> = (0..16 * 1024).map(|byte| (byte * 7 % 251) as u8).collect();
+        let hash = {
+            use sha1::{Digest, Sha1};
+            Sha1::digest(&data).into()
+        };
+        let info = crate::TorrentInfo::new(
+            "seed-rank",
+            16 * 1024,
+            vec![hash],
+            vec![crate::TorrentFile::new("seed-rank", 16 * 1024)],
+        )
+        .unwrap();
+        let torrent = crate::engine::active::ActiveTorrent::seeding(
+            info,
+            storage,
+            [3; 20],
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            torrent.seed_rank(),
+            1000,
+            "unknown: one downloader per seed"
+        );
+        // Only ourselves seed it: above every swarm with another seed.
+        torrent.set_swarm_size(Some(1), Some(3));
+        let alone = torrent.seed_rank();
+        assert_eq!(alone, 0x2000_0000 | 3);
+        // 49 other seeds and one downloader: (1 + 1) * 1000 / 49.
+        torrent.set_swarm_size(Some(50), Some(1));
+        assert_eq!(torrent.seed_rank(), 40);
+        torrent.set_swarm_size(Some(3), Some(10));
+        assert_eq!(torrent.seed_rank(), 11 * 1000 / 2);
+        assert!(alone > torrent.seed_rank());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// At the connection limit, a torrent no one else seeds keeps getting
+    /// peers, in place of a torrent with plenty of seeds, even holding more
+    /// connections already (counting connections alone, as libtorrent
+    /// does, would turn it away); a peer of the well-seeded torrent is the
+    /// one turned away.
+    #[test]
+    fn a_rarely_seeded_torrent_gets_connections_before_a_well_seeded_one() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-runtime-rank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let storage = crate::Storage::new(&root).unwrap();
+        const SIZE: usize = 1024 * 1024;
+        let seeder = |name: &str, salt: u8| {
+            let data: Vec<u8> = (0..SIZE).map(|byte| (byte as u8) ^ salt).collect();
+            let hashes = data
+                .chunks(16 * 1024)
+                .map(|piece| {
+                    use sha1::{Digest, Sha1};
+                    Sha1::digest(piece).into()
+                })
+                .collect();
+            let info = crate::TorrentInfo::new(
+                name,
+                16 * 1024,
+                hashes,
+                vec![crate::TorrentFile::new(name, SIZE as u64)],
+            )
+            .unwrap();
+            for (index, piece) in data.chunks(16 * 1024).enumerate() {
+                storage.write_piece(&info, index, piece).unwrap();
+            }
+            let seeder = Seeder::new(
+                info.clone(),
+                storage.clone(),
+                [3; 20],
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            (info, seeder)
+        };
+        let (crowded, crowded_seeder) = seeder("crowded", 1);
+        let (rare, rare_seeder) = seeder("rare", 2);
+        let limits = Arc::new(crate::Limits::unlimited());
+        limits.set_max_connections(3);
+        // Slow, so the crowded torrent's peers stay busy downloading.
+        limits.set_upload_rate(32 * 1024);
+        let runtime = Arc::new(
+            Runtime::new(vec![crowded_seeder, rare_seeder], 64)
+                .unwrap()
+                .with_limits(Arc::clone(&limits)),
+        );
+        runtime.set_swarm_size(crowded.info_hash(), Some(50), Some(1));
+        runtime.set_swarm_size(rare.info_hash(), Some(1), Some(3));
+        let listener = runtime.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = {
+            let (runtime, shutdown) = (Arc::clone(&runtime), Arc::clone(&shutdown));
+            thread::spawn(move || runtime.serve_until(&listener, &shutdown))
+        };
+
+        // The rare torrent already has more connections than the crowded
+        // one: balancing by count alone would turn its next peer away.
+        let _rare_first = busy_peer(address, &rare, 1);
+        let _rare_second = busy_peer(address, &rare, 2);
+        let mut crowded_peer = busy_peer(address, &crowded, 3);
+        assert_eq!(limits.open_connections(), 3);
+        // In, in place of the crowded torrent's peer; the rare torrent's
+        // three are then what stays open.
+        let _rare_third = busy_peer(address, &rare, 4);
+        assert!(
+            closed_soon(&mut crowded_peer),
+            "the crowded torrent's peer stayed"
+        );
+        assert_eq!(limits.open_connections(), 3);
+        // A newcomer for the crowded torrent is the one turned away.
+        assert!(refused(address, &crowded, 5));
+        assert_eq!(limits.open_connections(), 3);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn refuses_peers_beyond_the_shared_connection_limit() {
         let limits = Arc::new(crate::Limits::unlimited());
@@ -1364,15 +1568,10 @@ mod tests {
         let first = interested_peer(address, &info, 1);
         let _second = interested_peer(address, &info, 2);
         assert_eq!(limits.open_connections(), 2);
-        // A third is closed at once, before any handshake.
-        let mut third = TcpStream::connect(address).unwrap();
-        third
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        assert!(matches!(
-            std::io::Read::read(&mut third, &mut [0; 1]),
-            Ok(0) | Err(_)
-        ));
+        // A third, for the same torrent, gets through to its handshake (the
+        // slack), and is closed without an answer: no other torrent can
+        // spare a connection for it.
+        assert!(refused(address, &info, 3));
         // Once one leaves, there is room again.
         drop(first);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
