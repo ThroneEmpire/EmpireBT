@@ -389,6 +389,46 @@ pub(crate) fn canonical(address: SocketAddr) -> SocketAddr {
     }
 }
 
+/// The host an address belongs to, for limits of one per host: an IPv4
+/// address itself, and for IPv6 its /64 network, which one host commonly
+/// holds whole (privacy extensions hand out a new address in it every
+/// day, and anyone with one can use any of its 2^64 addresses). As
+/// libtorrent's maintainer proposes for its issue 8934.
+pub(crate) fn host(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let segments = v6.segments();
+                IpAddr::V6(Ipv6Addr::new(
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    0,
+                    0,
+                    0,
+                    0,
+                ))
+            }
+        },
+        IpAddr::V4(_) => ip,
+    }
+}
+
+/// An address no peer can be reached at: unspecified (`0.0.0.0/8`, `::`),
+/// multicast, or IPv4 broadcast. Such addresses show up in DHT peer lists
+/// now and then (libtorrent's issue 7910), and dialing them is wasted.
+pub(crate) fn unreachable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.octets()[0] == 0 || v4.is_multicast() || v4.is_broadcast(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => unreachable(IpAddr::V4(v4)),
+            None => v6.is_unspecified() || v6.is_multicast(),
+        },
+    }
+}
+
 /// `fe80::/10`.
 pub(crate) fn is_link_local(ip: &Ipv6Addr) -> bool {
     ip.segments()[0] & 0xffc0 == 0xfe80
@@ -445,6 +485,28 @@ fn unavailable_message(interface: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosts_are_ipv4_addresses_and_ipv6_64s() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        assert_eq!(host(ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(
+            host(ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd")),
+            ip("2001:db8:1:2::")
+        );
+        assert_eq!(
+            host(ip("2001:db8:1:2::1")),
+            host(ip("2001:db8:1:2:ffff::9"))
+        );
+        assert_ne!(host(ip("2001:db8:1:2::1")), host(ip("2001:db8:1:3::1")));
+        assert_eq!(host(ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
+        assert!(unreachable(ip("0.0.0.0")) && unreachable(ip("0.200.1.1")));
+        assert!(unreachable(ip("239.1.1.1")) && unreachable(ip("255.255.255.255")));
+        assert!(unreachable(ip("::")) && unreachable(ip("ff05::2")));
+        assert!(unreachable(ip("::ffff:0.0.0.0")));
+        assert!(!unreachable(ip("10.0.0.1")) && !unreachable(ip("127.0.0.1")));
+        assert!(!unreachable(ip("2001:db8::1")) && !unreachable(ip("::1")));
+    }
 
     #[test]
     fn lists_only_public_addresses_ipv4_first() {

@@ -103,9 +103,9 @@ impl RoutingTable {
     }
 
     /// Records a node that just responded or queried us. One node per
-    /// IP address, as libtorrent's `restrict_routing_ips`: otherwise one
-    /// machine could fill the table under made-up ids and steer every
-    /// lookup. An address that comes back with a new id (it restarted, or
+    /// host (an IPv4 address, or an IPv6 /64: see [`crate::net::host`]), as
+    /// libtorrent's `restrict_routing_ips`: otherwise one machine could
+    /// fill the table under made-up ids and steer every lookup. An address that comes back with a new id (it restarted, or
     /// moved to a BEP 42 id) replaces its old entry. This computer's own
     /// nodes, which share the loopback address, are exempt.
     fn insert(&mut self, id: NodeId, address: SocketAddr) {
@@ -121,7 +121,12 @@ impl RoutingTable {
         for bucket in &mut self.buckets {
             bucket.retain(|node| node.address != address);
         }
-        if !address.ip().is_loopback() && self.all().any(|node| node.address.ip() == address.ip()) {
+        let host = crate::net::host(address.ip());
+        if !address.ip().is_loopback()
+            && self
+                .all()
+                .any(|node| crate::net::host(node.address.ip()) == host)
+        {
             return;
         }
         let bucket = &mut self.buckets[index];
@@ -209,7 +214,15 @@ impl PeerStore {
             return;
         }
         let peers = self.peers.entry(info_hash).or_default();
-        peers.retain(|(existing, _)| *existing != peer);
+        // One entry per host: announcing again (from another port, or
+        // another address in its IPv6 /64) replaces the last, so one host
+        // cannot fill a torrent's list. This computer's own nodes, which
+        // share the loopback address, are exempt.
+        let host = crate::net::host(peer.ip());
+        peers.retain(|(existing, _)| {
+            *existing != peer
+                && (peer.ip().is_loopback() || crate::net::host(existing.ip()) != host)
+        });
         if peers.len() >= MAX_PEERS_PER_HASH {
             peers.remove(0);
         }
@@ -1189,11 +1202,13 @@ impl Inner {
                     .or_insert_with(|| xor(target, &[0xff; 20]));
             }
         }
-        // One contact per IP address, as libtorrent's
+        // One contact per host (IPv6: per /64), as libtorrent's
         // `restrict_search_ips`, so one machine handing out many made-up
         // nodes cannot take over the lookup.
-        let mut addresses: HashSet<IpAddr> =
-            candidates.keys().map(|address| address.ip()).collect();
+        let mut addresses: HashSet<IpAddr> = candidates
+            .keys()
+            .map(|address| crate::net::host(address.ip()))
+            .collect();
         let mut queried = HashSet::new();
         let mut peers = HashSet::new();
         let mut tokens: Vec<(NodeId, SocketAddr, Vec<u8>)> = Vec::new();
@@ -1247,11 +1262,12 @@ impl Inner {
                 }
                 if let Some(nodes) = response.get_bytes(self.nodes_key()) {
                     for (id, address) in parse_compact_nodes(nodes, self.v6) {
+                        let host = crate::net::host(address.ip());
                         let repeated = !address.ip().is_loopback()
                             && !candidates.contains_key(&address)
-                            && addresses.contains(&address.ip());
+                            && addresses.contains(&host);
                         if id != own_id && !repeated {
-                            addresses.insert(address.ip());
+                            addresses.insert(host);
                             candidates.entry(address).or_insert(id);
                         }
                     }
@@ -1480,7 +1496,7 @@ fn parse_compact_peer(bytes: &[u8]) -> Option<SocketAddr> {
         _ => return None,
     };
     let port = u16::from_be_bytes([port[0], port[1]]);
-    (port != 0).then(|| SocketAddr::new(ip, port))
+    (port != 0 && !crate::net::unreachable(ip)).then(|| SocketAddr::new(ip, port))
 }
 
 fn compact_peer(address: &SocketAddr) -> Vec<u8> {
@@ -1645,6 +1661,70 @@ mod tests {
         table.insert(id(4), SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
         table.insert(id(5), SocketAddr::from((Ipv4Addr::LOCALHOST, 2)));
         assert_eq!(table.len(), 3);
+    }
+
+    /// An IPv6 /64 counts as one host (libtorrent's issue 8934): one node
+    /// of it in the routing table, one stored peer of it per torrent, so
+    /// one host cannot fill either with its 2^64 addresses.
+    #[test]
+    fn counts_an_ipv6_64_as_one_host() {
+        let mut table = RoutingTable::new([0; 20]);
+        let id = |last: u8| {
+            let mut id = [0; 20];
+            id[0] = 0x80;
+            id[19] = last;
+            id
+        };
+        let in_64 =
+            |last: u16| SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, last), 6881));
+        table.insert(id(1), in_64(1));
+        table.insert(id(2), in_64(2));
+        table.insert(id(3), in_64(0xbeef));
+        assert_eq!(table.len(), 1, "one node from a /64");
+        table.insert(
+            id(4),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1), 6881)),
+        );
+        assert_eq!(table.len(), 2, "the next /64 is another host");
+
+        let mut store = PeerStore::default();
+        for last in 1..=50 {
+            store.add([7; 20], in_64(last));
+        }
+        assert_eq!(store.get(&[7; 20]), vec![in_64(50)], "the latest one stays");
+        // Another port from one IPv4 host replaces its entry too.
+        let v4 = |port: u16| SocketAddr::from(([203, 0, 113, 5], port));
+        store.add([7; 20], v4(6881));
+        store.add([7; 20], v4(7000));
+        assert_eq!(store.get(&[7; 20]), vec![in_64(50), v4(7000)]);
+        // This computer's own nodes share the loopback address.
+        store.add([8; 20], SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        store.add([8; 20], SocketAddr::from((Ipv4Addr::LOCALHOST, 2)));
+        assert_eq!(store.get(&[8; 20]).len(), 2);
+    }
+
+    /// Peers and nodes at addresses no one can have (libtorrent's issue
+    /// 7910) are left out of replies; local ones stay, as a node on the
+    /// same network can rightly return them.
+    #[test]
+    fn leaves_out_addresses_no_peer_can_have() {
+        let compact = |ip: [u8; 4]| [ip.as_slice(), &6881u16.to_be_bytes()].concat();
+        for bogus in [
+            [0, 0, 0, 0],
+            [0, 1, 2, 3],
+            [224, 0, 0, 1],
+            [255, 255, 255, 255],
+        ] {
+            assert_eq!(parse_compact_peer(&compact(bogus)), None, "{bogus:?}");
+        }
+        let v6 = |ip: Ipv6Addr| [ip.octets().as_slice(), &6881u16.to_be_bytes()].concat();
+        assert_eq!(parse_compact_peer(&v6(Ipv6Addr::UNSPECIFIED)), None);
+        assert_eq!(parse_compact_peer(&v6("ff02::1".parse().unwrap())), None);
+        for fine in [[198, 51, 100, 7], [10, 0, 0, 2], [127, 0, 0, 1]] {
+            assert!(parse_compact_peer(&compact(fine)).is_some(), "{fine:?}");
+        }
+        assert!(parse_compact_peer(&v6("2001:db8::1".parse().unwrap())).is_some());
+        assert_eq!(parse_compact_peer(&[198, 51, 100, 7, 0, 0]), None, "port 0");
     }
 
     /// A node we query a lot (a bootstrap node while the table fills)
