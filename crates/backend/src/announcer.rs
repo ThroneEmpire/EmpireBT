@@ -747,7 +747,7 @@ fn dht_loop(shared: &Shared, dht: &Arc<Dht>, port: u16) {
             let runtime = tracked.as_ref().map(|(runtime, _)| Arc::clone(runtime));
             std::thread::spawn(move || {
                 for hash in &hashes {
-                    let peers = dht.announce(hash, port);
+                    let peers = dht.announce(hash, port, true);
                     if let Some(runtime) = &runtime {
                         dial_peers(runtime, &key, peers.iter());
                     }

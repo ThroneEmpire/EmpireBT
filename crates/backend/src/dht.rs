@@ -205,11 +205,13 @@ impl RoutingTable {
 
 #[derive(Debug, Default)]
 struct PeerStore {
-    peers: HashMap<NodeId, Vec<(SocketAddr, Instant)>>,
+    /// Each torrent's peers, whether each said it is a seed (BEP 33), and
+    /// when it announced.
+    peers: HashMap<NodeId, Vec<(SocketAddr, bool, Instant)>>,
 }
 
 impl PeerStore {
-    fn add(&mut self, info_hash: NodeId, peer: SocketAddr) {
+    fn add(&mut self, info_hash: NodeId, peer: SocketAddr, seed: bool) {
         if !self.peers.contains_key(&info_hash) && self.peers.len() >= MAX_STORED_HASHES {
             return;
         }
@@ -219,29 +221,43 @@ impl PeerStore {
         // cannot fill a torrent's list. This computer's own nodes, which
         // share the loopback address, are exempt.
         let host = crate::net::host(peer.ip());
-        peers.retain(|(existing, _)| {
+        peers.retain(|(existing, _, _)| {
             *existing != peer
                 && (peer.ip().is_loopback() || crate::net::host(existing.ip()) != host)
         });
         if peers.len() >= MAX_PEERS_PER_HASH {
             peers.remove(0);
         }
-        peers.push((peer, Instant::now()));
+        peers.push((peer, seed, Instant::now()));
     }
 
-    fn get(&self, info_hash: &NodeId) -> Vec<SocketAddr> {
+    /// The peers stored for `info_hash`; without seeds when `noseed`, as a
+    /// seed asking has no use for them (BEP 33).
+    fn get(&self, info_hash: &NodeId, noseed: bool) -> Vec<SocketAddr> {
         self.peers
             .get(info_hash)
-            .map(|peers| peers.iter().map(|(peer, _)| *peer).collect())
+            .map(|peers| {
+                peers
+                    .iter()
+                    .filter(|(_, seed, _)| !(noseed && *seed))
+                    .map(|(peer, _, _)| *peer)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     fn expire(&mut self) {
         for peers in self.peers.values_mut() {
-            peers.retain(|(_, added)| added.elapsed() < PEER_LIFETIME);
+            peers.retain(|(_, _, added)| added.elapsed() < PEER_LIFETIME);
         }
         self.peers.retain(|_, peers| !peers.is_empty());
     }
+}
+
+/// Whether a query sets the integer flag `key` (BEP 33's `seed` and
+/// `noseed`); any value but 0 counts, as in libtorrent.
+fn flag(arguments: &Value, key: &[u8]) -> bool {
+    arguments.get_int(key).is_some_and(|value| value != 0)
 }
 
 /// A response routed back to a waiting query.
@@ -403,13 +419,15 @@ impl Dht {
 
     /// Looks up peers for `info_hash`.
     pub fn get_peers(&self, info_hash: &[u8; 20]) -> Vec<SocketAddr> {
-        merged(&self.lookups(info_hash))
+        merged(&self.lookups(info_hash, false))
     }
 
     /// Looks up peers for `info_hash` and announces that we serve it on
-    /// `port` to the closest nodes. Returns the peers found.
-    pub fn announce(&self, info_hash: &[u8; 20], port: u16) -> Vec<SocketAddr> {
-        self.announce_then(info_hash, port, |_| {})
+    /// `port` to the closest nodes. Returns the peers found. A `seed` says
+    /// so and asks for no seeds back (BEP 33), as libtorrent does: other
+    /// seeds have nothing to download from it.
+    pub fn announce(&self, info_hash: &[u8; 20], port: u16, seed: bool) -> Vec<SocketAddr> {
+        self.announce_then(info_hash, port, seed, |_| {})
     }
 
     /// Like [`Dht::announce`], but hands the peers found to `found` before
@@ -418,9 +436,10 @@ impl Dht {
         &self,
         info_hash: &[u8; 20],
         port: u16,
+        seed: bool,
         found: impl FnOnce(&[SocketAddr]),
     ) -> Vec<SocketAddr> {
-        let lookups = self.lookups(info_hash);
+        let lookups = self.lookups(info_hash, seed);
         let peers = merged(&lookups);
         found(&peers);
         let receivers: Vec<_> = lookups
@@ -435,6 +454,7 @@ impl Dht {
                             (b"port", Value::Int(port.into())),
                             (b"token", Value::bytes(token.clone())),
                             (b"implied_port", Value::Int(0)),
+                            (b"seed", Value::Int(seed.into())),
                         ],
                     )
                 })
@@ -466,7 +486,7 @@ impl Dht {
 
     /// Runs a lookup on each family's node at once, once fewer than
     /// [`MAX_LOOKUPS`] are running; none once the DHT is stopping.
-    fn lookups(&self, info_hash: &[u8; 20]) -> Vec<(&Arc<Inner>, Lookup)> {
+    fn lookups(&self, info_hash: &[u8; 20], noseed: bool) -> Vec<(&Arc<Inner>, Lookup)> {
         {
             let mut running = self
                 .lookups_running
@@ -484,7 +504,7 @@ impl Dht {
             }
             *running += 1;
         }
-        let lookups = self.run_lookups(info_hash);
+        let lookups = self.run_lookups(info_hash, noseed);
         *self
             .lookups_running
             .lock()
@@ -493,12 +513,12 @@ impl Dht {
         lookups
     }
 
-    fn run_lookups(&self, info_hash: &[u8; 20]) -> Vec<(&Arc<Inner>, Lookup)> {
+    fn run_lookups(&self, info_hash: &[u8; 20], noseed: bool) -> Vec<(&Arc<Inner>, Lookup)> {
         std::thread::scope(|scope| {
             let running: Vec<_> = self
                 .families
                 .iter()
-                .map(|inner| (inner, scope.spawn(move || inner.lookup(info_hash))))
+                .map(|inner| (inner, scope.spawn(move || inner.lookup(info_hash, noseed))))
                 .collect();
             running
                 .into_iter()
@@ -675,7 +695,7 @@ impl PeerSearch {
                 // Peers go out as soon as the lookup ends; announcing
                 // ourselves waits on replies.
                 Some(port) => {
-                    dht.announce_then(&info_hash, port, |peers| {
+                    dht.announce_then(&info_hash, port, false, |peers| {
                         let _ = sender.send(peers.to_vec());
                     });
                 }
@@ -917,7 +937,7 @@ impl Inner {
                     let peers = self
                         .store
                         .lock()
-                        .map(|store| store.get(&info_hash))
+                        .map(|store| store.get(&info_hash, flag(arguments, b"noseed")))
                         .unwrap_or_default();
                     if peers.is_empty() {
                         Value::dict([
@@ -988,7 +1008,11 @@ impl Inner {
         match (valid, port) {
             (true, Some(port)) => {
                 if let Ok(mut store) = self.store.lock() {
-                    store.add(info_hash, SocketAddr::new(from.ip(), port));
+                    store.add(
+                        info_hash,
+                        SocketAddr::new(from.ip(), port),
+                        flag(arguments, b"seed"),
+                    );
                 }
                 true
             }
@@ -1111,6 +1135,7 @@ impl Inner {
         addresses: &[SocketAddr],
         method: &[u8],
         target: Option<&NodeId>,
+        noseed: bool,
     ) -> Vec<Reply> {
         let (sender, receiver) = mpsc::channel();
         let key: &[u8] = if method == b"find_node" {
@@ -1121,6 +1146,12 @@ impl Inner {
         let transactions: Vec<[u8; 2]> = addresses
             .iter()
             .filter_map(|address| match target {
+                Some(target) if noseed => self.query_into(
+                    *address,
+                    method,
+                    [(key, Value::bytes(*target)), (b"noseed", Value::Int(1))],
+                    sender.clone(),
+                ),
                 Some(target) => self.query_into(
                     *address,
                     method,
@@ -1178,12 +1209,13 @@ impl Inner {
     }
 
     /// Iteratively queries the nodes closest to `target`: `get_peers` for an
-    /// info hash, collecting peers and announce tokens along the way.
-    fn lookup(&self, target: &NodeId) -> Lookup {
-        self.iterate(target, b"get_peers")
+    /// info hash, collecting peers and announce tokens along the way. With
+    /// `noseed`, nodes are asked to leave seeds out (BEP 33).
+    fn lookup(&self, target: &NodeId, noseed: bool) -> Lookup {
+        self.iterate(target, b"get_peers", noseed)
     }
 
-    fn iterate(&self, target: &NodeId, method: &[u8]) -> Lookup {
+    fn iterate(&self, target: &NodeId, method: &[u8], noseed: bool) -> Lookup {
         let own_id = self.own_id();
         let mut candidates: HashMap<SocketAddr, NodeId> = self
             .table
@@ -1236,7 +1268,7 @@ impl Inner {
                 .map(|(address, _)| *address)
                 .collect();
             queried.extend(batch.iter().copied());
-            let replies = self.query_all(&batch, method, Some(target));
+            let replies = self.query_all(&batch, method, Some(target), noseed);
             // Silent nodes leave the candidate set, so the lookup only ends
             // once the closest nodes that actually answer were asked.
             for address in &batch {
@@ -1337,10 +1369,10 @@ impl Inner {
             if last_refresh.is_none_or(|at| at.elapsed() >= interval) {
                 // Looking up our own id fills the buckets nearest to us;
                 // random ids spread entries across the rest.
-                self.iterate(&self.own_id(), b"find_node");
-                self.iterate(&random_bytes(), b"find_node");
+                self.iterate(&self.own_id(), b"find_node", false);
+                self.iterate(&random_bytes(), b"find_node", false);
                 if filling {
-                    self.iterate(&random_bytes(), b"find_node");
+                    self.iterate(&random_bytes(), b"find_node", false);
                 }
                 last_refresh = Some(Instant::now());
             }
@@ -1353,7 +1385,7 @@ impl Inner {
                     .map(|table| table.stale(PINGS_PER_ROUND))
                     .unwrap_or_default();
                 if !stale.is_empty() {
-                    self.query_all(&stale, b"ping", None);
+                    self.query_all(&stale, b"ping", None, false);
                 }
                 last_ping = Instant::now();
             }
@@ -1689,18 +1721,22 @@ mod tests {
 
         let mut store = PeerStore::default();
         for last in 1..=50 {
-            store.add([7; 20], in_64(last));
+            store.add([7; 20], in_64(last), false);
         }
-        assert_eq!(store.get(&[7; 20]), vec![in_64(50)], "the latest one stays");
+        assert_eq!(
+            store.get(&[7; 20], false),
+            vec![in_64(50)],
+            "the latest one stays"
+        );
         // Another port from one IPv4 host replaces its entry too.
         let v4 = |port: u16| SocketAddr::from(([203, 0, 113, 5], port));
-        store.add([7; 20], v4(6881));
-        store.add([7; 20], v4(7000));
-        assert_eq!(store.get(&[7; 20]), vec![in_64(50), v4(7000)]);
+        store.add([7; 20], v4(6881), false);
+        store.add([7; 20], v4(7000), false);
+        assert_eq!(store.get(&[7; 20], false), vec![in_64(50), v4(7000)]);
         // This computer's own nodes share the loopback address.
-        store.add([8; 20], SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
-        store.add([8; 20], SocketAddr::from((Ipv4Addr::LOCALHOST, 2)));
-        assert_eq!(store.get(&[8; 20]).len(), 2);
+        store.add([8; 20], SocketAddr::from((Ipv4Addr::LOCALHOST, 1)), false);
+        store.add([8; 20], SocketAddr::from((Ipv4Addr::LOCALHOST, 2)), false);
+        assert_eq!(store.get(&[8; 20], false).len(), 2);
     }
 
     /// Peers and nodes at addresses no one can have (libtorrent's issue
@@ -1770,7 +1806,7 @@ mod tests {
         let other = local_node(Vec::new());
         let inner = node.families.iter().find(|inner| !inner.v6).unwrap();
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port_of(&other)));
-        assert_eq!(inner.query_all(&[address], b"ping", None).len(), 1);
+        assert_eq!(inner.query_all(&[address], b"ping", None, false).len(), 1);
         assert_eq!(node.node_count(), 1);
         // Still there: pings keep it.
         std::thread::sleep(STALE_AFTER * 3);
@@ -1855,7 +1891,7 @@ mod tests {
         let leecher = local_node(bootstrap);
         let info_hash = [0x42; 20];
 
-        seeder.announce(&info_hash, 51_413);
+        seeder.announce(&info_hash, 51_413, true);
         let deadline = Instant::now() + Duration::from_secs(10);
         let peers = loop {
             let peers = leecher.get_peers(&info_hash);
@@ -1868,6 +1904,56 @@ mod tests {
         for node in [&root, &seeder, &leecher] {
             node.stop();
         }
+    }
+
+    /// BEP 33: announces say whether the peer is a seed, and a seed's
+    /// lookup asks for no seeds back, as libtorrent's do.
+    #[test]
+    fn seeds_are_left_out_of_what_a_seed_is_sent() {
+        let root = local_node(Vec::new());
+        let bootstrap = vec![format!("127.0.0.1:{}", port_of(&root))];
+        let seeder = local_node(bootstrap.clone());
+        let downloader = local_node(bootstrap.clone());
+        let other_seed = local_node(bootstrap);
+        let info_hash = [0x43; 20];
+        let seed: SocketAddr = "127.0.0.1:51413".parse().unwrap();
+        let leech: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+
+        seeder.announce(&info_hash, seed.port(), true);
+        downloader.announce(&info_hash, leech.port(), false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut everyone = loop {
+            let peers = other_seed.get_peers(&info_hash);
+            if peers.len() >= 2 || Instant::now() > deadline {
+                break peers;
+            }
+        };
+        everyone.sort();
+        assert_eq!(everyone, [leech, seed], "a downloader is sent seeds");
+        assert_eq!(
+            other_seed.announce(&info_hash, 51_414, true),
+            [leech],
+            "a seed is sent only downloaders"
+        );
+        for node in [&root, &seeder, &downloader, &other_seed] {
+            node.stop();
+        }
+    }
+
+    #[test]
+    fn stored_peers_say_whether_they_are_seeds() {
+        let mut store = PeerStore::default();
+        let peer = |last: u8| SocketAddr::from(([203, 0, 113, last], 6881));
+        store.add([1; 20], peer(1), true);
+        store.add([1; 20], peer(2), false);
+        assert_eq!(store.get(&[1; 20], false), [peer(1), peer(2)]);
+        assert_eq!(store.get(&[1; 20], true), [peer(2)]);
+        // Announcing again updates it: a downloader that finished is a seed.
+        store.add([1; 20], peer(2), true);
+        assert!(store.get(&[1; 20], true).is_empty());
+        let query = |seed: i64| Value::dict([(b"seed", Value::Int(seed))]);
+        assert!(flag(&query(1), b"seed") && flag(&query(2), b"seed"));
+        assert!(!flag(&query(0), b"seed") && !flag(&query(1), b"noseed"));
     }
 
     #[test]
@@ -1884,7 +1970,7 @@ mod tests {
         let leecher = local_node(bootstrap);
         let info_hash = [0x66; 20];
 
-        seeder.announce(&info_hash, 51_413);
+        seeder.announce(&info_hash, 51_413, true);
         let deadline = Instant::now() + Duration::from_secs(10);
         let peers = loop {
             let peers = leecher.get_peers(&info_hash);
@@ -1960,7 +2046,7 @@ mod tests {
                 .store
                 .lock()
                 .unwrap()
-                .get(&[2; 20])
+                .get(&[2; 20], false)
                 .is_empty()
         );
         node.stop();
