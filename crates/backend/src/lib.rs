@@ -53,7 +53,7 @@ pub use identity::{
     QBITTORRENT_USER_AGENT, USER_AGENT, client_name, disguised, generate_anonymous_peer_id,
     generate_peer_id, generate_qbittorrent_peer_id, identifies,
 };
-pub use limits::Limits;
+pub use limits::{Limits, SeedChoking, UploadSlotsMode};
 pub use lsd::Lsd;
 pub use magnet::MagnetLink;
 pub use metadata::{

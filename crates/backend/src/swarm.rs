@@ -9,6 +9,14 @@
 //! likely to get it. A new peer then has a chance to prove itself, and we
 //! find better partners than the current ones.
 //!
+//! In a runtime, the event loop chokes for every torrent at once
+//! ([`rechoke_all`]), as libtorrent's session does: a global number of
+//! upload slots goes to the best peers of all torrents, at most a
+//! torrent's own number to each, and a fifth of them rotate
+//! optimistically. Among peers that sent us equally much, those of the
+//! torrent its swarm most needs (seed rank) come first. A swarm on its own
+//! chokes for itself the same way, with no global limit.
+//!
 //! Each piece is downloaded from a single peer, so a piece that fails its
 //! hash check names its sender. That peer loses trust, good pieces earn it
 //! back, and an address that keeps sending corrupt data is banned for the
@@ -24,6 +32,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -71,6 +80,13 @@ struct Peer {
     /// Bytes per rechoke interval it sent us last time.
     rate: u64,
     uploaded: u64,
+    /// Bytes we sent it by the last rechoke, and in the interval before.
+    uploaded_before: u64,
+    uploaded_round: u64,
+    /// When we last unchoked it (when it connected, before that), and how
+    /// much we had sent it then.
+    last_unchoke: Instant,
+    uploaded_at_unchoke: u64,
     /// The address other peers can reach it on, and its BEP 11 flags.
     pex: Option<(SocketAddr, u8)>,
     /// Its handshake peer id, once claimed.
@@ -273,6 +289,9 @@ struct Inner {
 pub(crate) struct Swarm {
     inner: Mutex<Inner>,
     upload_slots: usize,
+    /// Set once the event loop chokes for this swarm: the shared slot
+    /// settings and count, which then replace `upload_slots`.
+    managed: std::sync::OnceLock<std::sync::Arc<crate::limits::UploadSlots>>,
 }
 
 impl Swarm {
@@ -304,6 +323,45 @@ impl Swarm {
                 listen_port: None,
             }),
             upload_slots: upload_slots.max(1),
+            managed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Hands choking to the event loop, which from now on decides for
+    /// this swarm with every other ([`rechoke_all`]) under `slots`.
+    pub(crate) fn manage(&self, slots: &std::sync::Arc<crate::limits::UploadSlots>) {
+        let inner = self.lock();
+        if self.managed.set(std::sync::Arc::clone(slots)).is_ok() {
+            let unchoked = inner.peers.values().filter(|peer| peer.unchoked).count();
+            slots.unchoked.fetch_add(unchoked, Ordering::Relaxed);
+        }
+    }
+
+    /// Upload slots for this torrent.
+    fn slots(&self) -> usize {
+        self.managed
+            .get()
+            .map_or(self.upload_slots, |slots| slots.per_torrent())
+    }
+
+    /// Counts a peer unchoked (`1`) or choked (`-1`) in the shared count,
+    /// when the event loop manages this swarm.
+    fn count_unchoked(&self, unchoked: bool) {
+        if let Some(slots) = self.managed.get() {
+            if unchoked {
+                slots.unchoked.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Never below 0, should a count race with a recount.
+                let mut count = slots.unchoked.load(Ordering::Relaxed);
+                while let Err(actual) = slots.unchoked.compare_exchange_weak(
+                    count,
+                    count.saturating_sub(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    count = actual;
+                }
+            }
         }
     }
 
@@ -338,6 +396,10 @@ impl Swarm {
                 downloaded_before: 0,
                 rate: 0,
                 uploaded: 0,
+                uploaded_before: 0,
+                uploaded_round: 0,
+                last_unchoke: now,
+                uploaded_at_unchoke: 0,
                 pex: None,
                 peer_id: None,
                 evicted: false,
@@ -409,7 +471,9 @@ impl Swarm {
 
     pub fn leave(&self, key: PeerKey) {
         let mut inner = self.lock();
-        inner.peers.remove(&key);
+        if inner.peers.remove(&key).is_some_and(|peer| peer.unchoked) {
+            self.count_unchoked(false);
+        }
         if inner.optimistic == Some(key) {
             inner.optimistic = None;
         }
@@ -420,30 +484,67 @@ impl Swarm {
     }
 
     /// The peer became interested in our pieces or lost interest. A peer
-    /// that becomes interested while a slot is free is unchoked at once
-    /// instead of waiting for the next rechoke.
+    /// that becomes interested while a slot is free, this torrent's and
+    /// (when the event loop chokes) a global one, is unchoked at once
+    /// instead of waiting for the next rechoke, as libtorrent's
+    /// `preemptive_unchoke`.
     pub fn set_interested(&self, key: PeerKey, interested: bool) {
-        let slots = self.upload_slots;
+        let slots = self.slots();
+        let room = self.managed.get().is_none_or(|slots| slots.has_room());
         let mut inner = self.lock();
         let unchoked = inner.peers.values().filter(|peer| peer.unchoked).count();
-        if let Some(peer) = inner.peers.get_mut(&key) {
-            peer.interested = interested;
-            if !interested {
-                peer.unchoked = false;
-            } else if unchoked < slots {
-                peer.unchoked = true;
-            }
+        let Some(peer) = inner.peers.get_mut(&key) else {
+            return;
+        };
+        peer.interested = interested;
+        let was = peer.unchoked;
+        if !interested {
+            peer.unchoked = false;
+        } else if unchoked < slots && room {
+            peer.unchoke(Instant::now());
+        }
+        if peer.unchoked != was {
+            self.count_unchoked(peer.unchoked);
         }
     }
 
-    /// Whether we let `key` download from us, rechoking when it is due.
+    /// Whether we let `key` download from us. A swarm on its own rechokes
+    /// here when it is due; one the event loop manages, there.
     pub fn is_unchoked(&self, key: PeerKey, now: Instant) -> bool {
         let mut inner = self.lock();
-        if inner
-            .last_rechoke
-            .is_none_or(|last| now - last >= RECHOKE_INTERVAL)
+        if self.managed.get().is_none()
+            && inner
+                .last_rechoke
+                .is_none_or(|last| now - last >= RECHOKE_INTERVAL)
         {
-            inner.rechoke(self.upload_slots, now);
+            let policy = Policy {
+                global: None,
+                per_torrent: self.upload_slots,
+                choking: crate::SeedChoking::default(),
+                rate_based: false,
+            };
+            let interval = inner
+                .last_rechoke
+                .map_or(RECHOKE_INTERVAL, |last| now.saturating_duration_since(last));
+            let candidates = inner.candidates(0, Facts::default(), now);
+            let rotate = inner
+                .last_optimistic
+                .is_none_or(|last| now - last >= OPTIMISTIC_INTERVAL);
+            if rotate {
+                inner.last_optimistic = Some(now);
+            }
+            let previous: Vec<Slot> = inner.optimistic.map(|key| (0, key)).into_iter().collect();
+            let mut random = inner.random;
+            let chosen = choose(
+                candidates,
+                &policy,
+                interval,
+                &previous,
+                rotate,
+                &mut random,
+            );
+            inner.random = random;
+            inner.apply(0, &chosen, now);
         }
         inner.peers.get(&key).is_some_and(|peer| peer.unchoked)
     }
@@ -940,73 +1041,407 @@ impl Inner {
             .map(|(ip, _)| *ip)
     }
 
-    fn next_random(&mut self) -> u64 {
-        self.random ^= self.random << 13;
-        self.random ^= self.random >> 7;
-        self.random ^= self.random << 17;
-        self.random
-    }
-
-    /// Gives the regular slots to the interested peers that sent us the
-    /// most in the last interval, and rotates the optimistic slot.
-    fn rechoke(&mut self, slots: usize, now: Instant) {
+    /// This swarm's interested peers as choking candidates for torrent
+    /// `torrent`, rolling each peer's rates over to a new interval.
+    fn candidates(&mut self, torrent: usize, facts: Facts, now: Instant) -> Vec<Candidate> {
         self.last_rechoke = Some(now);
         for peer in self.peers.values_mut() {
             peer.rate = peer.downloaded - peer.downloaded_before;
             peer.downloaded_before = peer.downloaded;
+            peer.uploaded_round = peer.uploaded - peer.uploaded_before;
+            peer.uploaded_before = peer.uploaded;
         }
-        let mut interested: Vec<(PeerKey, u64, u64)> = self
-            .peers
+        self.peers
             .iter()
-            .filter(|(_, peer)| peer.interested)
-            .map(|(key, peer)| (*key, peer.rate, peer.uploaded))
-            .collect();
-        // Fastest first; among equals, those we have given least so far.
-        interested.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.0.cmp(&b.0.0)));
-        let regular_slots = if slots > 1 { slots - 1 } else { slots };
-        let regular: Vec<PeerKey> = interested
-            .iter()
-            .take(regular_slots)
-            .map(|(key, ..)| *key)
-            .collect();
+            .filter(|(_, peer)| peer.interested && !peer.evicted)
+            .map(|(key, peer)| Candidate {
+                slot: (torrent, *key),
+                rate: peer.rate,
+                rank: facts.rank,
+                uploaded_round: peer.uploaded_round,
+                unchoked: peer.unchoked,
+                quota_done: peer.unchoked
+                    && facts.piece_length > 0
+                    && peer.uploaded - peer.uploaded_at_unchoke
+                        > facts.piece_length * SEEDING_PIECE_QUOTA
+                    && now.saturating_duration_since(peer.last_unchoke) > QUOTA_TIME,
+                leech_score: anti_leech_score(peer, facts),
+                last_unchoke: peer.last_unchoke,
+                new: now.saturating_duration_since(peer.joined) < NEW_PEER,
+            })
+            .collect()
+    }
 
-        let optimistic_valid = self.optimistic.is_some_and(|key| {
-            !regular.contains(&key) && self.peers.get(&key).is_some_and(|peer| peer.interested)
-        });
+    /// Unchokes the peers `chosen` names for torrent `torrent` and chokes
+    /// the rest. Returns how many changed each way.
+    fn apply(&mut self, torrent: usize, chosen: &Chosen, now: Instant) -> (usize, usize) {
+        self.optimistic = chosen
+            .optimistic
+            .iter()
+            .find(|(owner, _)| *owner == torrent)
+            .map(|(_, key)| *key);
+        let (mut unchoked, mut choked) = (0, 0);
+        for (key, peer) in &mut self.peers {
+            let want = chosen.contains(&(torrent, *key));
+            if want != peer.unchoked {
+                if want {
+                    peer.unchoke(now);
+                } else {
+                    peer.unchoked = false;
+                }
+                if want {
+                    unchoked += 1;
+                } else {
+                    choked += 1;
+                }
+            }
+        }
+        (unchoked, choked)
+    }
+}
+
+impl Peer {
+    fn unchoke(&mut self, now: Instant) {
+        if !self.unchoked {
+            self.unchoked = true;
+            self.last_unchoke = now;
+            self.uploaded_at_unchoke = self.uploaded;
+        }
+    }
+}
+
+/// Round-robin: an unchoked peer has had its turn once sent this many
+/// pieces and unchoked this long (libtorrent's `seeding_piece_quota`).
+const SEEDING_PIECE_QUOTA: u64 = 20;
+const QUOTA_TIME: Duration = Duration::from_secs(60);
+/// Rate-based slots: a slot for each peer uploaded to faster than this,
+/// rising by the step per slot (libtorrent's
+/// `rate_choker_initial_threshold`).
+const RATE_THRESHOLD: u64 = 1024;
+const RATE_STEP: u64 = 2048;
+
+/// What the choker needs to know of a torrent.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Facts {
+    /// Its seed rank: how much its swarm needs us.
+    pub(crate) rank: u32,
+    pub(crate) piece_length: u64,
+    pub(crate) total_size: u64,
+}
+
+impl Facts {
+    pub(crate) fn of(torrent: &crate::engine::active::ActiveTorrent) -> Self {
+        Self {
+            rank: torrent.seed_rank(),
+            piece_length: u64::from(torrent.info.piece_length()),
+            total_size: torrent.info.total_length(),
+        }
+    }
+}
+
+/// How far a peer is from half done, 0 (half) to 1000 (nothing or all), as
+/// libtorrent's `anti_leech_score`: what it has is what it said, or what we
+/// sent it, counted up to half.
+fn anti_leech_score(peer: &Peer, facts: Facts) -> u32 {
+    let given = if facts.total_size > 0 {
+        peer.uploaded.min(facts.total_size / 2) as f64 / facts.total_size as f64
+    } else {
+        0.0
+    };
+    let have = peer
+        .pieces
+        .filter(|(_, total)| *total > 0)
+        .map_or(0.0, |(have, total)| have as f64 / total as f64);
+    let share = given.max(have).min(1.0);
+    ((share - 0.5).abs() * 2000.0) as u32
+}
+
+/// A peer in the choker's eyes: its torrent (any number unique among the
+/// torrents choked together) and its key in that torrent's swarm.
+type Slot = (usize, PeerKey);
+
+/// An interested peer the choker may unchoke.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    slot: Slot,
+    /// Bytes it sent us in the last interval.
+    rate: u64,
+    /// Its torrent's seed rank: how much the torrent's swarm needs us.
+    rank: u32,
+    /// Bytes we sent it in the last interval.
+    uploaded_round: u64,
+    unchoked: bool,
+    /// Round-robin: it has had its turn.
+    quota_done: bool,
+    /// Anti-leech: how far from half done it is.
+    leech_score: u32,
+    last_unchoke: Instant,
+    /// It connected recently, so it is likelier to get an optimistic slot.
+    new: bool,
+}
+
+/// The choking settings a rechoke follows.
+#[derive(Debug, Clone, Copy)]
+struct Policy {
+    /// Upload slots across all torrents; `None` for unlimited.
+    global: Option<usize>,
+    per_torrent: usize,
+    choking: crate::SeedChoking,
+    /// The global slots follow the upload rate instead.
+    rate_based: bool,
+}
+
+/// Upload slots as the upload rate fills them, as libtorrent's
+/// `rate_based_choker`: one for each peer uploaded to faster than a
+/// threshold that rises with each, plus one.
+fn rate_based_slots(candidates: &[Candidate], interval: Duration) -> usize {
+    let millis = interval.as_millis().max(1) as u64;
+    let mut rates: Vec<u64> = candidates
+        .iter()
+        .map(|candidate| candidate.uploaded_round.saturating_mul(1000) / millis)
+        .collect();
+    rates.sort_unstable_by(|a, b| b.cmp(a));
+    let mut threshold = RATE_THRESHOLD;
+    let mut slots = 0;
+    for rate in rates {
+        if rate < threshold {
+            break;
+        }
+        slots += 1;
+        threshold += RATE_STEP;
+    }
+    slots + 1
+}
+
+/// The order peers get regular slots in: those that sent us most, then
+/// those of the torrent with the highest seed rank, then as `choking`
+/// says, then the one unchoked longest ago (libtorrent's `unchoke_compare_*`).
+fn unchoke_order(a: &Candidate, b: &Candidate, choking: crate::SeedChoking) -> std::cmp::Ordering {
+    use crate::SeedChoking;
+    let by_choking = match choking {
+        SeedChoking::FastestUpload => b.uploaded_round.cmp(&a.uploaded_round),
+        SeedChoking::RoundRobin => {
+            let round = |candidate: &Candidate| {
+                if candidate.unchoked {
+                    candidate.uploaded_round
+                } else {
+                    0
+                }
+            };
+            a.quota_done
+                .cmp(&b.quota_done)
+                .then(round(b).cmp(&round(a)))
+        }
+        SeedChoking::AntiLeech => b.leech_score.cmp(&a.leech_score),
+    };
+    b.rate
+        .cmp(&a.rate)
+        .then(b.rank.cmp(&a.rank))
+        .then(by_choking)
+        .then(a.last_unchoke.cmp(&b.last_unchoke))
+        .then(a.slot.0.cmp(&b.slot.0))
+        .then(a.slot.1.0.cmp(&b.slot.1.0))
+}
+
+/// The peers the choker unchokes.
+#[derive(Debug, Default)]
+struct Chosen {
+    regular: HashSet<Slot>,
+    optimistic: Vec<Slot>,
+}
+
+impl Chosen {
+    fn contains(&self, slot: &Slot) -> bool {
+        self.regular.contains(slot) || self.optimistic.contains(slot)
+    }
+}
+
+/// Picks the peers to upload to, as libtorrent's session choker does
+/// (`recalculate_unchoke_slots`, `recalculate_optimistic_unchoke_slots`).
+///
+/// Regular slots go in [`unchoke_order`]. A torrent takes at most
+/// `per_torrent - 1` of them, keeping one for an optimistic unchoke. With a
+/// `global` limit (or rate-based slots, counted over the last `interval`),
+/// a fifth of it (at least one) is optimistic, the rest regular; without,
+/// each torrent has one optimistic slot. Optimistic slots stay with their
+/// peers until `rotate`, then go to new random picks, newcomers three times
+/// as likely.
+fn choose(
+    mut candidates: Vec<Candidate>,
+    policy: &Policy,
+    interval: Duration,
+    previous: &[Slot],
+    rotate: bool,
+    random: &mut u64,
+) -> Chosen {
+    let per_torrent = policy.per_torrent.max(1);
+    let global = if policy.rate_based {
+        Some(rate_based_slots(&candidates, interval))
+    } else {
+        policy.global
+    };
+    let optimistic_total = match global {
+        None => usize::MAX,
+        Some(global) if global > 1 => (global / 5).max(1),
+        Some(_) => 0,
+    };
+    // One slot of each torrent's is for an optimistic unchoke, unless it
+    // has only one.
+    let (regular_per_torrent, optimistic_per_torrent) = if per_torrent > 1 {
+        (per_torrent - 1, 1)
+    } else {
+        (1, 0)
+    };
+    let mut regular_left = global.map_or(usize::MAX, |global| global - optimistic_total);
+    candidates.sort_by(|a, b| unchoke_order(a, b, policy.choking));
+    let mut chosen = Chosen::default();
+    let mut regular_count: HashMap<usize, usize> = HashMap::new();
+    for candidate in &candidates {
+        if regular_left == 0 {
+            break;
+        }
+        let count = regular_count.entry(candidate.slot.0).or_default();
+        if *count < regular_per_torrent {
+            *count += 1;
+            regular_left -= 1;
+            chosen.regular.insert(candidate.slot);
+        }
+    }
+    let mut optimistic_count: HashMap<usize, usize> = HashMap::new();
+    let eligible = |slot: &Slot, optimistic_count: &HashMap<usize, usize>| {
+        !chosen.regular.contains(slot)
+            && optimistic_count.get(&slot.0).copied().unwrap_or(0) < optimistic_per_torrent
+    };
+    if !rotate {
+        for slot in previous {
+            if chosen.optimistic.len() < optimistic_total
+                && candidates.iter().any(|candidate| candidate.slot == *slot)
+                && eligible(slot, &optimistic_count)
+            {
+                *optimistic_count.entry(slot.0).or_default() += 1;
+                chosen.optimistic.push(*slot);
+            }
+        }
+    }
+    while chosen.optimistic.len() < optimistic_total {
+        let weighted: Vec<(Slot, u64)> = candidates
+            .iter()
+            .filter(|candidate| eligible(&candidate.slot, &optimistic_count))
+            .map(|candidate| (candidate.slot, if candidate.new { 3 } else { 1 }))
+            .collect();
+        let total: u64 = weighted.iter().map(|(_, weight)| weight).sum();
+        if total == 0 {
+            break;
+        }
+        let mut pick = next_random(random) % total;
+        let Some(slot) = weighted.into_iter().find_map(|(slot, weight)| {
+            if pick < weight {
+                Some(slot)
+            } else {
+                pick -= weight;
+                None
+            }
+        }) else {
+            break;
+        };
+        *optimistic_count.entry(slot.0).or_default() += 1;
+        chosen.optimistic.push(slot);
+    }
+    chosen
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// The event loop's choking state across rechokes.
+#[derive(Debug)]
+pub(crate) struct Choker {
+    last_rechoke: Option<Instant>,
+    last_optimistic: Option<Instant>,
+    optimistic: Vec<Slot>,
+    random: u64,
+}
+
+impl Default for Choker {
+    fn default() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |elapsed| elapsed.as_nanos() as u64)
+            | 1;
+        Self {
+            last_rechoke: None,
+            last_optimistic: None,
+            optimistic: Vec::new(),
+            random: seed,
+        }
+    }
+}
+
+impl Choker {
+    /// Whether a rechoke is due.
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        self.last_rechoke
+            .is_none_or(|last| now.saturating_duration_since(last) >= RECHOKE_INTERVAL)
+    }
+
+    /// Decides who every torrent uploads to, for `torrents` (each swarm
+    /// with its torrent's seed rank), under the shared `slots`. Every swarm
+    /// is handed to the event loop's choking ([`Swarm::manage`]) first.
+    pub(crate) fn rechoke_all(
+        &mut self,
+        torrents: &[(&Swarm, Facts)],
+        slots: &std::sync::Arc<crate::limits::UploadSlots>,
+        now: Instant,
+    ) {
+        let interval = self
+            .last_rechoke
+            .map_or(RECHOKE_INTERVAL, |last| now.saturating_duration_since(last));
+        self.last_rechoke = Some(now);
+        let mut candidates = Vec::new();
+        for (swarm, facts) in torrents {
+            swarm.manage(slots);
+            candidates.extend(swarm.lock().candidates(Self::id(swarm), *facts, now));
+        }
         let rotate = self
             .last_optimistic
-            .is_none_or(|last| now - last >= OPTIMISTIC_INTERVAL);
-        if slots > 1 && (rotate || !optimistic_valid) {
-            let candidates: Vec<(PeerKey, u64)> = interested
-                .iter()
-                .filter(|(key, ..)| !regular.contains(key))
-                .map(|(key, ..)| {
-                    let new = now - self.peers[key].joined < NEW_PEER;
-                    (*key, if new { 3 } else { 1 })
-                })
-                .collect();
-            let total: u64 = candidates.iter().map(|(_, weight)| weight).sum();
-            self.optimistic = if total == 0 {
-                None
-            } else {
-                let mut pick = self.next_random() % total;
-                candidates.into_iter().find_map(|(key, weight)| {
-                    if pick < weight {
-                        Some(key)
-                    } else {
-                        pick -= weight;
-                        None
-                    }
-                })
-            };
+            .is_none_or(|last| now.saturating_duration_since(last) >= OPTIMISTIC_INTERVAL);
+        if rotate {
             self.last_optimistic = Some(now);
-        } else if slots <= 1 {
-            self.optimistic = None;
         }
-        let optimistic = self.optimistic;
-        for (key, peer) in &mut self.peers {
-            peer.unchoked = regular.contains(key) || optimistic == Some(*key);
+        let policy = Policy {
+            global: slots.global(),
+            per_torrent: slots.per_torrent(),
+            choking: slots.choking(),
+            rate_based: slots.mode() == crate::UploadSlotsMode::RateBased,
+        };
+        let chosen = choose(
+            candidates,
+            &policy,
+            interval,
+            &self.optimistic,
+            rotate,
+            &mut self.random,
+        );
+        self.optimistic.clone_from(&chosen.optimistic);
+        // A recount, so a count that drifted (a swarm dropped with peers
+        // unchoked) is put right.
+        let mut unchoked = 0;
+        for (swarm, _) in torrents {
+            let mut inner = swarm.lock();
+            inner.apply(Self::id(swarm), &chosen, now);
+            unchoked += inner.peers.values().filter(|peer| peer.unchoked).count();
         }
+        slots.unchoked.store(unchoked, Ordering::Relaxed);
+    }
+
+    /// A torrent's id across rechokes: its swarm's address, which is
+    /// stable while the swarm lives.
+    fn id(swarm: &Swarm) -> usize {
+        std::ptr::from_ref(swarm) as usize
     }
 }
 
@@ -1262,6 +1697,324 @@ mod tests {
             optimistic.len() >= 3,
             "the optimistic slot rotated: {optimistic:?}"
         );
+    }
+
+    fn candidate(torrent: usize, key: u64, rate: u64, rank: u32) -> Candidate {
+        Candidate {
+            slot: (torrent, PeerKey(key)),
+            rate,
+            rank,
+            uploaded_round: 0,
+            unchoked: false,
+            quota_done: false,
+            leech_score: 0,
+            last_unchoke: Instant::now(),
+            new: false,
+        }
+    }
+
+    fn fixed(global: usize, per_torrent: usize) -> Policy {
+        Policy {
+            global: Some(global),
+            per_torrent,
+            choking: crate::SeedChoking::FastestUpload,
+            rate_based: false,
+        }
+    }
+
+    /// libtorrent's session choker: 20 global slots, 16 regular and a
+    /// fifth (4) optimistic, at most 4 per torrent.
+    #[test]
+    fn shares_global_upload_slots_among_torrents() {
+        let candidates: Vec<Candidate> = (0..10)
+            .flat_map(|torrent| (0..10).map(move |key| candidate(torrent, key, 0, 1000)))
+            .collect();
+        let mut random = 7;
+        let chosen = choose(
+            candidates,
+            &fixed(20, 4),
+            RECHOKE_INTERVAL,
+            &[],
+            true,
+            &mut random,
+        );
+        assert_eq!(chosen.regular.len(), 16);
+        assert_eq!(chosen.optimistic.len(), 4);
+        for torrent in 0..10 {
+            let regular = chosen
+                .regular
+                .iter()
+                .filter(|slot| slot.0 == torrent)
+                .count();
+            let optimistic = chosen
+                .optimistic
+                .iter()
+                .filter(|slot| slot.0 == torrent)
+                .count();
+            assert!(regular <= 3 && optimistic <= 1 && regular + optimistic <= 4);
+        }
+    }
+
+    /// Peers that send us data come first; among equals, those of the
+    /// torrent its swarm needs most (highest seed rank).
+    #[test]
+    fn ranks_peers_by_what_they_send_then_by_seed_rank() {
+        let candidates = vec![
+            candidate(0, 1, 0, 50),
+            candidate(1, 2, 0, 9000),
+            candidate(2, 3, 5000, 0),
+            candidate(3, 4, 0, 400),
+        ];
+        let mut random = 7;
+        // Two regular slots, no optimistic one.
+        let chosen = choose(
+            candidates,
+            &fixed(1, 2),
+            RECHOKE_INTERVAL,
+            &[],
+            true,
+            &mut random,
+        );
+        assert_eq!(
+            chosen.regular,
+            HashSet::from([(2, PeerKey(3))]),
+            "the sender"
+        );
+        let candidates = vec![
+            candidate(0, 1, 0, 50),
+            candidate(1, 2, 0, 9000),
+            candidate(3, 4, 0, 400),
+        ];
+        let chosen = choose(
+            candidates,
+            &fixed(3, 1),
+            RECHOKE_INTERVAL,
+            &[],
+            true,
+            &mut random,
+        );
+        assert_eq!(
+            chosen.regular,
+            HashSet::from([(1, PeerKey(2)), (3, PeerKey(4))]),
+            "the rarest-seeded torrents"
+        );
+    }
+
+    /// Which seeding peer gets the one regular slot, by each algorithm.
+    #[test]
+    fn picks_seeding_peers_by_the_chosen_algorithm() {
+        let now = Instant::now();
+        let earlier = now - Duration::from_secs(120);
+        // 1: uploaded to fastest, unchoked long ago, has had its quota.
+        // 2: slower, unchoked a while ago, still within its turn.
+        // 3: choked, never had a turn since connecting earlier still.
+        let mut fast = candidate(0, 1, 0, 0);
+        (fast.uploaded_round, fast.unchoked, fast.quota_done) = (900_000, true, true);
+        fast.last_unchoke = earlier;
+        fast.leech_score = 0; // half done
+        let mut slow = candidate(0, 2, 0, 0);
+        (slow.uploaded_round, slow.unchoked) = (10_000, true);
+        slow.last_unchoke = now - Duration::from_secs(30);
+        slow.leech_score = 900; // nearly done
+        let mut waiting = candidate(0, 3, 0, 0);
+        waiting.last_unchoke = earlier - Duration::from_secs(60);
+        waiting.leech_score = 500;
+        let pick = |choking| {
+            let policy = Policy {
+                global: Some(1),
+                per_torrent: 2,
+                choking,
+                rate_based: false,
+            };
+            let mut random = 7;
+            let chosen = choose(
+                vec![fast, slow, waiting],
+                &policy,
+                RECHOKE_INTERVAL,
+                &[],
+                true,
+                &mut random,
+            );
+            chosen.regular.into_iter().next().unwrap().1
+        };
+        assert_eq!(pick(crate::SeedChoking::FastestUpload), PeerKey(1));
+        // The fast one had its turn; of the rest, the unchoked one keeps
+        // going until its quota.
+        assert_eq!(pick(crate::SeedChoking::RoundRobin), PeerKey(2));
+        assert_eq!(pick(crate::SeedChoking::AntiLeech), PeerKey(2));
+    }
+
+    #[test]
+    fn scores_peers_far_from_half_done_highest() {
+        let now = Instant::now();
+        let swarm = Swarm::new(4);
+        let key = swarm.join(address(1), now).unwrap();
+        let facts = Facts {
+            rank: 0,
+            piece_length: 1024,
+            total_size: 100 * 1024,
+        };
+        let score = |have: usize| {
+            swarm.set_pieces(key, have, 100);
+            anti_leech_score(&swarm.lock().peers[&key], facts)
+        };
+        assert_eq!(score(0), 1000);
+        assert_eq!(score(50), 0);
+        assert_eq!(score(100), 1000);
+        // Unknown pieces: what we sent it counts, up to half.
+        swarm.set_pieces(key, 0, 0);
+        swarm.record_upload(key, 25 * 1024);
+        assert_eq!(anti_leech_score(&swarm.lock().peers[&key], facts), 500);
+    }
+
+    /// libtorrent's rate-based choker: a slot per peer above 1 KiB/s,
+    /// then 3, 5... KiB/s, plus one.
+    #[test]
+    fn rate_based_slots_follow_the_upload() {
+        let at = |bytes_per_second: u64| {
+            let mut peer = candidate(0, bytes_per_second, 0, 0);
+            peer.uploaded_round = bytes_per_second * 10;
+            peer
+        };
+        let ten = Duration::from_secs(10);
+        assert_eq!(rate_based_slots(&[], ten), 1);
+        assert_eq!(rate_based_slots(&[at(500)], ten), 1);
+        assert_eq!(rate_based_slots(&[at(2000), at(500)], ten), 2);
+        assert_eq!(rate_based_slots(&[at(9000), at(4000), at(3000)], ten), 3);
+        let policy = Policy {
+            global: Some(100),
+            per_torrent: 4,
+            choking: crate::SeedChoking::FastestUpload,
+            rate_based: true,
+        };
+        let candidates: Vec<Candidate> = (0..4)
+            .map(|torrent| {
+                let mut peer = at(1_000_000);
+                peer.slot = (torrent, PeerKey(1));
+                peer
+            })
+            .chain((0..4).map(|torrent| candidate(torrent, 2, 0, 0)))
+            .collect();
+        let mut random = 7;
+        let chosen = choose(candidates, &policy, ten, &[], true, &mut random);
+        // 4 fast peers: thresholds 1, 3, 5, 7 KiB/s passed, so 5 slots, not
+        // the fixed 100: 4 regular and 1 optimistic.
+        assert_eq!(chosen.regular.len() + chosen.optimistic.len(), 5);
+    }
+
+    #[test]
+    fn keeps_optimistic_slots_until_they_rotate() {
+        // Three peers in each of six torrents: one regular slot each, and
+        // two optimistic ones between them.
+        let candidates: Vec<Candidate> = (0..6)
+            .flat_map(|torrent| (0..3).map(move |key| candidate(torrent, key, 0, 1000)))
+            .collect();
+        let mut random = 7;
+        let first = choose(
+            candidates.clone(),
+            &fixed(10, 2),
+            RECHOKE_INTERVAL,
+            &[],
+            true,
+            &mut random,
+        );
+        assert_eq!(first.optimistic.len(), 2);
+        let kept = choose(
+            candidates.clone(),
+            &fixed(10, 2),
+            RECHOKE_INTERVAL,
+            &first.optimistic,
+            false,
+            &mut random,
+        );
+        assert_eq!(kept.optimistic, first.optimistic);
+        // A peer that left gives its slot to another.
+        let fewer: Vec<Candidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.slot != first.optimistic[0])
+            .copied()
+            .collect();
+        let refilled = choose(
+            fewer,
+            &fixed(10, 2),
+            RECHOKE_INTERVAL,
+            &first.optimistic,
+            false,
+            &mut random,
+        );
+        assert_eq!(refilled.optimistic.len(), first.optimistic.len());
+        assert!(!refilled.optimistic.contains(&first.optimistic[0]));
+    }
+
+    /// The event loop's choker over real swarms: the global limit holds,
+    /// a peer becoming interested is unchoked at once only while a global
+    /// slot is free, and leaving frees one.
+    #[test]
+    fn the_event_loop_keeps_to_the_global_slots() {
+        let limits = crate::Limits::unlimited();
+        limits.set_upload_slots(5);
+        // The test reaches the shared counters through these limits.
+        let shared = limits.slots();
+        let swarms: Vec<Swarm> = (0..3).map(|_| Swarm::new(4)).collect();
+        let now = Instant::now();
+        let mut keys = Vec::new();
+        for (index, swarm) in swarms.iter().enumerate() {
+            for last in 0..4 {
+                let key = swarm
+                    .join(SocketAddr::from(([10, 0, index as u8, last], 6881)), now)
+                    .unwrap();
+                swarm.set_interested(key, true);
+                keys.push((index, key));
+            }
+        }
+        let mut choker = Choker::default();
+        let ranked: Vec<(&Swarm, Facts)> = swarms
+            .iter()
+            .map(|swarm| (swarm, Facts::default()))
+            .collect();
+        choker.rechoke_all(&ranked, shared, now);
+        let unchoked = || {
+            keys.iter()
+                .filter(|(index, key)| swarms[*index].is_unchoked(*key, now))
+                .count()
+        };
+        assert_eq!(unchoked(), 5);
+        assert_eq!(shared.unchoked.load(Ordering::Relaxed), 5);
+        // No free global slot: a new interested peer waits.
+        let late = swarms[0]
+            .join(SocketAddr::from(([10, 0, 9, 9], 6881)), now)
+            .unwrap();
+        swarms[0].set_interested(late, true);
+        assert!(!swarms[0].is_unchoked(late, now));
+        // One unchoked peer leaves, so the next one in gets its slot.
+        let (index, key) = *keys
+            .iter()
+            .find(|(index, key)| *index != 0 && swarms[*index].is_unchoked(*key, now))
+            .unwrap();
+        swarms[index].leave(key);
+        assert_eq!(shared.unchoked.load(Ordering::Relaxed), 4);
+        // Into a torrent with a slot of its own free.
+        let roomy = swarms
+            .iter()
+            .find(|swarm| {
+                swarm
+                    .lock()
+                    .peers
+                    .values()
+                    .filter(|peer| peer.unchoked)
+                    .count()
+                    < 4
+            })
+            .unwrap();
+        let other = roomy
+            .join(SocketAddr::from(([10, 0, 9, 10], 6881)), now)
+            .unwrap();
+        roomy.set_interested(other, true);
+        assert!(
+            roomy.is_unchoked(other, now),
+            "a free global slot goes at once"
+        );
+        assert_eq!(shared.unchoked.load(Ordering::Relaxed), 5);
     }
 
     #[test]

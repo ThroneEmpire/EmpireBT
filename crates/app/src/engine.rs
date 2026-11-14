@@ -2386,6 +2386,13 @@ impl Engine {
         let limits = self.client.limits();
         match key {
             "network.max_connections" => limits.set_max_connections(config.max_connections()),
+            "network.max_peers" => limits.set_max_peers_per_torrent(config.max_peer_connections()),
+            "network.upload_slots" => limits.set_upload_slots(config.upload_slots()),
+            "network.upload_slots_per_torrent" => {
+                limits.set_upload_slots_per_torrent(config.upload_slots_per_torrent());
+            }
+            "network.upload_slots_mode" => limits.set_upload_slots_mode(config.upload_slots_mode()),
+            "network.seed_choking" => limits.set_seed_choking(config.seed_choking()),
             "network.upload_limit" => limits.set_upload_rate(config.upload_limit()),
             "network.download_limit" => limits.set_download_rate(config.download_limit()),
             _ => {}

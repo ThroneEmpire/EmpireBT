@@ -367,6 +367,7 @@ impl Runtime {
                         let pending = self.dialing.load(Ordering::Acquire);
                         if pending >= MAX_DIALS
                             || !self.limits.has_room(pending)
+                            || !torrent.has_connection_room(0)
                             || torrent.swarm.is_connected_to(address)
                         {
                             continue;
@@ -533,9 +534,11 @@ impl Runtime {
         let Some(torrent) = self.routes.read().by_hash.get(info_hash).cloned() else {
             return false;
         };
+        torrent.use_limits(&self.limits);
         let pending = self.dialing.load(Ordering::Acquire);
         if pending >= MAX_DIALS
             || !self.limits.has_room(pending)
+            || !torrent.has_connection_room(0)
             || torrent.swarm.is_connected_to(address)
             || torrent.swarm.is_banned(address)
             || !self.is_serving()
@@ -562,6 +565,16 @@ const MAX_DIALS: usize = 8;
 const HOLEPUNCH_POLL: Duration = Duration::from_millis(50);
 
 impl Routes {
+    /// Changes whenever torrents join, leave, or finish downloading.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Every torrent routed here.
+    pub(crate) fn torrents(&self) -> Vec<Arc<ActiveTorrent>> {
+        self.read().by_key.values().cloned().collect()
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, RouteTable> {
         self.table
             .read()
@@ -1554,6 +1567,95 @@ mod tests {
         // A newcomer for the crowded torrent is the one turned away.
         assert!(refused(address, &crowded, 5));
         assert_eq!(limits.open_connections(), 3);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A torrent at its own connection limit turns peers away, though the
+    /// global limit has room (libtorrent's `attach_peer`).
+    #[test]
+    fn refuses_peers_beyond_a_torrents_connection_limit() {
+        let limits = Arc::new(crate::Limits::unlimited());
+        limits.set_max_peers_per_torrent(2);
+        let (info, address, shutdown, server, root) =
+            serving("torrent-limit", 16 * 1024, Arc::clone(&limits));
+        let _first = interested_peer(address, &info, 1);
+        let _second = interested_peer(address, &info, 2);
+        assert!(refused(address, &info, 3));
+        // Raised while running, it lets the next one in.
+        limits.set_max_peers_per_torrent(3);
+        let _third = interested_peer(address, &info, 4);
+        assert_eq!(limits.open_connections(), 3);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// One global upload slot across two torrents: only one of their
+    /// interested peers is unchoked.
+    #[test]
+    fn shares_upload_slots_across_torrents() {
+        let root =
+            std::env::temp_dir().join(format!("empirebt-runtime-slots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let storage = crate::Storage::new(&root).unwrap();
+        let seeder = |name: &str, salt: u8| {
+            let data: Vec<u8> = (0..16 * 1024).map(|byte| (byte as u8) ^ salt).collect();
+            let hash = {
+                use sha1::{Digest, Sha1};
+                Sha1::digest(&data).into()
+            };
+            let info = crate::TorrentInfo::new(
+                name,
+                16 * 1024,
+                vec![hash],
+                vec![crate::TorrentFile::new(name, data.len() as u64)],
+            )
+            .unwrap();
+            storage.write_piece(&info, 0, &data).unwrap();
+            let seeder = Seeder::new(
+                info.clone(),
+                storage.clone(),
+                [3; 20],
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            (info, seeder)
+        };
+        let (first, first_seeder) = seeder("first", 1);
+        let (second, second_seeder) = seeder("second", 2);
+        let limits = Arc::new(crate::Limits::unlimited());
+        limits.set_upload_slots(1);
+        let runtime = Arc::new(
+            Runtime::new(vec![first_seeder, second_seeder], 64)
+                .unwrap()
+                .with_limits(Arc::clone(&limits)),
+        );
+        let listener = runtime.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = {
+            let (runtime, shutdown) = (Arc::clone(&runtime), Arc::clone(&shutdown));
+            thread::spawn(move || runtime.serve_until(&listener, &shutdown))
+        };
+        let unchoked = |stream: &mut TcpStream| {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if let Ok(PeerMessage::Unchoke) = read_message(stream) {
+                    return true;
+                }
+            }
+            false
+        };
+        let mut a = interested_peer(address, &first, 1);
+        assert!(unchoked(&mut a), "the free slot goes at once");
+        let mut b = interested_peer(address, &second, 2);
+        assert!(!unchoked(&mut b), "no slot left for the other torrent");
+        drop(a);
         shutdown.store(true, Ordering::Release);
         server.join().unwrap().unwrap();
         let _ = std::fs::remove_dir_all(root);

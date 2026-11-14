@@ -305,6 +305,14 @@ the server's fault.
 Run it after changing announcing, the session store, storage, or the
 seeding runtime, and compare with the table in [README.md](../README.md#scale).
 
+The load test gives every peer an upload slot, to measure how many the
+server can serve at once. `UPLOAD_SLOTS=20` runs it with the client's
+default instead: then 20 peers are served at a time and the rest wait
+for an unchoke (they show as "awaiting unchoke" failures, and the printed
+throughput is diluted by their wait). Measured 2026-11-13 with 2000
+torrents and 5000 peers: unlimited, 166,235 blocks in the 15 s window;
+20 slots, 172,192, so the cap costs no throughput on localhost.
+
 ## Docker image
 
 Not part of `cargo test`. After changing the Dockerfile or startup, build

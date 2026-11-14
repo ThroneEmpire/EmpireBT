@@ -105,8 +105,18 @@ fn main() {
     save_session_dir_benchmark(&client, &root);
 
     // Measure memory with only the loaded session alive.
-    // Room for the connection load test.
-    let config = client.config().clone().with_max_connections(10_000);
+    // Room for the connection load test, which measures how many peers
+    // can be served at once: every peer gets an upload slot unless
+    // UPLOAD_SLOTS says otherwise (20, the default, serves 20 at a time).
+    let slots = std::env::var("UPLOAD_SLOTS")
+        .ok()
+        .and_then(|slots| slots.parse().ok())
+        .unwrap_or(0);
+    let config = client
+        .config()
+        .clone()
+        .with_max_connections(10_000)
+        .with_upload_slots(slots);
     drop(client);
     drop(torrents);
     let started = Instant::now();

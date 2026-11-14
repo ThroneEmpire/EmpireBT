@@ -8,6 +8,10 @@ pub struct ClientConfig {
     listen_port: u16,
     max_peer_connections: usize,
     max_connections: usize,
+    upload_slots: usize,
+    upload_slots_per_torrent: usize,
+    upload_slots_mode: crate::UploadSlotsMode,
+    seed_choking: crate::SeedChoking,
     upload_limit: u64,
     download_limit: u64,
     peer_timeout: Duration,
@@ -27,8 +31,12 @@ impl Default for ClientConfig {
         Self {
             download_directory: PathBuf::from("downloads"),
             listen_port: 6881,
-            max_peer_connections: 50,
+            max_peer_connections: 100,
             max_connections: 500,
+            upload_slots: 20,
+            upload_slots_per_torrent: crate::swarm::DEFAULT_UPLOAD_SLOTS,
+            upload_slots_mode: crate::UploadSlotsMode::default(),
+            seed_choking: crate::SeedChoking::default(),
             upload_limit: 0,
             download_limit: 0,
             peer_timeout: Duration::from_secs(10),
@@ -62,7 +70,8 @@ impl ClientConfig {
         self
     }
 
-    /// Sets the maximum number of simultaneous outbound peer connections.
+    /// Sets the most peer connections one torrent keeps, downloading or
+    /// seeding (qBittorrent's "maximum number of connections per torrent").
     pub fn with_max_peer_connections(mut self, connections: usize) -> Self {
         self.max_peer_connections = connections;
         self
@@ -72,6 +81,32 @@ impl ClientConfig {
     /// every torrent, downloading and seeding, incoming and outgoing.
     pub fn with_max_connections(mut self, connections: usize) -> Self {
         self.max_connections = connections;
+        self
+    }
+
+    /// Sets how many peers we upload to at once across every torrent; 0
+    /// means unlimited.
+    pub fn with_upload_slots(mut self, slots: usize) -> Self {
+        self.upload_slots = slots;
+        self
+    }
+
+    /// Sets how many peers we upload to at once for one torrent.
+    pub fn with_upload_slots_per_torrent(mut self, slots: usize) -> Self {
+        self.upload_slots_per_torrent = slots;
+        self
+    }
+
+    /// Sets whether the number of upload slots is fixed or follows the
+    /// upload rate.
+    pub fn with_upload_slots_mode(mut self, mode: crate::UploadSlotsMode) -> Self {
+        self.upload_slots_mode = mode;
+        self
+    }
+
+    /// Sets which peers get the upload slots.
+    pub fn with_seed_choking(mut self, choking: crate::SeedChoking) -> Self {
+        self.seed_choking = choking;
         self
     }
 
@@ -214,6 +249,23 @@ impl ClientConfig {
         self.max_connections
     }
 
+    /// Peers uploaded to at once across every torrent; 0 means unlimited.
+    pub fn upload_slots(&self) -> usize {
+        self.upload_slots
+    }
+
+    pub fn upload_slots_per_torrent(&self) -> usize {
+        self.upload_slots_per_torrent
+    }
+
+    pub fn upload_slots_mode(&self) -> crate::UploadSlotsMode {
+        self.upload_slots_mode
+    }
+
+    pub fn seed_choking(&self) -> crate::SeedChoking {
+        self.seed_choking
+    }
+
     /// Total upload rate in bytes per second; 0 means unlimited.
     pub fn upload_limit(&self) -> u64 {
         self.upload_limit
@@ -243,6 +295,11 @@ impl ClientConfig {
         if self.max_connections == 0 {
             return Err(crate::BackendError::InvalidConfiguration(
                 "maximum connections must be greater than zero".to_owned(),
+            ));
+        }
+        if self.upload_slots_per_torrent == 0 {
+            return Err(crate::BackendError::InvalidConfiguration(
+                "upload slots per torrent must be greater than zero".to_owned(),
             ));
         }
 

@@ -23,6 +23,8 @@ pub enum SettingKind {
     Seconds,
     /// KiB per second; 0 means unlimited.
     Rate,
+    /// A whole number; 0 means unlimited.
+    Limit,
     Bool,
     /// Comma-separated `host:port` entries.
     HostList,
@@ -89,14 +91,46 @@ pub const BACKEND_SETTINGS: &[Setting] = &[
     Setting {
         key: "network.max_peers",
         kind: SettingKind::Count,
-        description: "Peers to download one torrent from at the same time.",
-        needs_restart: true,
+        description: "Peer connections one torrent keeps at most, downloading or seeding \
+                      (qBittorrent's default: 100).",
+        needs_restart: false,
     },
     Setting {
         key: "network.max_connections",
         kind: SettingKind::Count,
         description: "Peer connections open at once across all torrents, downloading and \
                       seeding.",
+        needs_restart: false,
+    },
+    Setting {
+        key: "network.upload_slots",
+        kind: SettingKind::Limit,
+        description: "Peers uploaded to at once across all torrents; a fifth of them rotate \
+                      to give other peers a turn. 0 means unlimited (qBittorrent's default: \
+                      20).",
+        needs_restart: false,
+    },
+    Setting {
+        key: "network.upload_slots_per_torrent",
+        kind: SettingKind::Count,
+        description: "Peers one torrent uploads to at once (qBittorrent's default: 4).",
+        needs_restart: false,
+    },
+    Setting {
+        key: "network.upload_slots_mode",
+        kind: SettingKind::Choice(&["fixed", "rate_based"]),
+        description: "fixed: network.upload_slots of them. rate_based: as many as the \
+                      upload fills, one more for each peer uploaded to faster than 1 KiB/s, \
+                      2 KiB/s more per slot (qBittorrent's \"upload slots behavior\").",
+        needs_restart: false,
+    },
+    Setting {
+        key: "network.seed_choking",
+        kind: SettingKind::Choice(&["fastest_upload", "round_robin", "anti_leech"]),
+        description: "Which peers get the upload slots, after those sending us the most and \
+                      then those of the rarest-seeded torrents. fastest_upload: those we \
+                      upload to fastest. round_robin: each in turn. anti_leech: those just \
+                      starting or nearly done (qBittorrent's \"upload choking algorithm\").",
         needs_restart: false,
     },
     Setting {
@@ -385,6 +419,11 @@ impl ConfigFile {
                 "network.max_connections",
                 defaults.max_connections(),
             )?)
+            .with_upload_slots(count("network.upload_slots", defaults.upload_slots())?)
+            .with_upload_slots_per_torrent(count(
+                "network.upload_slots_per_torrent",
+                defaults.upload_slots_per_torrent(),
+            )?)
             .with_upload_limit(rate("network.upload_limit")?.unwrap_or(defaults.upload_limit()))
             .with_download_limit(
                 rate("network.download_limit")?.unwrap_or(defaults.download_limit()),
@@ -402,6 +441,29 @@ impl ConfigFile {
                         format!(
                             "network.encryption must be enabled, required, or disabled, \
                              not \"{text}\""
+                        ),
+                    )
+                })?,
+            })
+            .with_upload_slots_mode(match self.typed::<String>("network.upload_slots_mode")? {
+                None => defaults.upload_slots_mode(),
+                Some(text) => crate::UploadSlotsMode::parse(&text).ok_or_else(|| {
+                    invalid(
+                        &self.path,
+                        format!(
+                            "network.upload_slots_mode must be fixed or rate_based, not \"{text}\""
+                        ),
+                    )
+                })?,
+            })
+            .with_seed_choking(match self.typed::<String>("network.seed_choking")? {
+                None => defaults.seed_choking(),
+                Some(text) => crate::SeedChoking::parse(&text).ok_or_else(|| {
+                    invalid(
+                        &self.path,
+                        format!(
+                            "network.seed_choking must be fastest_upload, round_robin, or \
+                             anti_leech, not \"{text}\""
                         ),
                     )
                 })?,
@@ -530,7 +592,7 @@ impl ConfigFile {
 
     fn fill_missing_backend_settings(&mut self, download_dir: &Path) {
         let defaults = ClientConfig::default();
-        let values: [(&str, Value); 18] = [
+        let values: [(&str, Value); 22] = [
             (
                 "storage.download_dir",
                 Value::from(download_dir.to_string_lossy().as_ref()),
@@ -546,6 +608,14 @@ impl ConfigFile {
             (
                 "network.max_connections",
                 Value::from(defaults.max_connections() as i64),
+            ),
+            (
+                "network.upload_slots",
+                Value::from(defaults.upload_slots() as i64),
+            ),
+            (
+                "network.upload_slots_per_torrent",
+                Value::from(defaults.upload_slots_per_torrent() as i64),
             ),
             (
                 "network.upload_limit",
@@ -564,6 +634,14 @@ impl ConfigFile {
                 Value::from(defaults.encryption().as_str()),
             ),
             ("network.utp", Value::from(defaults.utp().as_str())),
+            (
+                "network.upload_slots_mode",
+                Value::from(defaults.upload_slots_mode().as_str()),
+            ),
+            (
+                "network.seed_choking",
+                Value::from(defaults.seed_choking().as_str()),
+            ),
             ("network.lsd", Value::from(defaults.lsd_enabled())),
             ("network.anonymous", Value::from(defaults.anonymous())),
             ("network.disguise", Value::from("off")),
@@ -642,6 +720,7 @@ fn parse(setting: &Setting, input: &str) -> Result<Value, String> {
         SettingKind::Count => whole(1, 10_000, "a whole number"),
         SettingKind::Seconds => whole(1, 3_600, "a number of seconds"),
         SettingKind::Rate => whole(0, 10_000_000, "a speed in KiB/s (0 for unlimited)"),
+        SettingKind::Limit => whole(0, 10_000, "a whole number (0 for unlimited)"),
         SettingKind::Bool => match input.to_ascii_lowercase().as_str() {
             "true" | "yes" | "on" | "1" => Ok(Value::from(true)),
             "false" | "no" | "off" | "0" => Ok(Value::from(false)),
@@ -802,6 +881,32 @@ mod tests {
         assert!(!text.contains("max_inbound"), "{text}");
         assert!(text.contains("max_connections = 1200"), "{text}");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reads_the_upload_slot_settings() {
+        let path = temp_path("upload-slots");
+        let mut file = ConfigFile::load_or_create(&path, Path::new("/data")).unwrap();
+        // New files hold qBittorrent's defaults.
+        let config = file.client_config().unwrap();
+        assert_eq!(config.max_peer_connections(), 100);
+        assert_eq!(config.upload_slots(), 20);
+        assert_eq!(config.upload_slots_per_torrent(), 4);
+        assert_eq!(config.upload_slots_mode(), crate::UploadSlotsMode::Fixed);
+        assert_eq!(config.seed_choking(), crate::SeedChoking::FastestUpload);
+        file.set("network.upload_slots", "0").unwrap();
+        file.set("network.upload_slots_mode", "rate_based").unwrap();
+        file.set("network.seed_choking", "anti_leech").unwrap();
+        let config = file.client_config().unwrap();
+        assert_eq!(config.upload_slots(), 0, "unlimited");
+        assert_eq!(
+            config.upload_slots_mode(),
+            crate::UploadSlotsMode::RateBased
+        );
+        assert_eq!(config.seed_choking(), crate::SeedChoking::AntiLeech);
+        assert!(file.set("network.seed_choking", "fastest").is_err());
+        assert!(file.set("network.upload_slots_per_torrent", "0").is_err());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

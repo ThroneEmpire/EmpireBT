@@ -348,6 +348,8 @@ pub(crate) fn serve(
         limits,
         throttled: Vec::new(),
         evicted: Vec::new(),
+        choker: crate::swarm::Choker::default(),
+        choked_revision: None,
     };
     let mut events = Events::with_capacity(1024);
     let mut last_sweep = Instant::now();
@@ -404,6 +406,8 @@ pub(crate) fn serve(
             server.adopt(connection);
         }
         server.retry_throttled();
+        // Cheap unless a rechoke is due or torrents joined.
+        server.rechoke();
         if last_sweep.elapsed() >= TICK {
             last_sweep = Instant::now();
             server.close_stale();
@@ -437,6 +441,10 @@ struct Server<'a> {
     /// Connections to close to make room for newcomers whose torrents need
     /// them more.
     evicted: Vec<usize>,
+    /// Decides who every torrent uploads to (see [`Server::rechoke`]).
+    choker: crate::swarm::Choker,
+    /// The routes' revision when torrents were last handed to the choker.
+    choked_revision: Option<u64>,
 }
 
 /// Connections past the limit allowed through their handshake, so we learn
@@ -526,6 +534,34 @@ impl Server<'_> {
         for id in std::mem::take(&mut self.evicted) {
             tracing::debug!(target: "peer", "closing a connection to make room for a peer of a torrent that needs it more");
             self.close(id);
+        }
+    }
+
+    /// Chokes for every torrent at once when it is due, sharing the upload
+    /// slots among them. Torrents that joined since are handed to the
+    /// choker at once, so the global count covers them before then.
+    fn rechoke(&mut self) {
+        let now = Instant::now();
+        let revision = self.routes.revision();
+        let due = self.choker.due(now);
+        if !due && self.choked_revision == Some(revision) {
+            return;
+        }
+        self.choked_revision = Some(revision);
+        let torrents: Vec<Arc<ActiveTorrent>> = self.routes.torrents();
+        for torrent in &torrents {
+            torrent.use_limits(&self.limits);
+        }
+        if due {
+            let ranked: Vec<(&crate::swarm::Swarm, crate::swarm::Facts)> = torrents
+                .iter()
+                .map(|torrent| (&*torrent.swarm, crate::swarm::Facts::of(torrent)))
+                .collect();
+            self.choker.rechoke_all(&ranked, self.limits.slots(), now);
+        } else {
+            for torrent in &torrents {
+                torrent.swarm.manage(self.limits.slots());
+            }
         }
     }
 
@@ -817,6 +853,11 @@ impl Server<'_> {
             let torrent = routes
                 .route(&handshake)
                 .ok_or_else(|| invalid("peer asked for a torrent we are not sharing"))?;
+            // A torrent at its own connection limit takes no more, as
+            // libtorrent's `attach_peer`.
+            if !torrent.has_connection_room(0) {
+                return Err(invalid("too many connections for this torrent"));
+            }
             // Past the limit, it stays only if another torrent can better
             // spare a connection: closed before we answer, otherwise.
             if let Some(eviction) = &admission {

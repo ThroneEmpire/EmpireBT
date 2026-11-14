@@ -1,6 +1,6 @@
 //! Limits shared by every connection of a client: how many peer
-//! connections may be open at once, and how fast data may be uploaded and
-//! downloaded in total.
+//! connections may be open at once, how many peers we upload to at once,
+//! and how fast data may be uploaded and downloaded in total.
 //!
 //! Rates are enforced where bytes meet sockets, in the event loop: writes
 //! take upload tokens and reads take download tokens from a token bucket.
@@ -8,7 +8,7 @@
 //! reading from a TCP socket fills the peer's send window, so a download
 //! limit slows the sending peers rather than buffering data here.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -22,7 +22,10 @@ const MIN_BURST: f64 = 16.0 * 1024.0;
 #[derive(Debug)]
 pub struct Limits {
     max_connections: AtomicUsize,
+    /// Connections one torrent keeps at most.
+    max_peers: AtomicUsize,
     open: AtomicUsize,
+    slots: Arc<UploadSlots>,
     upload: Bucket,
     download: Bucket,
 }
@@ -38,7 +41,9 @@ impl Limits {
     pub fn unlimited() -> Self {
         Self {
             max_connections: AtomicUsize::new(usize::MAX),
+            max_peers: AtomicUsize::new(usize::MAX),
             open: AtomicUsize::new(0),
+            slots: Arc::default(),
             upload: Bucket::new(0),
             download: Bucket::new(0),
         }
@@ -48,6 +53,11 @@ impl Limits {
     pub fn from_config(config: &crate::ClientConfig) -> Self {
         let limits = Self::unlimited();
         limits.set_max_connections(config.max_connections());
+        limits.set_max_peers_per_torrent(config.max_peer_connections());
+        limits.set_upload_slots(config.upload_slots());
+        limits.set_upload_slots_per_torrent(config.upload_slots_per_torrent());
+        limits.set_upload_slots_mode(config.upload_slots_mode());
+        limits.set_seed_choking(config.seed_choking());
         limits.set_upload_rate(config.upload_limit());
         limits.set_download_rate(config.download_limit());
         limits
@@ -63,6 +73,16 @@ impl Limits {
         self.max_connections.load(Ordering::Relaxed)
     }
 
+    /// Peer connections one torrent keeps at most, downloading or seeding
+    /// (libtorrent's per-torrent `max_connections`).
+    pub fn set_max_peers_per_torrent(&self, connections: usize) {
+        self.max_peers.store(connections.max(1), Ordering::Relaxed);
+    }
+
+    pub fn max_peers_per_torrent(&self) -> usize {
+        self.max_peers.load(Ordering::Relaxed)
+    }
+
     /// Peer connections open now, across every runtime using these limits.
     pub fn open_connections(&self) -> usize {
         self.open.load(Ordering::Relaxed)
@@ -72,6 +92,55 @@ impl Limits {
     /// dialed.
     pub fn has_room(&self, pending: usize) -> bool {
         self.open_connections().saturating_add(pending) < self.max_connections()
+    }
+
+    /// Peers we upload to at once, across every torrent (libtorrent's
+    /// `unchoke_slots_limit`); 0 means unlimited.
+    pub fn set_upload_slots(&self, slots: usize) {
+        self.slots.global.store(slots, Ordering::Relaxed);
+    }
+
+    pub fn upload_slots(&self) -> usize {
+        self.slots.global.load(Ordering::Relaxed)
+    }
+
+    /// Peers we upload to at once for one torrent (libtorrent's
+    /// `max_uploads`); at least 1.
+    pub fn set_upload_slots_per_torrent(&self, slots: usize) {
+        self.slots
+            .per_torrent
+            .store(slots.max(1), Ordering::Relaxed);
+    }
+
+    pub fn upload_slots_per_torrent(&self) -> usize {
+        self.slots.per_torrent.load(Ordering::Relaxed)
+    }
+
+    /// Whether the number of upload slots follows the upload rate instead
+    /// of [`Limits::upload_slots`] (qBittorrent's "upload slots behavior").
+    pub fn set_upload_slots_mode(&self, mode: UploadSlotsMode) {
+        self.slots
+            .rate_based
+            .store(mode == UploadSlotsMode::RateBased, Ordering::Relaxed);
+    }
+
+    pub fn upload_slots_mode(&self) -> UploadSlotsMode {
+        self.slots.mode()
+    }
+
+    /// Which peers seeding torrents upload to (qBittorrent's "upload
+    /// choking algorithm").
+    pub fn set_seed_choking(&self, choking: SeedChoking) {
+        self.slots.choking.store(choking as u8, Ordering::Relaxed);
+    }
+
+    pub fn seed_choking(&self) -> SeedChoking {
+        self.slots.choking()
+    }
+
+    /// The upload slot settings and count, for the choker.
+    pub(crate) fn slots(&self) -> &Arc<UploadSlots> {
+        &self.slots
     }
 
     /// Total upload rate in bytes per second; 0 means unlimited.
@@ -118,6 +187,134 @@ impl Limits {
     /// Returns bytes taken for reading but not read.
     pub(crate) fn refund_download(&self, bytes: usize) {
         self.download.refund(bytes);
+    }
+}
+
+/// Upload slot settings, and how many peers hold one now. A swarm the
+/// event loop chokes for (see [`crate::swarm::rechoke_all`]) keeps
+/// `unchoked` up to date as it unchokes and chokes peers.
+#[derive(Debug)]
+pub(crate) struct UploadSlots {
+    /// Across every torrent; 0 is unlimited.
+    global: AtomicUsize,
+    per_torrent: AtomicUsize,
+    rate_based: AtomicBool,
+    /// A [`SeedChoking`].
+    choking: AtomicU8,
+    pub(crate) unchoked: AtomicUsize,
+}
+
+/// How many upload slots there are (libtorrent's `choking_algorithm`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UploadSlotsMode {
+    /// [`Limits::upload_slots`] of them (`fixed_slots_choker`).
+    #[default]
+    Fixed,
+    /// As many as the upload rate fills (`rate_based_choker`): one for
+    /// each peer we upload to faster than a threshold that starts at
+    /// 1 KiB/s and rises 2 KiB/s per slot, plus one.
+    RateBased,
+}
+
+impl UploadSlotsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::RateBased => "rate_based",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "fixed" => Some(Self::Fixed),
+            "rate_based" => Some(Self::RateBased),
+            _ => None,
+        }
+    }
+}
+
+/// Which interested peers get the upload slots, among those that send us
+/// equally much (libtorrent's `seed_choking_algorithm`). Ties go to the
+/// peer unchoked longest ago.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SeedChoking {
+    /// The peers we uploaded to fastest in the last interval, as
+    /// qBittorrent's default.
+    #[default]
+    FastestUpload = 0,
+    /// Each peer in turn: one that got its quota (20 pieces, and a minute
+    /// unchoked) makes way.
+    RoundRobin = 1,
+    /// Peers that have just started or nearly finished, over those half
+    /// done, which deters downloading without sharing.
+    AntiLeech = 2,
+}
+
+impl SeedChoking {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FastestUpload => "fastest_upload",
+            Self::RoundRobin => "round_robin",
+            Self::AntiLeech => "anti_leech",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "fastest_upload" => Some(Self::FastestUpload),
+            "round_robin" => Some(Self::RoundRobin),
+            "anti_leech" => Some(Self::AntiLeech),
+            _ => None,
+        }
+    }
+}
+
+impl Default for UploadSlots {
+    fn default() -> Self {
+        Self {
+            global: AtomicUsize::new(0),
+            per_torrent: AtomicUsize::new(crate::swarm::DEFAULT_UPLOAD_SLOTS),
+            rate_based: AtomicBool::new(false),
+            choking: AtomicU8::new(SeedChoking::default() as u8),
+            unchoked: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl UploadSlots {
+    /// The global limit, `None` when unlimited.
+    pub(crate) fn global(&self) -> Option<usize> {
+        match self.global.load(Ordering::Relaxed) {
+            0 => None,
+            slots => Some(slots),
+        }
+    }
+
+    pub(crate) fn per_torrent(&self) -> usize {
+        self.per_torrent.load(Ordering::Relaxed).max(1)
+    }
+
+    pub(crate) fn mode(&self) -> UploadSlotsMode {
+        if self.rate_based.load(Ordering::Relaxed) {
+            UploadSlotsMode::RateBased
+        } else {
+            UploadSlotsMode::Fixed
+        }
+    }
+
+    pub(crate) fn choking(&self) -> SeedChoking {
+        match self.choking.load(Ordering::Relaxed) {
+            1 => SeedChoking::RoundRobin,
+            2 => SeedChoking::AntiLeech,
+            _ => SeedChoking::FastestUpload,
+        }
+    }
+
+    /// Whether one more peer may be unchoked across all torrents.
+    pub(crate) fn has_room(&self) -> bool {
+        self.global()
+            .is_none_or(|global| self.unchoked.load(Ordering::Relaxed) < global)
     }
 }
 

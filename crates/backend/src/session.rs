@@ -685,6 +685,7 @@ impl DownloadSession {
     ) -> Result<(usize, Option<crate::BackendError>), crate::BackendError> {
         let before = self.progress.verified_pieces();
         torrent.set_connection_limit(max_connections);
+        torrent.use_limits(&self.limits);
         // Productive peers first; banned ones are skipped.
         let ranked = self.swarm.rank(addresses);
         self.swarm.note_known(&ranked);
@@ -715,9 +716,7 @@ impl DownloadSession {
                         // Only dial while there is room for the connection,
                         // for this torrent and across all of them.
                         let pending = dialing.load(Ordering::Acquire);
-                        if torrent.connection_count() + pending >= max_connections
-                            || !self.limits.has_room(pending)
-                        {
+                        if !torrent.has_connection_room(pending) || !self.limits.has_room(pending) {
                             std::thread::sleep(POLL_INTERVAL);
                             continue;
                         }

@@ -853,9 +853,11 @@ impl Client {
             .with_connect_options(self.connect_options())
             .with_limits(Arc::clone(&self.limits))
             .with_runtime(self.runtime.clone());
+        // The shared limits hold the per-torrent connection limit, so it
+        // can change while downloading.
         let downloaded = session.download_from_trackers_with_retries(
             self.config.listen_port(),
-            self.config.max_peer_connections(),
+            usize::MAX,
             3,
         )?;
         self.torrents[index].seed();
@@ -991,7 +993,9 @@ impl Client {
         let peer_id = self.peer_id_for(Some(&info), peer_id);
         let storage = self.storage_at(index);
         let port = self.config.listen_port();
-        let max_connections = self.config.max_peer_connections();
+        // The shared limits hold the per-torrent connection limit, so it
+        // can change while downloading.
+        let max_connections = usize::MAX;
         let options = self.connect_options();
         let runtime = self.runtime.clone();
         let limits = Arc::clone(&self.limits);

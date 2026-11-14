@@ -355,6 +355,21 @@ fn preferences_json(snapshot: &Snapshot) -> Value {
         },
         "max_connec": number(snapshot, "network.max_connections"),
         "max_connec_per_torrent": number(snapshot, "network.max_peers"),
+        // qBittorrent says unlimited with -1, EmpireBT with 0.
+        "max_uploads": match number(snapshot, "network.upload_slots") {
+            0 => -1,
+            slots => slots as i64,
+        },
+        "max_uploads_per_torrent": number(snapshot, "network.upload_slots_per_torrent"),
+        "upload_slots_behavior": match setting(snapshot, "network.upload_slots_mode").as_str() {
+            "rate_based" => 1,
+            _ => 0,
+        },
+        "upload_choking_algorithm": match setting(snapshot, "network.seed_choking").as_str() {
+            "round_robin" => 0,
+            "anti_leech" => 2,
+            _ => 1,
+        },
         "dl_limit": snapshot.rate_limits.0,
         "up_limit": snapshot.rate_limits.1,
         "alt_dl_limit": 0,
@@ -413,6 +428,29 @@ fn preference_setting(key: &str, value: &Value) -> Option<(&'static str, String)
         ),
         "max_connec" => ("network.max_connections", whole(value)?.to_string()),
         "max_connec_per_torrent" => ("network.max_peers", whole(value)?.to_string()),
+        // -1, unlimited there, becomes 0.
+        "max_uploads" => ("network.upload_slots", whole(value)?.to_string()),
+        "upload_slots_behavior" => (
+            "network.upload_slots_mode",
+            match value.as_i64()? {
+                1 => "rate_based",
+                _ => "fixed",
+            }
+            .to_owned(),
+        ),
+        "upload_choking_algorithm" => (
+            "network.seed_choking",
+            match value.as_i64()? {
+                0 => "round_robin",
+                2 => "anti_leech",
+                _ => "fastest_upload",
+            }
+            .to_owned(),
+        ),
+        "max_uploads_per_torrent" => (
+            "network.upload_slots_per_torrent",
+            whole(value)?.to_string(),
+        ),
         // Bytes a second there, KiB a second here.
         "dl_limit" => (
             "network.download_limit",

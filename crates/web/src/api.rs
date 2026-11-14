@@ -731,6 +731,7 @@ fn setting_kind(kind: empirebt_backend::SettingKind) -> &'static str {
         SettingKind::Count => "count",
         SettingKind::Seconds => "seconds",
         SettingKind::Rate => "rate",
+        SettingKind::Limit => "limit",
         SettingKind::Bool => "bool",
         SettingKind::HostList => "hosts",
         SettingKind::Choice(_) => "choice",

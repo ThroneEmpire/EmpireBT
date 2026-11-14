@@ -190,6 +190,9 @@ pub(crate) struct ActiveTorrent {
     connections: std::sync::atomic::AtomicUsize,
     /// The most connections this torrent keeps, when a download limits it.
     connection_limit: std::sync::atomic::AtomicUsize,
+    /// The shared limits, once a runtime or download applies them; their
+    /// per-torrent connection limit applies too.
+    limits: std::sync::OnceLock<Arc<crate::Limits>>,
     /// Seeders and leechers trackers last reported, packed in one word
     /// (high and low half); [`UNKNOWN_SWARM`] until one did.
     swarm_size: std::sync::atomic::AtomicU64,
@@ -230,6 +233,7 @@ impl ActiveTorrent {
             pieces: Arc::new(Mutex::new(pieces)),
             connections: std::sync::atomic::AtomicUsize::new(0),
             connection_limit: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            limits: std::sync::OnceLock::new(),
             swarm_size: std::sync::atomic::AtomicU64::new(UNKNOWN_SWARM),
             last_error: Mutex::new(None),
             leaf_layers: Mutex::new(HashMap::new()),
@@ -295,13 +299,33 @@ impl ActiveTorrent {
             .store(limit, std::sync::atomic::Ordering::Release);
     }
 
+    /// Applies the shared limits' per-torrent connection limit to this
+    /// torrent. The first limits given stay.
+    pub(crate) fn use_limits(&self, limits: &Arc<crate::Limits>) {
+        let _ = self.limits.set(Arc::clone(limits));
+    }
+
+    /// The most connections this torrent keeps: a download's own limit or
+    /// the shared per-torrent one, whichever is lower.
+    pub(crate) fn connection_limit(&self) -> usize {
+        let own = self
+            .connection_limit
+            .load(std::sync::atomic::Ordering::Acquire);
+        self.limits
+            .get()
+            .map_or(own, |limits| own.min(limits.max_peers_per_torrent()))
+    }
+
+    /// Whether another connection fits this torrent, with `pending` more
+    /// already being dialed for it.
+    pub(crate) fn has_connection_room(&self, pending: usize) -> bool {
+        self.connection_count().saturating_add(pending) < self.connection_limit()
+    }
+
     /// Within [`CROWDED_MARGIN`] connections of this torrent's limit, so
     /// connections that do nothing for it should make way.
     pub(crate) fn crowded(&self) -> bool {
-        let limit = self
-            .connection_limit
-            .load(std::sync::atomic::Ordering::Acquire);
-        self.connection_count().saturating_add(CROWDED_MARGIN) >= limit
+        self.connection_count().saturating_add(CROWDED_MARGIN) >= self.connection_limit()
     }
 
     pub(crate) fn connection_opened(&self) {

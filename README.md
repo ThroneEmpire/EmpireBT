@@ -180,8 +180,12 @@ with comments on first run. Change settings in any of three ways:
 | `storage.incomplete_dir` | empty | A folder new torrents download in; each moves to its save folder once complete (qBittorrent's incomplete folder). Empty downloads straight into the save folder |
 | `network.port` | `6881` | Incoming peer port, over TCP and UDP (uTP and the DHT); changes apply at once |
 | `network.port_file` | empty | A file holding the port to use instead, followed while running, such as a VPN's forwarded port ([DOCKER.md](docs/DOCKER.md#port-forwarding)) |
-| `network.max_peers` | `50` | Peers to download one torrent from at once |
+| `network.max_peers` | `100` | Peer connections one torrent keeps, downloading or seeding (applies live) |
 | `network.max_connections` | `500` | Peer connections across all torrents, downloading and seeding (applies live); when they run short, rarely seeded torrents keep theirs ([Connections](#connections)) |
+| `network.upload_slots` | `20` | Peers uploaded to at once across all torrents; 0 for unlimited (applies live) |
+| `network.upload_slots_per_torrent` | `4` | Peers one torrent uploads to at once (applies live) |
+| `network.upload_slots_mode` | `fixed` | `fixed`: `network.upload_slots` of them; `rate_based`: as many as the upload fills (qBittorrent's "upload slots behavior") |
+| `network.seed_choking` | `fastest_upload` | Which peers get the slots: `fastest_upload`, `round_robin` or `anti_leech` (qBittorrent's "upload choking algorithm") |
 | `network.upload_limit` | `0` | Total upload speed in KiB/s; `0` is unlimited (applies live) |
 | `network.download_limit` | `0` | Total download speed in KiB/s; `0` is unlimited (applies live) |
 | `network.peer_timeout` | `10` | Seconds before an unresponsive peer or tracker is dropped |
@@ -353,6 +357,14 @@ still be told apart by the finer details of how they behave.
   least busy peer of a well-seeded one; a peer of a well-seeded torrent is the
   one turned away. Downloads keep theirs before any seed. Every torrent
   keeps seeding: nothing is paused.
+- **Upload slots are shared across torrents**, as in qBittorrent: we upload
+  to at most 20 peers at once (`network.upload_slots`, 0 for unlimited),
+  and 4 per torrent (`network.upload_slots_per_torrent`). Every 10 seconds
+  the peers sending us the most get them; among equals, those of the
+  rarest-seeded torrents, then as `network.seed_choking` says (fastest
+  upload, round-robin, or anti-leech). A fifth rotate every 30 seconds to
+  give other peers a turn. With `network.upload_slots_mode = rate_based`,
+  the number of slots follows the upload instead.
 - **uTP (BEP 29)** runs on the same port as TCP and the DHT, so clients
   that try uTP first connect immediately. Its congestion control backs off
   as soon as it sees queuing, so seeding leaves room for everything else.
