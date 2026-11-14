@@ -96,7 +96,7 @@ Key areas and where they are tested:
 | Peer ID (BEP 20), handshakes, self-connections | `identity.rs`, `protocol/connection.rs` |
 | Encryption (MSE): DH, RC4, both handshake sides | `protocol/mse.rs` (RC4 checked against RFC 6229, DH against Python's `pow`) |
 | uTP: packets, retransmission, congestion, sockets | `net/utp.rs` (two cores over a simulated link with 10% loss, duplicates, and reordering; real loopback sockets) |
-| Client, session save/load, resume data | `client.rs`, `storage/resume.rs` |
+| Client, session save/load, resume data | `client/mod.rs`, `client/session_file.rs`, `storage/resume.rs` |
 | Config file | `config_file.rs`, `config.rs` |
 | Application engine: commands seen in the next snapshot, failures, settings, waiting for snapshots, several interfaces at once, restart; session store and data-directory lock | `app/src/engine.rs`, `app/src/store.rs` |
 | Categories and tags: assignment, the labels file, names, restart, a damaged file | `app/src/labels.rs`, `app/src/engine.rs` |

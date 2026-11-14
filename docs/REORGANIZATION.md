@@ -15,7 +15,8 @@ Started 2026-11-13, after the upload-slot work (commit `6fbcd9f`).
 | `discovery/` | tracker, tiers (was `discovery.rs`), dht, dht_id, lsd, announcer | Finding peers: trackers, the DHT, local discovery |
 | `engine/` | active, block, wire, runtime, reactor, session, swarm, choker (out of `swarm.rs`), limits, seeder (with `v2_seeder`), piece_manager | Moving data: connections, choking, limits |
 | `storage/` | mod (was `storage.rs`), resume, names | Files on disk |
-| top level | lib, client, config, config_file, error, identity, progress, torrent (with `transfer`) | The client and its settings |
+| `client/` | mod (was `client.rs`), session_file | The client, and saving its session |
+| top level | lib, config, config_file, error, identity, progress, torrent (with `transfer`) | The client and its settings |
 
 ## Progress
 
@@ -27,7 +28,7 @@ Started 2026-11-13, after the upload-slot work (commit `6fbcd9f`).
 - [x] Merge `seeder.rs` + `v2_seeder.rs`, and `transfer.rs` into `torrent.rs`
 - [x] Split the choker out of `swarm.rs` into `engine/choker.rs`
 - [x] Update doc comments and docs/TESTING.md paths
-- [ ] Later, separately: split `client.rs` (~2,000 lines of code)
+- [x] Move saving and loading the session out of `client.rs` into `client/session_file.rs` (~470 lines of code, with its byte helpers and its four tests). The rest of `client/mod.rs` (~1,500 lines of code) stays together: adding, starting, downloading, seeding, and renaming torrents all work on the torrent list
 
 After each step: `cargo build`, then the full suite, clippy, and fmt at
 the end.
