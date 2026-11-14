@@ -6,11 +6,11 @@
 //! one flag byte per added contact in `added.f` and `added6.f`. Messages go
 //! out at most once a minute, with at most 50 additions and 50 drops after
 //! the first. Contacts from peers are untrusted, so the receiver checks and
-//! limits them (see [`crate::swarm`]).
+//! limits them (see [`crate::engine::swarm`]).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::bencode::{self, Value};
+use crate::protocol::bencode::{self, Value};
 
 /// The extension message id we assign to `ut_pex`.
 pub(crate) const UT_PEX: u8 = 2;

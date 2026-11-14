@@ -99,7 +99,11 @@ impl Layout {
             }
             Self::V2(pieces) => {
                 pieces[index].expected
-                    == crate::v2::piece_hash_for(data, info.piece_length(), pieces[index].single)
+                    == crate::protocol::v2::piece_hash_for(
+                        data,
+                        info.piece_length(),
+                        pieces[index].single,
+                    )
             }
         }
     }
@@ -184,7 +188,7 @@ pub(crate) struct ActiveTorrent {
     /// How long a peer may go without sending requested blocks.
     pub(crate) timeout: Duration,
     pub(crate) progress: Arc<crate::TransferProgress>,
-    pub(crate) swarm: Arc<crate::swarm::Swarm>,
+    pub(crate) swarm: Arc<crate::engine::swarm::Swarm>,
     pieces: Arc<Mutex<PieceManager>>,
     /// Open peer connections, counted by their protocol state.
     connections: std::sync::atomic::AtomicUsize,
@@ -219,7 +223,7 @@ impl ActiveTorrent {
         peer_id: [u8; 20],
         timeout: Duration,
         progress: Arc<crate::TransferProgress>,
-        swarm: Arc<crate::swarm::Swarm>,
+        swarm: Arc<crate::engine::swarm::Swarm>,
         pieces: PieceManager,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -254,7 +258,9 @@ impl ActiveTorrent {
         }
         let progress = Arc::new(crate::TransferProgress::new());
         progress.set_totals(count, info.total_length());
-        let swarm = Arc::new(crate::swarm::Swarm::new(crate::swarm::DEFAULT_UPLOAD_SLOTS));
+        let swarm = Arc::new(crate::engine::swarm::Swarm::new(
+            crate::engine::swarm::DEFAULT_UPLOAD_SLOTS,
+        ));
         Self::new(info, storage, peer_id, timeout, progress, swarm, pieces)
     }
 
@@ -579,7 +585,7 @@ impl ActiveTorrent {
         if self.info.v2_info_hash().is_none() {
             return Ok(reject);
         }
-        crate::v2::answer_hash_request(
+        crate::protocol::v2::answer_hash_request(
             &self.info,
             pieces_root,
             base_layer,
@@ -608,7 +614,7 @@ impl ActiveTorrent {
             let piece = self
                 .storage
                 .read_v2_piece(file, self.info.piece_length(), piece_index)?;
-            leaves.extend(crate::v2::leaf_hashes(&piece));
+            leaves.extend(crate::protocol::v2::leaf_hashes(&piece));
         }
         let layer = Arc::new(leaves);
         if let Ok(mut layers) = self.leaf_layers.lock() {
@@ -659,7 +665,9 @@ mod tests {
         std::fs::create_dir_all(root.join("piece.bin")).unwrap();
         let storage = Storage::new(&root).unwrap();
         let progress = Arc::new(crate::TransferProgress::new());
-        let swarm = Arc::new(crate::swarm::Swarm::new(crate::swarm::DEFAULT_UPLOAD_SLOTS));
+        let swarm = Arc::new(crate::engine::swarm::Swarm::new(
+            crate::engine::swarm::DEFAULT_UPLOAD_SLOTS,
+        ));
         let torrent = ActiveTorrent::new(
             info,
             storage,

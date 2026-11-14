@@ -439,7 +439,7 @@ fn udp_exchange(
 /// be guessed by someone forging tracker replies (made-up peers, a huge
 /// interval).
 fn transaction_id() -> u32 {
-    u32::from_be_bytes(crate::dht::random_bytes())
+    u32::from_be_bytes(crate::discovery::dht::random_bytes())
 }
 
 fn invalid(message: impl Into<String>) -> crate::BackendError {
@@ -780,7 +780,7 @@ fn announce_http_tracker(
     request: &AnnounceRequest,
     timeout: Duration,
 ) -> Result<TrackerResponse, Failure> {
-    let url = crate::http::Url::parse(tracker.url(), "announce")
+    let url = crate::net::http::Url::parse(tracker.url(), "announce")
         .map_err(|message| tracker_error(format!("tracker {message}")))?;
     // Private trackers embed credentials in the announce URL's own query.
     let separator = if url.path.contains('?') { '&' } else { '?' };
@@ -909,14 +909,14 @@ mod tracker_ids {
 
 fn http_announce_at(
     address: SocketAddr,
-    url: &crate::http::Url,
+    url: &crate::net::http::Url,
     target: &str,
     user_agent: &str,
     timeout: Duration,
     binding: &crate::Binding,
 ) -> Result<TrackerResponse, Failure> {
-    let fetch = |address: SocketAddr, url: &crate::http::Url, target: &str| {
-        crate::http::request_at(
+    let fetch = |address: SocketAddr, url: &crate::net::http::Url, target: &str| {
+        crate::net::http::request_at(
             address,
             url,
             target,
@@ -926,8 +926,8 @@ fn http_announce_at(
             binding,
         )
         .map_err(|error| match error {
-            crate::http::Error::Unreachable(message) => unreachable(message),
-            crate::http::Error::Invalid(message) => Failure::from(tracker_error(message)),
+            crate::net::http::Error::Unreachable(message) => unreachable(message),
+            crate::net::http::Error::Invalid(message) => Failure::from(tracker_error(message)),
         })
     };
     let mut response = fetch(address, url, target)?;
@@ -936,7 +936,7 @@ fn http_announce_at(
     let mut redirects = 0;
     while matches!(response.status, 301 | 302 | 303 | 307 | 308) {
         redirects += 1;
-        if redirects > crate::http::MAX_REDIRECTS {
+        if redirects > crate::net::http::MAX_REDIRECTS {
             return Err(tracker_error("tracker redirected too many times").into());
         }
         let location = response
@@ -1052,7 +1052,7 @@ fn scrape_http(
 ) -> Result<HashMap<[u8; 20], ScrapeStats>, Failure> {
     let scrape =
         scrape_url(tracker.url()).ok_or_else(|| tracker_error("this tracker cannot be scraped"))?;
-    let url = crate::http::Url::parse(&scrape, "scrape")
+    let url = crate::net::http::Url::parse(&scrape, "scrape")
         .map_err(|message| tracker_error(format!("tracker {message}")))?;
     let separator = if url.path.contains('?') { '&' } else { '?' };
     let hashes: Vec<String> = info_hashes
@@ -1062,7 +1062,7 @@ fn scrape_http(
     let target = format!("{}{separator}{}", url.path, hashes.join("&"));
     let mut last = None;
     for address in family_addresses(tracker, &format!("{}:{}", url.host, url.port))? {
-        let response = match crate::http::request_at(
+        let response = match crate::net::http::request_at(
             address,
             &url,
             &target,
@@ -1072,11 +1072,13 @@ fn scrape_http(
             &tracker.binding,
         ) {
             Ok(response) => response,
-            Err(crate::http::Error::Unreachable(message)) => {
+            Err(crate::net::http::Error::Unreachable(message)) => {
                 last = Some(unreachable(message));
                 continue;
             }
-            Err(crate::http::Error::Invalid(message)) => return Err(tracker_error(message).into()),
+            Err(crate::net::http::Error::Invalid(message)) => {
+                return Err(tracker_error(message).into());
+            }
         };
         if response.status != 200 {
             return Err(tracker_error(format!(
@@ -1092,17 +1094,17 @@ fn scrape_http(
 
 /// A BEP 48 scrape response: `files`, each torrent's hash to its counts.
 fn parse_scrape(body: &[u8]) -> Result<HashMap<[u8; 20], ScrapeStats>, crate::BackendError> {
-    let response = crate::bencode::decode(body)?;
+    let response = crate::protocol::bencode::decode(body)?;
     if let Some(reason) = response.get_bytes(b"failure reason") {
         return Err(tracker_error(format!(
             "tracker refused the scrape: {}",
             String::from_utf8_lossy(reason)
         )));
     }
-    let Some(crate::bencode::Value::Dict(files)) = response.get(b"files") else {
+    let Some(crate::protocol::bencode::Value::Dict(files)) = response.get(b"files") else {
         return Err(tracker_error("scrape response has no files"));
     };
-    let count = |file: &crate::bencode::Value, key: &[u8]| {
+    let count = |file: &crate::protocol::bencode::Value, key: &[u8]| {
         file.get_int(key)
             .and_then(|count| u64::try_from(count).ok())
             .unwrap_or(0)
@@ -1312,8 +1314,8 @@ mod tests {
     }
 
     fn http_family_announce(port: u16) -> FamilyAnnounce {
-        let url =
-            crate::http::Url::parse(&format!("http://tracker.test:{port}/announce"), "").unwrap();
+        let url = crate::net::http::Url::parse(&format!("http://tracker.test:{port}/announce"), "")
+            .unwrap();
         let target = format!("{}?info_hash=x", url.path);
         Arc::new(move |address| {
             http_announce_at(

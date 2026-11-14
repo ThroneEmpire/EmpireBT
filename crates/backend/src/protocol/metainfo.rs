@@ -179,14 +179,14 @@ impl TorrentInfo {
 
         // `name.utf-8` first: torrent makers that wrote `name` in a legacy
         // encoding add it in UTF-8 there. Either way the name is made safe
-        // rather than refused (see [`crate::names`]).
+        // rather than refused (see [`crate::storage::names`]).
         let raw_name = match find(info_dict, b"name.utf-8") {
             Some(value) => bytes_value(value, "name.utf-8")?,
             None => bytes_value(required(info_dict, b"name")?, "name")?,
         };
         let name = Some(raw_name)
             .filter(|raw| !raw.is_empty())
-            .and_then(|raw| crate::names::sanitize_element(raw, false))
+            .and_then(|raw| crate::storage::names::sanitize_element(raw, false))
             .ok_or_else(|| invalid("torrent has no usable name"))?;
         let piece_length = integer(required(info_dict, b"piece length")?, "piece length")?;
         let meta_version = find(info_dict, b"meta version")
@@ -397,15 +397,15 @@ impl TorrentInfo {
 
     /// The paths EmpireBT 0.1.1 and earlier gave this torrent's files, in
     /// the order of [`TorrentInfo::files`]: names exactly as the torrent
-    /// wrote them, before [`crate::names`] cleaned them (control
+    /// wrote them, before [`crate::storage::names`] cleaned them (control
     /// characters, invisible ones, overlong names, duplicates). Files
     /// downloaded then are on disk under these names (as libtorrent 2.0
     /// left them too, before 2.1 cleaned C1 controls: its issue 9115).
     /// `None` when that version could not have added the torrent (a name
     /// not in UTF-8, or unsafe), or without the raw metadata.
     pub fn legacy_paths(&self) -> Option<Vec<PathBuf>> {
-        use crate::bencode::Value;
-        let info = crate::bencode::decode(self.info_bytes()?).ok()?;
+        use crate::protocol::bencode::Value;
+        let info = crate::protocol::bencode::decode(self.info_bytes()?).ok()?;
         let text = |value: &Value| {
             std::str::from_utf8(value.as_bytes()?)
                 .ok()
@@ -507,9 +507,10 @@ impl TorrentInfo {
         /// Large torrents run to tens of MB of piece hashes; anything much
         /// bigger is not a torrent.
         const LIMIT: u64 = 64 * 1024 * 1024;
-        let bytes = crate::http::get(url.trim(), timeout, LIMIT, binding).map_err(|error| {
-            crate::BackendError::Io(format!("cannot download {url}: {}", error.into_message()))
-        })?;
+        let bytes =
+            crate::net::http::get(url.trim(), timeout, LIMIT, binding).map_err(|error| {
+                crate::BackendError::Io(format!("cannot download {url}: {}", error.into_message()))
+            })?;
         // Sites often answer with a login or error page instead.
         Self::from_bytes(&bytes).map_err(|error| {
             crate::BackendError::InvalidMetainfo(format!(
@@ -695,11 +696,11 @@ impl TorrentInfo {
                     pieces_root,
                 });
             } else {
-                if prefix.iter().count() >= crate::names::MAX_DIRECTORY_DEPTH {
+                if prefix.iter().count() >= crate::storage::names::MAX_DIRECTORY_DEPTH {
                     return Err(invalid("torrent has a file more than 100 folders deep"));
                 }
-                let component =
-                    crate::names::sanitize_element(name, true).unwrap_or_else(|| "_".to_owned());
+                let component = crate::storage::names::sanitize_element(name, true)
+                    .unwrap_or_else(|| "_".to_owned());
                 let mut next = prefix.to_path_buf();
                 next.push(component);
                 files.extend(Self::parse_v2_tree(child, &next)?);
@@ -718,7 +719,7 @@ fn v1_info_hash(
     pieces: &[[u8; 20]],
     files: &[TorrentFile],
 ) -> [u8; 20] {
-    use crate::bencode::Value;
+    use crate::protocol::bencode::Value;
     let text = |text: &str| Value::bytes(text.as_bytes());
     let mut info = std::collections::BTreeMap::new();
     info.insert(b"name".to_vec(), text(name));
@@ -774,7 +775,8 @@ fn parse_multi_file(
                 .iter()
                 .map(|element| bytes_value(element, "file path"))
                 .collect::<Result<Vec<_>, _>>()?;
-            let path = PathBuf::from(root_name).join(crate::names::sanitize_path(elements)?);
+            let path =
+                PathBuf::from(root_name).join(crate::storage::names::sanitize_path(elements)?);
             let padding = find(dict, b"attr")
                 .and_then(|attr| bytes_value(attr, "attr").ok())
                 .is_some_and(|attr| attr.contains(&b'p'));
@@ -787,7 +789,7 @@ fn parse_multi_file(
         .collect()
 }
 
-/// Gives files whose paths collide new names, as [`crate::names`]
+/// Gives files whose paths collide new names, as [`crate::storage::names`]
 /// describes, in `files` and the same files of `v2_files`: all of them for
 /// a v2 torrent, whose `files` mirror them, or the files other than padding,
 /// in order, for a hybrid one.
@@ -795,14 +797,14 @@ fn rename_duplicates(
     files: &mut [TorrentFile],
     v2_files: &mut [V2File],
 ) -> Result<(), crate::BackendError> {
-    let named: Vec<crate::names::Named> = files
+    let named: Vec<crate::storage::names::Named> = files
         .iter()
-        .map(|file| crate::names::Named {
+        .map(|file| crate::storage::names::Named {
             path: &file.path,
             padding: file.padding.then_some(file.length),
         })
         .collect();
-    let renamed = crate::names::resolve_duplicates(&named)?;
+    let renamed = crate::storage::names::resolve_duplicates(&named)?;
     if renamed.is_empty() {
         return Ok(());
     }

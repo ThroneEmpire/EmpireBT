@@ -117,7 +117,7 @@ pub fn generate_qbittorrent_peer_id() -> [u8; 20] {
         b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.!~*()";
     let mut id = [0; 20];
     id[..8].copy_from_slice(&QBITTORRENT_PEER_ID_PREFIX);
-    let random: [u8; 12] = crate::dht::random_bytes();
+    let random: [u8; 12] = crate::discovery::dht::random_bytes();
     for (byte, value) in id[8..].iter_mut().zip(random) {
         *byte = PRINTABLE[usize::from(value) % PRINTABLE.len()];
     }

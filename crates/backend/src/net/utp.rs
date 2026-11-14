@@ -1400,7 +1400,7 @@ impl Drop for UtpStream {
 
 fn random_u16() -> u16 {
     let mut bytes = [0; 2];
-    crate::mse::fill_random(&mut bytes).unwrap_or_else(|_| {
+    crate::protocol::mse::fill_random(&mut bytes).unwrap_or_else(|_| {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());

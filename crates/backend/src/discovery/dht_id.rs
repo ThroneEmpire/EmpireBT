@@ -53,7 +53,7 @@ fn ip_hash(ip: IpAddr, r: u8) -> u32 {
         *byte &= mask;
     }
     bytes[0] |= (r & 0x07) << 5;
-    crate::priority::crc32c(&bytes)
+    crate::protocol::priority::crc32c(&bytes)
 }
 
 /// Addresses BEP 42 exempts: private, link-local, and loopback.

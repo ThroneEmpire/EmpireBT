@@ -1,3 +1,9 @@
+//! Torrent data on disk: reading and writing pieces across a torrent's
+//! files ([`Storage`]), checking what is already there, file names made
+//! safe as libtorrent makes them ([`names`]), and resume data ([`resume`]).
+pub(crate) mod names;
+pub(crate) mod resume;
+
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
@@ -657,7 +663,7 @@ impl Storage {
             return Ok(false);
         }
 
-        let roots = crate::v2::piece_roots(&data, info.piece_length());
+        let roots = crate::protocol::v2::piece_roots(&data, info.piece_length());
         if roots.len() > 1 {
             let Some(layer) = info
                 .v2_piece_layers()
@@ -670,7 +676,7 @@ impl Storage {
                 return Ok(false);
             }
         }
-        Ok(crate::v2::file_root(&data, info.piece_length()) == *file.pieces_root())
+        Ok(crate::protocol::v2::file_root(&data, info.piece_length()) == *file.pieces_root())
     }
 
     fn read_file(
@@ -999,7 +1005,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("empirebt-v2-{}", std::process::id()));
         let storage = Storage::new(&root).unwrap();
         let data = b"data";
-        let pieces_root = crate::v2::file_root(data, 16_384);
+        let pieces_root = crate::protocol::v2::file_root(data, 16_384);
         let mut bytes = b"d4:infod4:name4:test12:piece lengthi16384e9:file treed3:foo\
 d0:d6:lengthi4e11:pieces root32:"
             .to_vec();

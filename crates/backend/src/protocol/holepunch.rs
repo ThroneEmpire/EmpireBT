@@ -7,7 +7,7 @@
 //!   to, it sends both a `connect` naming the other;
 //! - initiator: when connecting to a peer that peer exchange said can be
 //!   hole-punched fails, it asks the peer that told it of that one for an
-//!   introduction ([`crate::swarm::Swarm::connect_failed`]);
+//!   introduction ([`crate::engine::swarm::Swarm::connect_failed`]);
 //! - either side of an introduction: on `connect`, it dials the named peer
 //!   over uTP at once, while that peer dials it, so both NATs open
 //!   (the runtime's hole-punch dialer).

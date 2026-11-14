@@ -189,7 +189,7 @@ impl Announcer {
                     // tracker that refuses the torrent is not asked every few
                     // seconds for as long as it runs.
                     schedule.failures = schedule.failures.saturating_add(1);
-                    schedule.next = now + crate::tracker::retry_delay(schedule.failures);
+                    schedule.next = now + crate::discovery::tracker::retry_delay(schedule.failures);
                     collected.error = Some(error);
                 }
             }

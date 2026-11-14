@@ -56,7 +56,7 @@ struct Shared {
 /// stopped. Without this, trackers never learn that we have the data, so
 /// new peers cannot find us.
 ///
-/// Statuses are keyed by each torrent's [`TorrentInfo::info_hash`].
+/// Statuses are keyed by each torrent's [`crate::TorrentInfo::info_hash`].
 #[derive(Debug)]
 pub struct SeedAnnouncer {
     shared: Arc<Shared>,
@@ -255,13 +255,13 @@ impl Tier {
 }
 
 /// How long a tier that failed `failures` times in a row waits:
-/// libtorrent's backoff (see [`crate::tracker::retry_delay`]), quicker in
+/// libtorrent's backoff (see [`crate::discovery::tracker::retry_delay`]), quicker in
 /// tests.
 fn tier_retry(failures: u32) -> Duration {
     if cfg!(test) {
         Duration::from_millis(300)
     } else {
-        crate::tracker::retry_delay(failures)
+        crate::discovery::tracker::retry_delay(failures)
     }
 }
 
@@ -324,7 +324,7 @@ fn unchanged(runtime: &Option<Arc<Runtime>>, tracked: &Option<(Arc<Runtime>, u64
 /// Spreads re-announces by up to ±10% so thousands of torrents added at
 /// once do not stay due at the same moment.
 fn jittered(interval: Duration) -> Duration {
-    let [byte] = crate::dht::random_bytes::<1>();
+    let [byte] = crate::discovery::dht::random_bytes::<1>();
     interval.mul_f64(0.9 + f64::from(byte) / 255.0 * 0.2)
 }
 

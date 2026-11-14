@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use sha1::{Digest, Sha1};
 
-use crate::bencode::{self, Value};
+use crate::protocol::bencode::{self, Value};
 use crate::{Handshake, PeerConnection, PeerMessage, TransferProgress};
 
 /// The extension message id we assign to `ut_metadata`. Peers send their
@@ -57,12 +57,12 @@ pub(crate) fn extension_handshake_with(offer: &ExtensionOffer) -> PeerMessage {
         extensions.push((&b"ut_metadata"[..], Value::Int(UT_METADATA.into())));
     }
     if offer.pex {
-        extensions.push((b"ut_pex", Value::Int(crate::pex::UT_PEX.into())));
+        extensions.push((b"ut_pex", Value::Int(crate::protocol::pex::UT_PEX.into())));
     }
     if offer.holepunch {
         extensions.push((
             b"ut_holepunch",
-            Value::Int(crate::holepunch::UT_HOLEPUNCH.into()),
+            Value::Int(crate::protocol::holepunch::UT_HOLEPUNCH.into()),
         ));
     }
     let mut entries = vec![
@@ -150,7 +150,7 @@ pub(crate) fn parse_extension_handshake(
         .filter(|port| *port != 0);
     let your_ip = handshake
         .get_bytes(b"yourip")
-        .and_then(crate::pex::parse_ip);
+        .and_then(crate::protocol::pex::parse_ip);
     let reqq = handshake
         .get_int(b"reqq")
         .and_then(|reqq| usize::try_from(reqq).ok())

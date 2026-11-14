@@ -1,82 +1,54 @@
 //! Core BitTorrent functionality shared by the console and future interfaces.
 
-mod announcer;
-mod bencode;
 mod client;
 mod config;
 mod config_file;
-mod dht;
-mod dht_id;
 mod discovery;
 mod engine;
 mod error;
-mod fast;
-mod holepunch;
-mod http;
 mod identity;
-mod limits;
-mod lsd;
-mod magnet;
-mod metadata;
-mod metainfo;
-mod mse;
-mod names;
 mod net;
-mod peer_manager;
-mod pex;
-mod piece_manager;
-mod priority;
 mod progress;
-mod reactor;
-mod resume;
-mod runtime;
-mod seeder;
-mod session;
+mod protocol;
 mod storage;
-mod swarm;
 mod torrent;
-mod tracker;
-mod transfer;
-mod utp;
-mod v2;
-mod v2_seeder;
 
-pub use announcer::{AnnounceStatus, SeedAnnouncer};
 pub use client::Client;
 pub use config::ClientConfig;
 pub use config_file::{BACKEND_SETTINGS, ConfigFile, Setting, SettingKind};
-pub use dht::Dht;
+pub use discovery::announcer::{AnnounceStatus, SeedAnnouncer};
+pub use discovery::dht::Dht;
+pub use discovery::lsd::Lsd;
+pub use discovery::tracker::{
+    AnnounceEvent, AnnounceRequest, MAX_SCRAPE_HASHES, ScrapeStats, Tracker, TrackerClient,
+    TrackerResponse, scrape_url,
+};
+pub use engine::limits::{Limits, SeedChoking, UploadSlotsMode};
+pub use engine::piece_manager::{PieceManager, PieceState};
+pub use engine::runtime::Runtime;
+pub use engine::seeder::Seeder;
+pub use engine::seeder::V2Seeder;
+pub use engine::session::DownloadSession;
+pub use engine::swarm::PeerInfo;
 pub use error::BackendError;
-pub use http::{HttpResponse, download, http_request};
 pub use identity::{
     ANONYMOUS_USER_AGENT, CLIENT_CODE, Identity, PEER_ID_PREFIX, QBITTORRENT_PEER_ID_PREFIX,
     QBITTORRENT_USER_AGENT, USER_AGENT, client_name, disguised, generate_anonymous_peer_id,
     generate_peer_id, generate_qbittorrent_peer_id, identifies,
 };
-pub use limits::{Limits, SeedChoking, UploadSlotsMode};
-pub use lsd::Lsd;
-pub use magnet::MagnetLink;
-pub use metadata::{
+pub use net::Binding;
+pub use net::http::{HttpResponse, download, http_request};
+pub use net::utp::{UtpMode, UtpSocket, UtpStream};
+pub use progress::{TransferHandle, TransferKind, TransferPhase, TransferProgress};
+pub use protocol::connection::{ConnectOptions, Handshake, PeerConnection, PeerMessage};
+pub use protocol::magnet::MagnetLink;
+pub use protocol::metadata::{
     Metadata, fetch_metadata, fetch_metadata_from_peer, fetch_metadata_from_peer_with,
 };
-pub use metainfo::{TorrentFile, TorrentFormat, TorrentInfo, V2File, V2PieceLayer};
-pub use mse::Encryption;
-pub use net::Binding;
-pub use peer_manager::{ConnectOptions, Handshake, PeerConnection, PeerMessage};
-pub use piece_manager::{PieceManager, PieceState};
-pub use progress::{TransferHandle, TransferKind, TransferPhase, TransferProgress};
-pub use resume::ResumeData;
-pub use runtime::Runtime;
-pub use seeder::Seeder;
-pub use session::DownloadSession;
+pub use protocol::metainfo::{TorrentFile, TorrentFormat, TorrentInfo, V2File, V2PieceLayer};
+pub use protocol::mse::Encryption;
+pub use protocol::v2::verify_hashes_response;
+pub use storage::resume::ResumeData;
 pub use storage::{Deleted, Renames, Storage, delete_files};
-pub use swarm::PeerInfo;
+pub use torrent::TransferState;
 pub use torrent::{ContentLayout, Torrent, TorrentFileName};
-pub use tracker::{
-    AnnounceEvent, AnnounceRequest, MAX_SCRAPE_HASHES, ScrapeStats, Tracker, TrackerClient,
-    TrackerResponse, scrape_url,
-};
-pub use transfer::TransferState;
-pub use utp::{UtpMode, UtpSocket, UtpStream};
-pub use v2::verify_hashes_response;
-pub use v2_seeder::V2Seeder;

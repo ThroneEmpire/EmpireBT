@@ -28,8 +28,8 @@ use mio::{Events, Interest, Poll, Token, Waker};
 
 use crate::engine::active::{ActiveTorrent, Checked, Download};
 use crate::engine::wire::{Action, Flow, Link, PeerWire};
-use crate::mse::{Ciphers, Opening, Responder};
-use crate::peer_manager::Handshake;
+use crate::protocol::connection::Handshake;
+use crate::protocol::mse::{Ciphers, Opening, Responder};
 use crate::{BackendError, Encryption, PeerMessage};
 
 const WAKER: Token = Token(usize::MAX);
@@ -123,7 +123,7 @@ struct Connection {
     /// The encryption handshake was used.
     obfuscated: bool,
     /// Counts this connection against the shared connection limit.
-    _slot: crate::limits::Slot,
+    _slot: crate::engine::limits::Slot,
 }
 
 impl Connection {
@@ -264,7 +264,7 @@ impl Control {
 /// while running. `connections` is kept equal to the number of open peer
 /// connections.
 pub(crate) fn serve(
-    routes: &crate::runtime::Routes,
+    routes: &crate::engine::runtime::Routes,
     listeners: Vec<std::net::TcpListener>,
     settings: Settings<'_>,
     shutdown: &AtomicBool,
@@ -348,7 +348,7 @@ pub(crate) fn serve(
         limits,
         throttled: Vec::new(),
         evicted: Vec::new(),
-        choker: crate::swarm::Choker::default(),
+        choker: crate::engine::choker::Choker::default(),
         choked_revision: None,
     };
     let mut events = Events::with_capacity(1024);
@@ -425,7 +425,7 @@ pub(crate) fn serve(
 }
 
 struct Server<'a> {
-    routes: &'a crate::runtime::Routes,
+    routes: &'a crate::engine::runtime::Routes,
     poll: Poll,
     connections: HashMap<usize, Connection>,
     next_id: usize,
@@ -442,7 +442,7 @@ struct Server<'a> {
     /// them more.
     evicted: Vec<usize>,
     /// Decides who every torrent uploads to (see [`Server::rechoke`]).
-    choker: crate::swarm::Choker,
+    choker: crate::engine::choker::Choker,
     /// The routes' revision when torrents were last handed to the choker.
     choked_revision: Option<u64>,
 }
@@ -553,10 +553,11 @@ impl Server<'_> {
             torrent.use_limits(&self.limits);
         }
         if due {
-            let ranked: Vec<(&crate::swarm::Swarm, crate::swarm::Facts)> = torrents
-                .iter()
-                .map(|torrent| (&*torrent.swarm, crate::swarm::Facts::of(torrent)))
-                .collect();
+            let ranked: Vec<(&crate::engine::swarm::Swarm, crate::engine::choker::Facts)> =
+                torrents
+                    .iter()
+                    .map(|torrent| (&*torrent.swarm, crate::engine::choker::Facts::of(torrent)))
+                    .collect();
             self.choker.rechoke_all(&ranked, self.limits.slots(), now);
         } else {
             for torrent in &torrents {
@@ -618,7 +619,7 @@ impl Server<'_> {
 
     /// Takes in waiting uTP connections. Their readiness callbacks queue
     /// them for the event loop.
-    fn accept_utp(&mut self, listener: &crate::utp::UtpListener) {
+    fn accept_utp(&mut self, listener: &crate::net::utp::UtpListener) {
         while let Some(mut stream) = listener.accept() {
             if !self.has_slack() {
                 continue; // dropping it closes the connection
@@ -650,7 +651,7 @@ impl Server<'_> {
         let (transport, ciphers, obfuscated, buffered) = connection.into_parts();
         let id = self.next_id();
         let stream = match transport {
-            crate::peer_manager::Transport::Tcp(stream) => {
+            crate::protocol::connection::Transport::Tcp(stream) => {
                 if stream.set_nonblocking(true).is_err() {
                     return;
                 }
@@ -665,7 +666,7 @@ impl Server<'_> {
                 }
                 Stream::Tcp(stream)
             }
-            crate::peer_manager::Transport::Utp(mut stream) => {
+            crate::protocol::connection::Transport::Utp(mut stream) => {
                 stream.set_nonblocking(true);
                 let (ready, waker) = (Arc::clone(&self.ready), Arc::clone(&self.waker));
                 stream.set_notify(Arc::new(move || {
@@ -796,7 +797,7 @@ impl Server<'_> {
             negotiated: None,
         } = connection.phase
         {
-            match crate::mse::classify(&connection.input) {
+            match crate::protocol::mse::classify(&connection.input) {
                 Opening::Undecided => return Ok(false),
                 Opening::Plain if self.encryption == Encryption::Required => {
                     return Err(invalid(
@@ -1172,7 +1173,7 @@ fn run_tick(
     id: usize,
     connection: &mut Connection,
     jobs: &mpsc::Sender<Job>,
-    routes: &crate::runtime::Routes,
+    routes: &crate::engine::runtime::Routes,
     crowded: bool,
 ) -> Result<(), BackendError> {
     let Phase::Active { torrent, wire } = &mut connection.phase else {

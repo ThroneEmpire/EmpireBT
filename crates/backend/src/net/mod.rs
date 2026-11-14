@@ -18,6 +18,12 @@
 //!
 //! Also here: listening sockets for each address family, and the canonical
 //! form of peer addresses.
+//!
+//! Submodules: [`utp`], BitTorrent over UDP (BEP 29), and [`http`], the
+//! small HTTP client trackers and downloads use.
+
+pub(crate) mod http;
+pub(crate) mod utp;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::Arc;
@@ -371,7 +377,8 @@ pub(crate) fn receive_batches(
 fn public_only(candidates: Vec<IpAddr>) -> Vec<IpAddr> {
     let mut public: Vec<IpAddr> = Vec::new();
     for ip in candidates {
-        if !crate::dht_id::is_local(ip) && !ip.is_unspecified() && !public.contains(&ip) {
+        if !crate::discovery::dht_id::is_local(ip) && !ip.is_unspecified() && !public.contains(&ip)
+        {
             public.push(ip);
         }
     }

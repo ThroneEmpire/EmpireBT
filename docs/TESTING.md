@@ -5,7 +5,7 @@ EmpireBT has four kinds of tests. Only the first three run in
 
 | Kind | Where | Count | Needs |
 | --- | --- | --- | --- |
-| Backend unit tests | `crates/backend/src/*.rs` (`mod tests`) | ~234 | nothing |
+| Backend unit tests | `crates/backend/src/**/*.rs` (`mod tests`) | ~234 | nothing |
 | Application tests | `crates/app/src/*.rs` (`mod tests`), `crates/app/tests/qbittorrent.rs` | 35 + 1 (+1 opt in) | nothing |
 | Console unit tests | `crates/console/src/*.rs` (`mod tests`) | 21 | nothing |
 | Web UI tests | `crates/web/src/*.rs` and `crates/web/tests/web.rs` | 9 + 10 | nothing |
@@ -63,7 +63,7 @@ entirely on the local machine:
   must listen on `0.0.0.0`, since LSD hands out network addresses.
 - **Encrypted by default.** Test peers built on `PeerConnection::from_stream`
   accept encrypted handshakes, so every unit-test download also exercises MSE.
-- **Reference values.** `v2.rs` checks Merkle roots, piece layers, and proofs
+- **Reference values.** `protocol/v2.rs` checks Merkle roots, piece layers, and proofs
   against hashes computed by libtorrent and pasted into the tests. If those
   fail, the hashing is wrong, not the test.
 
@@ -71,31 +71,32 @@ Key areas and where they are tested:
 
 | Area | File |
 | --- | --- |
-| Bencode | `bencode.rs` |
-| .torrent parsing (v1/v2/hybrid, padding, empty files) | `metainfo.rs` |
-| BEP 52 Merkle trees and hash requests | `v2.rs` |
-| Peer protocol (shared by downloads and seeds): stalls, choking, uploads, bans, idle peers, Fast Extension, PEX | `engine/wire.rs`, `engine/active.rs`, tested through `session.rs` |
-| Downloads: finding and dialing peers, resume | `session.rs`, `piece_manager.rs`, `peer_manager.rs`, `engine/block.rs` |
-| Choking, optimistic unchoke, trust and bans, peer ranking | `swarm.rs` |
-| Fast Extension (BEP 6): allowed fast sets (BEP test vectors), `have_all`, rejects, choked downloads | `fast.rs`, `session.rs` |
-| Peer exchange (BEP 11): message format, what we send and accept, private torrents | `pex.rs`, `swarm.rs`, `session.rs` |
-| Canonical peer priority (BEP 40) and CRC-32C (BEP and libtorrent test vectors) | `priority.rs` |
-| Disk I/O, file pool, padding | `storage.rs` |
-| Magnets and metadata exchange | `magnet.rs`, `metadata.rs` |
-| Trackers (HTTP and UDP) | `tracker.rs`, `announcer.rs` |
-| Announcing a download to every tracker at once (dead trackers don't delay others) | `discovery.rs`, `session.rs` |
-| HTTP client (redirects, chunked bodies), `.torrent` URLs | `http.rs`, `metainfo.rs` |
-| Local peer discovery (BEP 14): format, schedule, filtering, real multicast between instances, downloads and seeds finding local peers | `lsd.rs`, `session.rs`, `runtime.rs`, interop |
-| IPv6: dual-stack listeners, uTP, downloads from IPv6 peers, the IPv6 DHT (BEP 32 encodings, a local IPv6 swarm), trackers over both families, LSD over IPv6, libtorrent both ways | `net.rs`, `runtime.rs`, `utp.rs`, `session.rs`, `dht.rs`, `tracker.rs`, `lsd.rs`, interop |
+| Bencode | `protocol/bencode.rs` |
+| .torrent parsing (v1/v2/hybrid, padding, empty files) | `protocol/metainfo.rs` |
+| BEP 52 Merkle trees and hash requests | `protocol/v2.rs` |
+| Peer protocol (shared by downloads and seeds): stalls, choking, uploads, bans, idle peers, Fast Extension, PEX | `engine/wire.rs`, `engine/active.rs`, tested through `engine/session.rs` |
+| Downloads: finding and dialing peers, resume | `engine/session.rs`, `engine/piece_manager.rs`, `protocol/connection.rs`, `engine/block.rs` |
+| Choking across torrents (upload slots, seed choking algorithms, rate-based slots), optimistic unchoke | `engine/choker.rs`, `engine/swarm.rs`, `engine/runtime.rs` |
+| Trust and bans, peer ranking | `engine/swarm.rs` |
+| Fast Extension (BEP 6): allowed fast sets (BEP test vectors), `have_all`, rejects, choked downloads | `protocol/fast.rs`, `engine/session.rs` |
+| Peer exchange (BEP 11): message format, what we send and accept, private torrents | `protocol/pex.rs`, `engine/swarm.rs`, `engine/session.rs` |
+| Canonical peer priority (BEP 40) and CRC-32C (BEP and libtorrent test vectors) | `protocol/priority.rs` |
+| Disk I/O, file pool, padding | `storage/mod.rs` |
+| Magnets and metadata exchange | `protocol/magnet.rs`, `protocol/metadata.rs` |
+| Trackers (HTTP and UDP) | `discovery/tracker.rs`, `discovery/announcer.rs` |
+| Announcing a download to every tracker at once (dead trackers don't delay others) | `discovery/tiers.rs`, `engine/session.rs` |
+| HTTP client (redirects, chunked bodies), `.torrent` URLs | `net/http.rs`, `protocol/metainfo.rs` |
+| Local peer discovery (BEP 14): format, schedule, filtering, real multicast between instances, downloads and seeds finding local peers | `discovery/lsd.rs`, `engine/session.rs`, `engine/runtime.rs`, interop |
+| IPv6: dual-stack listeners, uTP, downloads from IPv6 peers, the IPv6 DHT (BEP 32 encodings, a local IPv6 swarm), trackers over both families, LSD over IPv6, libtorrent both ways | `net/mod.rs`, `engine/runtime.rs`, `net/utp.rs`, `engine/session.rs`, `discovery/dht.rs`, `discovery/tracker.rs`, `discovery/lsd.rs`, interop |
 | Web UI: who gets in (password, one-time links, sessions, tokens, lockout), CSRF and Host checks, security headers, locked settings, size limits, live updates, HTTPS beyond loopback, driving the engine | `web/src/auth.rs`, `web/src/api.rs`, `web/tests/web.rs` (real HTTP and HTTPS against a real engine) |
-| Network interface binding: name and address lookup, source address of connections, device tie-in, nothing connecting while it is down, trackers not marked dead | `net.rs`, `session.rs`, `tracker.rs` |
-| Connection and speed limits: token buckets, the global connection cap, capped uploads and downloads end to end | `limits.rs`, `runtime.rs`, `session.rs` |
-| DHT | `dht.rs` |
-| Event loop: handshakes, adopting dialed connections, torrents joining and leaving | `runtime.rs`, `reactor.rs` |
-| Peer ID (BEP 20), handshakes, self-connections | `identity.rs`, `peer_manager.rs` |
-| Encryption (MSE): DH, RC4, both handshake sides | `mse.rs` (RC4 checked against RFC 6229, DH against Python's `pow`) |
-| uTP: packets, retransmission, congestion, sockets | `utp.rs` (two cores over a simulated link with 10% loss, duplicates, and reordering; real loopback sockets) |
-| Client, session save/load, resume data | `client.rs`, `resume.rs` |
+| Network interface binding: name and address lookup, source address of connections, device tie-in, nothing connecting while it is down, trackers not marked dead | `net/mod.rs`, `engine/session.rs`, `discovery/tracker.rs` |
+| Connection and speed limits: token buckets, the global connection cap, capped uploads and downloads end to end | `engine/limits.rs`, `engine/runtime.rs`, `engine/session.rs` |
+| DHT | `discovery/dht.rs` |
+| Event loop: handshakes, adopting dialed connections, torrents joining and leaving | `engine/runtime.rs`, `engine/reactor.rs` |
+| Peer ID (BEP 20), handshakes, self-connections | `identity.rs`, `protocol/connection.rs` |
+| Encryption (MSE): DH, RC4, both handshake sides | `protocol/mse.rs` (RC4 checked against RFC 6229, DH against Python's `pow`) |
+| uTP: packets, retransmission, congestion, sockets | `net/utp.rs` (two cores over a simulated link with 10% loss, duplicates, and reordering; real loopback sockets) |
+| Client, session save/load, resume data | `client.rs`, `storage/resume.rs` |
 | Config file | `config_file.rs`, `config.rs` |
 | Application engine: commands seen in the next snapshot, failures, settings, waiting for snapshots, several interfaces at once, restart; session store and data-directory lock | `app/src/engine.rs`, `app/src/store.rs` |
 | Categories and tags: assignment, the labels file, names, restart, a damaged file | `app/src/labels.rs`, `app/src/engine.rs` |

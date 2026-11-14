@@ -12,7 +12,7 @@
 //! - We download pieces the peer has and we need, keeping about two seconds
 //!   of requests in flight across several pieces.
 //! - We upload verified pieces it asks for while the choker lets it (see
-//!   [`crate::swarm`]), and announce pieces as they are verified.
+//!   [`crate::engine::swarm`]), and announce pieces as they are verified.
 //! - With the Fast Extension (BEP 6), which both handshakes must advertise:
 //!   `have_all` and `have_none` may replace the bitfield, and every request
 //!   gets a block or a `reject`, so a choke no longer discards outstanding
@@ -76,7 +76,7 @@ pub(crate) enum Flow {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Link {
     pub(crate) address: SocketAddr,
-    pub(crate) key: crate::swarm::PeerKey,
+    pub(crate) key: crate::engine::swarm::PeerKey,
     /// We connected to the peer, rather than it to us.
     pub(crate) outgoing: bool,
     /// Its handshake advertised the Fast Extension (ours always does).
@@ -104,7 +104,7 @@ pub(crate) struct PeerWire {
     /// Pieces the peer lets us download while choked, and suggests.
     allowed: Vec<u32>,
     suggested: VecDeque<u32>,
-    remote: crate::metadata::RemoteMetadata,
+    remote: crate::protocol::metadata::RemoteMetadata,
     pex: Pex,
     pex_flags: u8,
     state: State,
@@ -141,11 +141,11 @@ impl PeerWire {
             hasher.finish() as usize
         };
         let granted = if link.fast {
-            crate::fast::allowed_fast_set(
+            crate::protocol::fast::allowed_fast_set(
                 link.address.ip(),
                 &torrent.info.peer_info_hash(),
                 torrent.piece_count(),
-                crate::fast::ALLOWED_FAST_COUNT,
+                crate::protocol::fast::ALLOWED_FAST_COUNT,
             )
         } else {
             Vec::new()
@@ -160,10 +160,10 @@ impl PeerWire {
         );
         let mut pex_flags = 0;
         if link.utp {
-            pex_flags |= crate::pex::SUPPORTS_UTP;
+            pex_flags |= crate::protocol::pex::SUPPORTS_UTP;
         }
         if link.encrypted {
-            pex_flags |= crate::pex::PREFERS_ENCRYPTION;
+            pex_flags |= crate::protocol::pex::PREFERS_ENCRYPTION;
         }
         Self {
             private: torrent.info.is_private(),
@@ -174,7 +174,7 @@ impl PeerWire {
             granted,
             allowed: Vec::new(),
             suggested: VecDeque::new(),
-            remote: crate::metadata::RemoteMetadata::default(),
+            remote: crate::protocol::metadata::RemoteMetadata::default(),
             pex: Pex::default(),
             pex_flags,
             state: State::new(now),
@@ -212,7 +212,7 @@ impl PeerWire {
             }
         }
         if self.link.extensions {
-            let offer = crate::metadata::ExtensionOffer {
+            let offer = crate::protocol::metadata::ExtensionOffer {
                 metadata_size: torrent.info.info_bytes().map(<[u8]>::len),
                 pex: !self.private,
                 your_ip: Some(self.link.address.ip()),
@@ -221,16 +221,16 @@ impl PeerWire {
                 holepunch: !self.private,
                 private: self.private,
             };
-            out.push(Action::Send(crate::metadata::extension_handshake_with(
-                &offer,
-            )));
+            out.push(Action::Send(
+                crate::protocol::metadata::extension_handshake_with(&offer),
+            ));
         }
         // A peer we connected to is reachable at that address.
         if self.link.outgoing {
             torrent.swarm.set_pex(
                 self.link.key,
                 self.link.address,
-                self.pex_flags | crate::pex::REACHABLE,
+                self.pex_flags | crate::protocol::pex::REACHABLE,
             );
         }
         Ok(())
@@ -291,7 +291,9 @@ impl PeerWire {
         if self.state.interest_changed {
             self.state.interest_changed = false;
             if self.peer_is_seed() {
-                torrent.swarm.update_pex_flags(key, crate::pex::SEED, 0);
+                torrent
+                    .swarm
+                    .update_pex_flags(key, crate::protocol::pex::SEED, 0);
             }
             let wanted = self
                 .bitfield
@@ -564,7 +566,7 @@ impl PeerWire {
                 self.report_pieces();
             }
             PeerMessage::Extended { id: 0, payload } => {
-                self.remote = crate::metadata::parse_extension_handshake(&payload)?;
+                self.remote = crate::protocol::metadata::parse_extension_handshake(&payload)?;
                 torrent.swarm.set_client(key, self.remote.client.clone());
                 if let Some(ip) = self.remote.your_ip {
                     torrent.swarm.vote_external(self.link.address, ip);
@@ -587,19 +589,21 @@ impl PeerWire {
                 // introduced (BEP 55).
                 if self.remote.holepunch_id.is_some() && !self.private {
                     torrent.swarm.set_holepunch(key);
-                    self.pex_flags |= crate::pex::SUPPORTS_HOLEPUNCH;
-                    torrent
-                        .swarm
-                        .update_pex_flags(key, crate::pex::SUPPORTS_HOLEPUNCH, 0);
+                    self.pex_flags |= crate::protocol::pex::SUPPORTS_HOLEPUNCH;
+                    torrent.swarm.update_pex_flags(
+                        key,
+                        crate::protocol::pex::SUPPORTS_HOLEPUNCH,
+                        0,
+                    );
                 }
             }
             // Not offered for a private torrent, so not answered either.
             PeerMessage::Extended {
-                id: crate::metadata::UT_METADATA,
+                id: crate::protocol::metadata::UT_METADATA,
                 payload,
             } if !self.private => {
-                let replies = crate::metadata::serve_extended(
-                    crate::metadata::UT_METADATA,
+                let replies = crate::protocol::metadata::serve_extended(
+                    crate::protocol::metadata::UT_METADATA,
                     &payload,
                     torrent.info.info_bytes(),
                     &mut self.remote,
@@ -609,10 +613,10 @@ impl PeerWire {
             // A peer that did not offer the extension gets no answer: we
             // could not send one (BEP 55).
             PeerMessage::Extended {
-                id: crate::holepunch::UT_HOLEPUNCH,
+                id: crate::protocol::holepunch::UT_HOLEPUNCH,
                 payload,
             } if !self.private => {
-                use crate::holepunch::{Kind, Message};
+                use crate::protocol::holepunch::{Kind, Message};
                 if let (Some(id), Some(message)) =
                     (self.remote.holepunch_id, Message::decode(&payload))
                 {
@@ -631,7 +635,7 @@ impl PeerWire {
                         // NAT. A local address only from a local peer, as
                         // libtorrent has it, and past the budget none.
                         Kind::Connect => {
-                            let local = crate::dht_id::is_local;
+                            let local = crate::discovery::dht_id::is_local;
                             if (!local(message.address.ip()) || local(self.link.address.ip()))
                                 && connect_allowed(self.connects, self.opened, now)
                             {
@@ -645,7 +649,7 @@ impl PeerWire {
                 }
             }
             PeerMessage::Extended {
-                id: crate::pex::UT_PEX,
+                id: crate::protocol::pex::UT_PEX,
                 payload,
             } if !self.private => {
                 // More than one message per interval is ignored.
@@ -655,7 +659,7 @@ impl PeerWire {
                     .is_none_or(|last| now - last >= PEX_INTERVAL / 2)
                 {
                     self.pex.last_received = Some(now);
-                    let message = crate::pex::PexMessage::decode(&payload)?;
+                    let message = crate::protocol::pex::PexMessage::decode(&payload)?;
                     torrent.swarm.discover(self.link.address, &message.added);
                 }
             }
@@ -760,7 +764,7 @@ impl PeerWire {
                 // allowed fast pieces while it has only a few.
                 let starting = self.bitfield.as_deref().map_or(0, |bits| {
                     bits.iter().map(|byte| byte.count_ones()).sum::<u32>()
-                }) < crate::fast::ALLOWED_FAST_COUNT as u32;
+                }) < crate::protocol::fast::ALLOWED_FAST_COUNT as u32;
                 self.state.last_upload_activity = now;
                 let permitted = !self.state.am_choking
                     || (fast && starting && self.granted.contains(&piece_index));
@@ -1006,9 +1010,9 @@ struct Pex {
 impl Pex {
     /// The message bringing the peer up to date with `contacts`: the whole
     /// list the first time, then at most 50 additions and 50 drops.
-    fn changes(&mut self, contacts: &[(SocketAddr, u8)]) -> crate::pex::PexMessage {
+    fn changes(&mut self, contacts: &[(SocketAddr, u8)]) -> crate::protocol::pex::PexMessage {
         let limit = if self.sent_any {
-            crate::pex::MAX_PER_MESSAGE
+            crate::protocol::pex::MAX_PER_MESSAGE
         } else {
             MAX_FIRST_PEX
         };
@@ -1033,7 +1037,7 @@ impl Pex {
         for address in &dropped {
             self.told.remove(address);
         }
-        crate::pex::PexMessage { added, dropped }
+        crate::protocol::pex::PexMessage { added, dropped }
     }
 }
 
@@ -1270,6 +1274,6 @@ mod tests {
         assert_eq!(first.added.len(), MAX_FIRST_PEX);
         pex.sent_any = true;
         let second = pex.changes(&contacts);
-        assert_eq!(second.added.len(), crate::pex::MAX_PER_MESSAGE);
+        assert_eq!(second.added.len(), crate::protocol::pex::MAX_PER_MESSAGE);
     }
 }

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::discovery::OnPeers;
+use crate::discovery::tiers::OnPeers;
 use crate::{BackendError, Runtime};
 
 /// The BEP 14 multicast groups and port, for IPv4 and IPv6.
@@ -130,7 +130,7 @@ impl Lsd {
         let shared = Arc::new(Shared {
             port,
             binding,
-            cookie: hex(&crate::dht::random_bytes::<8>()),
+            cookie: hex(&crate::discovery::dht::random_bytes::<8>()),
             downloads: Mutex::default(),
             next_id: AtomicU64::new(0),
             runtime: Mutex::default(),
@@ -841,7 +841,7 @@ pub(crate) mod tests {
             eprintln!("skipped: multicast is not available here");
             return;
         };
-        let torrent = crate::dht::random_bytes::<20>();
+        let torrent = crate::discovery::dht::random_bytes::<20>();
         let (on_first, found_by_first) = collector();
         let (on_second, found_by_second) = collector();
         let _first = first.join(&[torrent], on_first);
@@ -914,7 +914,7 @@ pub(crate) mod tests {
             eprintln!("skipped: no IPv6 multicast interface here");
             return;
         }
-        let torrent = crate::dht::random_bytes();
+        let torrent = crate::discovery::dht::random_bytes();
         let (on_peers, found) = collector();
         let _download = lsd.join(&[torrent], on_peers);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -944,7 +944,10 @@ pub(crate) mod tests {
             eprintln!("skipped: multicast is not available here");
             return;
         };
-        let (wanted, unknown) = (crate::dht::random_bytes(), crate::dht::random_bytes());
+        let (wanted, unknown) = (
+            crate::discovery::dht::random_bytes(),
+            crate::discovery::dht::random_bytes(),
+        );
         let (on_peers, found) = collector();
         let _download = lsd.join(&[wanted], on_peers);
         announce_as_peer(40004, &[unknown]);

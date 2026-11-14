@@ -27,7 +27,7 @@ pub struct DownloadSession {
     resume: Option<crate::ResumeData>,
     layout: Layout,
     connect: crate::ConnectOptions,
-    swarm: Arc<crate::swarm::Swarm>,
+    swarm: Arc<crate::engine::swarm::Swarm>,
     runtime: Option<Arc<crate::Runtime>>,
     limits: Arc<crate::Limits>,
 }
@@ -47,7 +47,9 @@ impl DownloadSession {
             resume: None,
             layout,
             connect: crate::ConnectOptions::default(),
-            swarm: Arc::new(crate::swarm::Swarm::new(crate::swarm::DEFAULT_UPLOAD_SLOTS)),
+            swarm: Arc::new(crate::engine::swarm::Swarm::new(
+                crate::engine::swarm::DEFAULT_UPLOAD_SLOTS,
+            )),
             runtime: None,
             limits: Arc::default(),
         };
@@ -405,13 +407,13 @@ impl DownloadSession {
         max_rounds: usize,
     ) -> Result<usize, crate::BackendError> {
         let hashes = self.info.swarm_hashes();
-        let mut dht_searches: Vec<crate::dht::PeerSearch> = self
+        let mut dht_searches: Vec<crate::discovery::dht::PeerSearch> = self
             .dht
             .iter()
             .flat_map(|dht| {
-                hashes
-                    .iter()
-                    .map(|hash| crate::dht::PeerSearch::new(Arc::clone(dht), *hash, Some(port)))
+                hashes.iter().map(|hash| {
+                    crate::discovery::dht::PeerSearch::new(Arc::clone(dht), *hash, Some(port))
+                })
             })
             .collect();
         self.swarm.set_listen_port(port);
@@ -425,7 +427,7 @@ impl DownloadSession {
             lsd.join(
                 &hashes,
                 Arc::new(move |peers: &[SocketAddr]| {
-                    swarm.offer_from(&swarm.rank(peers), crate::swarm::SOURCE_LSD);
+                    swarm.offer_from(&swarm.rank(peers), crate::engine::swarm::SOURCE_LSD);
                     if let Ok(mut found) = found.lock() {
                         remember_peers(&mut found, peers);
                     }
@@ -439,8 +441,10 @@ impl DownloadSession {
                     for search in &mut dht_searches {
                         let peers = search.poll();
                         if !peers.is_empty() {
-                            self.swarm
-                                .offer_from(&self.swarm.rank(&peers), crate::swarm::SOURCE_DHT);
+                            self.swarm.offer_from(
+                                &self.swarm.rank(&peers),
+                                crate::engine::swarm::SOURCE_DHT,
+                            );
                             if let Ok(mut found) = found.lock() {
                                 remember_peers(&mut found, &peers);
                             }
@@ -476,11 +480,11 @@ impl DownloadSession {
         // results do, and are kept for later rounds through `found`.
         let mut announcer = {
             let swarm = Arc::clone(&self.swarm);
-            crate::discovery::Announcer::new(
+            crate::discovery::tiers::Announcer::new(
                 trackers,
                 self.timeout,
                 Arc::new(move |peers: &[SocketAddr]| {
-                    swarm.offer_from(&swarm.rank(peers), crate::swarm::SOURCE_TRACKER);
+                    swarm.offer_from(&swarm.rank(peers), crate::engine::swarm::SOURCE_TRACKER);
                 }),
             )
         };
@@ -491,7 +495,7 @@ impl DownloadSession {
         let result = (|| {
             let mut downloaded = 0;
             let mut last_error = None;
-            let collect = |announcer: &mut crate::discovery::Announcer,
+            let collect = |announcer: &mut crate::discovery::tiers::Announcer,
                            last_error: &mut Option<crate::BackendError>| {
                 if self.progress.take_reannounce() {
                     announcer.reannounce_now();
@@ -944,9 +948,12 @@ mod tests {
                 connection.supports_extensions(),
                 "our handshake offers BEP 10"
             );
-            let ours = crate::bencode::Value::dict([(
+            let ours = crate::protocol::bencode::Value::dict([(
                 &b"m"[..],
-                crate::bencode::Value::dict([(&b"ut_pex"[..], crate::bencode::Value::Int(7))]),
+                crate::protocol::bencode::Value::dict([(
+                    &b"ut_pex"[..],
+                    crate::protocol::bencode::Value::Int(7),
+                )]),
             )]);
             connection
                 .send(&PeerMessage::Extended {
@@ -960,10 +967,12 @@ mod tests {
     }
 
     /// Reads messages until our extension handshake arrives.
-    fn their_extension_handshake(connection: &mut PeerConnection) -> crate::bencode::Value {
+    fn their_extension_handshake(
+        connection: &mut PeerConnection,
+    ) -> crate::protocol::bencode::Value {
         loop {
             if let PeerMessage::Extended { id: 0, payload } = connection.receive().unwrap() {
-                return crate::bencode::decode(&payload).unwrap();
+                return crate::protocol::bencode::decode(&payload).unwrap();
             }
         }
     }
@@ -1064,7 +1073,7 @@ mod tests {
 
     #[test]
     fn downloads_from_a_peer_found_on_the_local_network() {
-        let Some(lsd) = crate::lsd::tests::running(40010) else {
+        let Some(lsd) = crate::discovery::lsd::tests::running(40010) else {
             eprintln!("skipped: multicast is not available here");
             return;
         };
@@ -1091,7 +1100,7 @@ mod tests {
             // The seeder announces, as a client on the network would, until
             // the download has registered and heard it.
             while !download.is_finished() {
-                crate::lsd::tests::announce_as_peer(address.port(), &[hash]);
+                crate::discovery::lsd::tests::announce_as_peer(address.port(), &[hash]);
                 std::thread::sleep(Duration::from_millis(500));
             }
             download.join().unwrap().unwrap();
@@ -1734,14 +1743,17 @@ mod tests {
         let (seed, _seed) = fake_peer(&info, move |connection| serve_blocks(connection, &served));
         // This peer has nothing, but tells us about the seed.
         let (gossip, _gossip) = pex_peer(&info, move |connection| {
-            let message = crate::pex::PexMessage {
-                added: vec![(seed, crate::pex::REACHABLE | crate::pex::SEED)],
+            let message = crate::protocol::pex::PexMessage {
+                added: vec![(
+                    seed,
+                    crate::protocol::pex::REACHABLE | crate::protocol::pex::SEED,
+                )],
                 dropped: Vec::new(),
             };
             their_extension_handshake(connection);
             connection
                 .send(&PeerMessage::Extended {
-                    id: crate::pex::UT_PEX,
+                    id: crate::protocol::pex::UT_PEX,
                     payload: message.encode(),
                 })
                 .unwrap();
@@ -1767,7 +1779,10 @@ mod tests {
             loop {
                 match connection.receive() {
                     Ok(PeerMessage::Extended { id: 7, payload }) => {
-                        return (handshake, crate::pex::PexMessage::decode(&payload).unwrap());
+                        return (
+                            handshake,
+                            crate::protocol::pex::PexMessage::decode(&payload).unwrap(),
+                        );
                     }
                     Ok(_) => {}
                     Err(error) => panic!("no peer exchange arrived: {error}"),
@@ -1781,7 +1796,7 @@ mod tests {
         let extensions = handshake.get(b"m").unwrap();
         assert_eq!(
             extensions.get_int(b"ut_pex"),
-            Some(crate::pex::UT_PEX.into())
+            Some(crate::protocol::pex::UT_PEX.into())
         );
         assert_eq!(extensions.get_int(b"ut_metadata"), Some(1));
         assert_eq!(handshake.get_bytes(b"yourip"), Some(&[127, 0, 0, 1][..]));
@@ -1792,7 +1807,7 @@ mod tests {
             panic!("expected only the seed: {:?}", message.added);
         };
         assert_eq!(address, seed);
-        assert!(flags & crate::pex::REACHABLE != 0, "{flags:#x}");
+        assert!(flags & crate::protocol::pex::REACHABLE != 0, "{flags:#x}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1811,12 +1826,12 @@ mod tests {
         let stranger = SocketAddr::from(([127, 0, 0, 1], 1));
         let (gossip, observed) = pex_peer(&info, move |connection| {
             let handshake = their_extension_handshake(connection);
-            let message = crate::pex::PexMessage {
+            let message = crate::protocol::pex::PexMessage {
                 added: vec![(stranger, 0)],
                 dropped: Vec::new(),
             };
             let _ = connection.send(&PeerMessage::Extended {
-                id: crate::pex::UT_PEX,
+                id: crate::protocol::pex::UT_PEX,
                 payload: message.encode(),
             });
             while connection.receive().is_ok() {}

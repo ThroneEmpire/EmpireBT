@@ -191,7 +191,7 @@ impl Limits {
 }
 
 /// Upload slot settings, and how many peers hold one now. A swarm the
-/// event loop chokes for (see [`crate::swarm::rechoke_all`]) keeps
+/// event loop chokes for (see [`crate::engine::choker::Choker::rechoke_all`]) keeps
 /// `unchoked` up to date as it unchokes and chokes peers.
 #[derive(Debug)]
 pub(crate) struct UploadSlots {
@@ -274,7 +274,7 @@ impl Default for UploadSlots {
     fn default() -> Self {
         Self {
             global: AtomicUsize::new(0),
-            per_torrent: AtomicUsize::new(crate::swarm::DEFAULT_UPLOAD_SLOTS),
+            per_torrent: AtomicUsize::new(crate::engine::swarm::DEFAULT_UPLOAD_SLOTS),
             rate_based: AtomicBool::new(false),
             choking: AtomicU8::new(SeedChoking::default() as u8),
             unchoked: AtomicUsize::new(0),

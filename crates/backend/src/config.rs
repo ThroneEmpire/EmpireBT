@@ -34,7 +34,7 @@ impl Default for ClientConfig {
             max_peer_connections: 100,
             max_connections: 500,
             upload_slots: 20,
-            upload_slots_per_torrent: crate::swarm::DEFAULT_UPLOAD_SLOTS,
+            upload_slots_per_torrent: crate::engine::swarm::DEFAULT_UPLOAD_SLOTS,
             upload_slots_mode: crate::UploadSlotsMode::default(),
             seed_choking: crate::SeedChoking::default(),
             upload_limit: 0,

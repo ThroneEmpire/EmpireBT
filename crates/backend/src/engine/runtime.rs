@@ -31,7 +31,7 @@ pub struct Runtime {
     /// Outgoing connections being made for torrents in the runtime.
     dialing: Arc<AtomicUsize>,
     /// Set while serving: how other threads hand connections in.
-    control: Mutex<Option<crate::reactor::Control>>,
+    control: Mutex<Option<crate::engine::reactor::Control>>,
     /// Set once serving has ended, so nobody waits for it to start.
     stopped: AtomicBool,
 }
@@ -329,10 +329,10 @@ impl Runtime {
         let served = AtomicBool::new(false);
         let result = std::thread::scope(|scope| {
             scope.spawn(|| self.punch_holes(shutdown, &served));
-            let result = crate::reactor::serve(
+            let result = crate::engine::reactor::serve(
                 &self.routes,
                 listeners,
-                crate::reactor::Settings {
+                crate::engine::reactor::Settings {
                     max_connections: self.max_connections,
                     handshake_timeout: self.handshake_timeout,
                     encryption: self.encryption,
@@ -430,7 +430,7 @@ impl Runtime {
                 "the runtime is not running".to_owned(),
             ));
         };
-        control.adopt(crate::reactor::Adopted {
+        control.adopt(crate::engine::reactor::Adopted {
             connection,
             address,
             torrent,
@@ -608,14 +608,16 @@ impl Routes {
         if let Some(old) = table.by_key.remove(&key) {
             for hash in old.info.swarm_hashes() {
                 table.by_hash.remove(&hash);
-                table.obfuscated.remove(&crate::mse::obfuscated_hash(&hash));
+                table
+                    .obfuscated
+                    .remove(&crate::protocol::mse::obfuscated_hash(&hash));
             }
         }
         for hash in hashes {
             table.by_hash.insert(hash, Arc::clone(&torrent));
             table
                 .obfuscated
-                .insert(crate::mse::obfuscated_hash(&hash), hash);
+                .insert(crate::protocol::mse::obfuscated_hash(&hash), hash);
         }
         table.by_key.insert(key, torrent);
         drop(table);
@@ -630,7 +632,9 @@ impl Routes {
         };
         for hash in torrent.info.swarm_hashes() {
             table.by_hash.remove(&hash);
-            table.obfuscated.remove(&crate::mse::obfuscated_hash(&hash));
+            table
+                .obfuscated
+                .remove(&crate::protocol::mse::obfuscated_hash(&hash));
         }
         drop(table);
         self.revision.fetch_add(1, Ordering::AcqRel);
@@ -862,7 +866,7 @@ mod tests {
     /// port until the returned flag is set.
     #[test]
     fn introduces_two_peers_that_ask_for_it() {
-        use crate::holepunch::{Kind, Message};
+        use crate::protocol::holepunch::{Kind, Message};
         use std::io::Write;
         let limits = Arc::new(crate::Limits::unlimited());
         let (info, _, shutdown, server, root) = serving("holepunch", 64 * 1024, limits);
@@ -924,7 +928,7 @@ mod tests {
             stream
                 .write_all(
                     &PeerMessage::Extended {
-                        id: crate::holepunch::UT_HOLEPUNCH,
+                        id: crate::protocol::holepunch::UT_HOLEPUNCH,
                         payload: rendezvous.encode()[..8].to_vec(),
                     }
                     .encode()
@@ -945,13 +949,17 @@ mod tests {
         let failed = next_holepunch(&mut initiator);
         assert_eq!(
             (failed.kind, failed.address, failed.error),
-            (Kind::Failed, stranger, crate::holepunch::NOT_CONNECTED)
+            (
+                Kind::Failed,
+                stranger,
+                crate::protocol::holepunch::NOT_CONNECTED
+            )
         );
         let itself = initiator.local_addr().unwrap();
         ask(&mut initiator, itself);
         assert_eq!(
             next_holepunch(&mut initiator).error,
-            crate::holepunch::NO_SELF
+            crate::protocol::holepunch::NO_SELF
         );
         drop((initiator, target));
         stop.store(true, Ordering::Release);
@@ -963,7 +971,7 @@ mod tests {
 
     #[test]
     fn dials_over_utp_the_peer_an_introducer_names() {
-        use crate::holepunch::{Kind, Message};
+        use crate::protocol::holepunch::{Kind, Message};
         use std::io::Write;
         let limits = Arc::new(crate::Limits::unlimited());
         let (info, _, shutdown, server, root) = serving("punch", 64 * 1024, limits);
@@ -1014,7 +1022,7 @@ mod tests {
         introducer
             .write_all(
                 &PeerMessage::Extended {
-                    id: crate::holepunch::UT_HOLEPUNCH,
+                    id: crate::protocol::holepunch::UT_HOLEPUNCH,
                     payload: connect.encode(),
                 }
                 .encode()
@@ -1160,7 +1168,7 @@ mod tests {
 
     #[test]
     fn a_seed_dials_downloaders_announcing_on_the_local_network() {
-        let Some(lsd) = crate::lsd::tests::running(40011) else {
+        let Some(lsd) = crate::discovery::lsd::tests::running(40011) else {
             eprintln!("skipped: multicast is not available here");
             return;
         };
@@ -1184,7 +1192,7 @@ mod tests {
         downloader.set_nonblocking(true).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let stream = loop {
-            crate::lsd::tests::announce_as_peer(port, &[*info.info_hash()]);
+            crate::discovery::lsd::tests::announce_as_peer(port, &[*info.info_hash()]);
             thread::sleep(Duration::from_millis(500));
             if let Ok((stream, _)) = downloader.accept() {
                 break stream;

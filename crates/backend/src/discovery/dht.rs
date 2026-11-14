@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use sha1::{Digest, Sha1};
 
-use crate::bencode::{self, Value};
+use crate::protocol::bencode::{self, Value};
 
 type NodeId = [u8; 20];
 
@@ -282,10 +282,10 @@ struct Inner {
     /// Whether this is the IPv6 node.
     v6: bool,
     /// Random until our external address is known, then derived from it
-    /// (BEP 42); see [`crate::dht_id`].
+    /// (BEP 42); see [`crate::discovery::dht_id`].
     own_id: Mutex<NodeId>,
     /// Our external address, as other nodes report it.
-    external: Mutex<crate::dht_id::ExternalIp>,
+    external: Mutex<crate::discovery::dht_id::ExternalIp>,
     /// Addresses ignored for flooding us.
     blocker: Mutex<Blocker>,
     table: Mutex<RoutingTable>,
@@ -304,7 +304,7 @@ struct Inner {
     silent: Mutex<HashMap<SocketAddr, Instant>>,
     state_path: Option<PathBuf>,
     /// uTP connections sharing this UDP port.
-    utp: std::sync::OnceLock<Arc<crate::utp::Shared>>,
+    utp: std::sync::OnceLock<Arc<crate::net::utp::Shared>>,
     /// Leave the client's name and version (`v`) out of queries.
     /// The `v` key on our messages: 0 ours, 1 none, 2 libtorrent's.
     tag: std::sync::atomic::AtomicU8,
@@ -538,7 +538,7 @@ impl Dht {
     }
 
     /// Hands uTP datagrams arriving on the DHT's port to `utp`.
-    pub(crate) fn route_utp(&self, utp: Arc<crate::utp::Shared>) {
+    pub(crate) fn route_utp(&self, utp: Arc<crate::net::utp::Shared>) {
         for inner in &self.families {
             let _ = inner.utp.set(Arc::clone(&utp));
         }
@@ -743,7 +743,7 @@ impl Inner {
             socket,
             v6,
             own_id: Mutex::new(own_id),
-            external: Mutex::new(crate::dht_id::ExternalIp::default()),
+            external: Mutex::new(crate::discovery::dht_id::ExternalIp::default()),
             blocker: Mutex::new(Blocker::default()),
             table: Mutex::new(table),
             pending: Mutex::new(HashMap::new()),
@@ -787,11 +787,11 @@ impl Inner {
         let Some(ip) = changed else {
             return;
         };
-        if crate::dht_id::verify_node_id(&self.own_id(), ip) {
+        if crate::discovery::dht_id::verify_node_id(&self.own_id(), ip) {
             return;
         }
         let [r] = random_bytes::<1>();
-        let id = crate::dht_id::secure_node_id(ip, r, random_bytes());
+        let id = crate::discovery::dht_id::secure_node_id(ip, r, random_bytes());
         if let Ok(mut table) = self.table.lock() {
             table.rekey(id);
         }
@@ -811,13 +811,13 @@ impl Inner {
     }
 
     fn receive_loop(&self) {
-        let batch = std::cell::RefCell::new(crate::utp::Batch::default());
+        let batch = std::cell::RefCell::new(crate::net::utp::Batch::default());
         let _ = crate::net::receive_batches(
             &self.socket,
             &self.shutdown,
             |bytes, from| {
                 // uTP shares the port; its headers never start with `d`.
-                if crate::utp::is_utp(bytes) {
+                if crate::net::utp::is_utp(bytes) {
                     if let Some(utp) = self.utp.get() {
                         utp.handle_in_batch(bytes, from, &mut batch.borrow_mut());
                     }
@@ -2070,7 +2070,7 @@ mod tests {
         node.stop();
         assert!(joined >= 20, "only {joined} nodes after 30 s");
         let external = external.expect("no node said where it sees us");
-        assert!(crate::dht_id::verify_node_id(&id, external));
+        assert!(crate::discovery::dht_id::verify_node_id(&id, external));
     }
 
     #[test]
@@ -2177,7 +2177,7 @@ mod tests {
         inner.note_external(&said, "198.51.100.2:6881".parse().unwrap());
         let after = inner.own_id();
         assert_ne!(after, before);
-        assert!(crate::dht_id::verify_node_id(&after, ours));
+        assert!(crate::discovery::dht_id::verify_node_id(&after, ours));
         assert_eq!(inner.table.lock().unwrap().len(), 1, "known nodes stay");
         // Saying the same again keeps the ID.
         inner.note_external(&said, "198.51.100.3:6881".parse().unwrap());

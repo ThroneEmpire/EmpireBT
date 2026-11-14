@@ -1,6 +1,15 @@
 use std::path::{Path, PathBuf};
 
-use crate::{MagnetLink, Renames, ResumeData, TorrentInfo, TransferState};
+use crate::{MagnetLink, Renames, ResumeData, TorrentInfo};
+
+/// High-level transfer lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferState {
+    Paused,
+    Downloading,
+    Seeding,
+    Complete,
+}
 
 /// A torrent managed by the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]

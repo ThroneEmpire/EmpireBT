@@ -131,7 +131,7 @@ pub struct PeerConnection {
     supports_v2: bool,
     remote_reserved: [u8; 8],
     /// Present when the stream is RC4-encrypted (MSE).
-    ciphers: Option<crate::mse::Ciphers>,
+    ciphers: Option<crate::protocol::mse::Ciphers>,
     /// The encryption handshake was used, even if the stream then went on
     /// in plain text.
     obfuscated: bool,
@@ -222,7 +222,7 @@ impl PeerConnection {
                 let mut stream = open(over_utp)?;
                 let started = std::time::Instant::now();
                 // The BitTorrent handshake rides along as the initial payload.
-                match crate::mse::initiate(
+                match crate::protocol::mse::initiate(
                     &mut stream,
                     handshake.info_hash(),
                     &handshake.encode(),
@@ -272,7 +272,14 @@ impl PeerConnection {
 
     /// The stream, its encryption, and anything read ahead of the next
     /// message, for an event loop to take over.
-    pub(crate) fn into_parts(self) -> (Transport, Option<crate::mse::Ciphers>, bool, Vec<u8>) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Transport,
+        Option<crate::protocol::mse::Ciphers>,
+        bool,
+        Vec<u8>,
+    ) {
         (self.stream, self.ciphers, self.obfuscated, self.buffered)
     }
 
@@ -285,7 +292,7 @@ impl PeerConnection {
     fn finish(
         stream: Transport,
         handshake: &Handshake,
-        ciphers: Option<crate::mse::Ciphers>,
+        ciphers: Option<crate::protocol::mse::Ciphers>,
         obfuscated: bool,
     ) -> Result<Self, crate::BackendError> {
         let mut connection = Self {
@@ -333,7 +340,7 @@ impl PeerConnection {
         handshake: &Handshake,
         timeout: Duration,
     ) -> Result<Self, crate::BackendError> {
-        use crate::mse::{Opening, Responder};
+        use crate::protocol::mse::{Opening, Responder};
         let io = |error: std::io::Error| crate::BackendError::Io(error.to_string());
         stream
             .set_read_timeout(Some(timeout))
@@ -341,18 +348,19 @@ impl PeerConnection {
             .map_err(io)?;
         // Peers open with either a plain handshake or an encrypted one.
         let mut input = Vec::new();
-        while crate::mse::classify(&input) == Opening::Undecided {
+        while crate::protocol::mse::classify(&input) == Opening::Undecided {
             read_more(&mut stream, &mut input)?;
         }
         let mut ciphers = None;
-        let obfuscated = crate::mse::classify(&input) == Opening::Encrypted;
+        let obfuscated = crate::protocol::mse::classify(&input) == Opening::Encrypted;
         if obfuscated {
             let info_hash = *handshake.info_hash();
             let mut responder = Responder::new(true);
             loop {
                 let mut output = Vec::new();
                 let established = responder.advance(&mut input, &mut output, |req2| {
-                    (*req2 == crate::mse::obfuscated_hash(&info_hash)).then_some(info_hash)
+                    (*req2 == crate::protocol::mse::obfuscated_hash(&info_hash))
+                        .then_some(info_hash)
                 })?;
                 stream.write_all(&output).map_err(io)?;
                 if let Some(established) = established {

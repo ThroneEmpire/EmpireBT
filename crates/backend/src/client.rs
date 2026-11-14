@@ -1771,11 +1771,12 @@ fn fetch_magnet_metadata(
 ) -> Result<crate::Metadata, BackendError> {
     let trackers =
         crate::TrackerClient::from_urls(link.trackers().to_vec())?.with_binding(options.binding());
-    let mut search = dht.map(|dht| crate::dht::PeerSearch::new(dht, *link.info_hash(), Some(port)));
+    let mut search =
+        dht.map(|dht| crate::discovery::dht::PeerSearch::new(dht, *link.info_hash(), Some(port)));
     let mut peers = link.peers();
     // Every tracker is asked, each on its own thread; their peers land here.
     let announced: Arc<std::sync::Mutex<Vec<SocketAddr>>> = Arc::default();
-    let mut announcer = crate::discovery::Announcer::new(&trackers, timeout, {
+    let mut announcer = crate::discovery::tiers::Announcer::new(&trackers, timeout, {
         let announced = Arc::clone(&announced);
         Arc::new(move |found: &[SocketAddr]| {
             if let Ok(mut announced) = announced.lock() {
@@ -2755,14 +2756,14 @@ mod tests {
 
     #[test]
     fn v2_magnet_links_fetch_metadata_and_piece_layers() {
-        use crate::bencode::Value;
+        use crate::protocol::bencode::Value;
         let root_dir =
             std::env::temp_dir().join(format!("empirebt-client-v2-magnet-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root_dir);
         // Seven 16 KiB pieces, so the file needs a piece layer.
         let data: Vec<u8> = (0..100_000).map(|byte| (byte * 13 % 251) as u8).collect();
-        let pieces_root = crate::v2::file_root(&data, 16_384);
-        let layer = crate::v2::piece_roots(&data, 16_384);
+        let pieces_root = crate::protocol::v2::file_root(&data, 16_384);
+        let layer = crate::protocol::v2::piece_roots(&data, 16_384);
         assert_eq!(layer.len(), 7);
         let info = Value::dict([
             (
@@ -3030,7 +3031,11 @@ mod network_tests {
                 .unwrap(),
         );
         let handle = client
-            .spawn_metadata(index, crate::dht::random_bytes(), Duration::from_secs(10))
+            .spawn_metadata(
+                index,
+                crate::discovery::dht::random_bytes(),
+                Duration::from_secs(10),
+            )
             .unwrap();
         let started = Instant::now();
         while !handle.is_finished() && started.elapsed() < Duration::from_secs(120) {
