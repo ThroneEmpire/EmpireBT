@@ -112,6 +112,24 @@ pub(crate) struct PeerWire {
     downloads: Vec<Download>,
     /// Block reads requested from the driver and not yet reported.
     reads_in_flight: usize,
+    /// Hole-punch `connect`s acted on, and when the connection opened:
+    /// see [`connect_allowed`].
+    connects: u32,
+    opened: Instant,
+}
+
+/// `connect`s a connection may act on from the start, and how often one
+/// more is allowed, as libtorrent's fix (pull request 9170). Each makes
+/// us dial the address it names, so without a cap one peer could keep us
+/// dialing addresses of its choosing.
+const CONNECT_BUDGET: u32 = 10;
+const CONNECT_EARNED_EVERY: Duration = Duration::from_secs(3);
+
+/// Whether a connection opened at `opened`, having acted on `connects`
+/// hole-punch `connect`s, may act on one more at `now`.
+fn connect_allowed(connects: u32, opened: Instant, now: Instant) -> bool {
+    let earned = now.saturating_duration_since(opened).as_secs() / CONNECT_EARNED_EVERY.as_secs();
+    u64::from(connects) < u64::from(CONNECT_BUDGET) + earned
 }
 
 impl PeerWire {
@@ -162,6 +180,8 @@ impl PeerWire {
             state: State::new(now),
             downloads: Vec::new(),
             reads_in_flight: 0,
+            connects: 0,
+            opened: now,
             torrent,
             link,
         }
@@ -609,10 +629,13 @@ impl PeerWire {
                         // The peer it names is connecting to us right now:
                         // connect to it too, over uTP, punching through our
                         // NAT. A local address only from a local peer, as
-                        // libtorrent has it.
+                        // libtorrent has it, and past the budget none.
                         Kind::Connect => {
                             let local = crate::dht_id::is_local;
-                            if !local(message.address.ip()) || local(self.link.address.ip()) {
+                            if (!local(message.address.ip()) || local(self.link.address.ip()))
+                                && connect_allowed(self.connects, self.opened, now)
+                            {
+                                self.connects += 1;
                                 torrent.swarm.queue_holepunch_dial(message.address);
                             }
                         }
@@ -1212,6 +1235,24 @@ mod tests {
         assert_eq!(state.request_depth(Some(100)), 100);
         assert_eq!(state.request_depth(Some(2000)), MAX_REQUEST_DEPTH);
         assert_eq!(state.request_depth(Some(8)), 8);
+    }
+
+    /// libtorrent's pull request 9170: 10 hole-punch `connect`s, then one
+    /// more each 3 seconds the connection has been open.
+    #[test]
+    fn caps_the_hole_punch_connects_a_peer_can_ask_for() {
+        let opened = Instant::now();
+        let mut acted = 0;
+        for _ in 0..100 {
+            if connect_allowed(acted, opened, opened) {
+                acted += 1;
+            }
+        }
+        assert_eq!(acted, CONNECT_BUDGET, "a burst gets the budget only");
+        let later = opened + Duration::from_secs(7);
+        assert!(connect_allowed(acted, opened, later));
+        assert!(connect_allowed(acted + 1, opened, later));
+        assert!(!connect_allowed(acted + 2, opened, later), "one per 3 s");
     }
 
     #[test]
